@@ -944,7 +944,7 @@ impl SortExec {
     }
 
     /// Add or reset `self.filter` to a new `TopKDynamicFilters`.
-    fn create_filter(&self) -> Arc<RwLock<TopKDynamicFilters>> {
+    pub fn create_filter(&self) -> Arc<RwLock<TopKDynamicFilters>> {
         let children = self
             .expr
             .iter()
