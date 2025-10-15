@@ -17,6 +17,7 @@
 
 mod kernels;
 
+use crate::expressions::binary::kernels::select::collection_select_dyn_scalar;
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::PhysicalExpr;
 use std::hash::Hash;
@@ -589,6 +590,7 @@ impl BinaryExpr {
             BitwiseXor => bitwise_xor_dyn_scalar(array, scalar),
             BitwiseShiftRight => bitwise_shift_right_dyn_scalar(array, scalar),
             BitwiseShiftLeft => bitwise_shift_left_dyn_scalar(array, scalar),
+            Arrow => collection_select_dyn_scalar(array, scalar),
             // if scalar operation is not supported - fallback to array implementation
             _ => None,
         };
