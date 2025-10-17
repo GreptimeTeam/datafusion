@@ -17,6 +17,15 @@
 
 mod kernels;
 
+use crate::expressions::binary::kernels::contains::{
+    collection_contains_all_strings_dyn, collection_contains_all_strings_dyn_scalar,
+    collection_contains_any_string_dyn, collection_contains_any_string_dyn_scalar,
+    collection_contains_dyn, collection_contains_dyn_scalar,
+    collection_contains_string_dyn, collection_contains_string_dyn_scalar,
+};
+use crate::expressions::binary::kernels::select::{
+    cast_to_string_array, collection_select_dyn_scalar, collection_select_path_dyn_scalar,
+};
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use crate::PhysicalExpr;
 use std::hash::Hash;
@@ -290,7 +299,7 @@ impl PhysicalExpr for BinaryExpr {
         {
             if !scalar.is_null() {
                 if let Some(result_array) =
-                    self.evaluate_array_scalar(array, scalar.clone())?
+                    self.evaluate_array_scalar(Arc::clone(array), scalar.clone())?
                 {
                     let final_array = result_array
                         .and_then(|a| to_result_type_array(&self.op, a, &result_type));
@@ -575,20 +584,31 @@ impl BinaryExpr {
     /// right is literal - use scalar operations
     fn evaluate_array_scalar(
         &self,
-        array: &dyn Array,
+        array: Arc<dyn Array>,
         scalar: ScalarValue,
     ) -> Result<Option<Result<ArrayRef>>> {
         use Operator::*;
         let scalar_result = match &self.op {
-            RegexMatch => regex_match_dyn_scalar(array, scalar, false, false),
-            RegexIMatch => regex_match_dyn_scalar(array, scalar, false, true),
-            RegexNotMatch => regex_match_dyn_scalar(array, scalar, true, false),
-            RegexNotIMatch => regex_match_dyn_scalar(array, scalar, true, true),
-            BitwiseAnd => bitwise_and_dyn_scalar(array, scalar),
-            BitwiseOr => bitwise_or_dyn_scalar(array, scalar),
-            BitwiseXor => bitwise_xor_dyn_scalar(array, scalar),
-            BitwiseShiftRight => bitwise_shift_right_dyn_scalar(array, scalar),
-            BitwiseShiftLeft => bitwise_shift_left_dyn_scalar(array, scalar),
+            RegexMatch => regex_match_dyn_scalar(&array, scalar, false, false),
+            RegexIMatch => regex_match_dyn_scalar(&array, scalar, false, true),
+            RegexNotMatch => regex_match_dyn_scalar(&array, scalar, true, false),
+            RegexNotIMatch => regex_match_dyn_scalar(&array, scalar, true, true),
+            BitwiseAnd => bitwise_and_dyn_scalar(&array, scalar),
+            BitwiseOr => bitwise_or_dyn_scalar(&array, scalar),
+            BitwiseXor => bitwise_xor_dyn_scalar(&array, scalar),
+            BitwiseShiftRight => bitwise_shift_right_dyn_scalar(&array, scalar),
+            BitwiseShiftLeft => bitwise_shift_left_dyn_scalar(&array, scalar),
+            Arrow => collection_select_dyn_scalar(&array, scalar),
+            LongArrow => collection_select_dyn_scalar(&array, scalar)
+                .map(|arr| arr.and_then(cast_to_string_array)),
+            HashArrow => collection_select_path_dyn_scalar(array, scalar),
+            HashLongArrow => collection_select_path_dyn_scalar(array, scalar)
+                .map(|arr| arr.and_then(cast_to_string_array)),
+            AtArrow => collection_contains_dyn_scalar(&array, scalar),
+            // TODO: ArrowAt
+            Question => collection_contains_string_dyn_scalar(&array, scalar),
+            QuestionPipe => collection_contains_any_string_dyn_scalar(&array, scalar),
+            QuestionAnd => collection_contains_all_strings_dyn_scalar(&array, scalar),
             // if scalar operation is not supported - fallback to array implementation
             _ => None,
         };
@@ -642,9 +662,13 @@ impl BinaryExpr {
             BitwiseShiftRight => bitwise_shift_right_dyn(left, right),
             BitwiseShiftLeft => bitwise_shift_left_dyn(left, right),
             StringConcat => concat_elements(left, right),
-            AtArrow | ArrowAt | Arrow | LongArrow | HashArrow | HashLongArrow | AtAt
-            | HashMinus | AtQuestion | Question | QuestionAnd | QuestionPipe
-            | IntegerDivide => {
+            AtArrow => collection_contains_dyn(left, right),
+            ArrowAt => collection_contains_dyn(right, left),
+            Question => collection_contains_string_dyn(left, right),
+            QuestionPipe => collection_contains_any_string_dyn(left, right),
+            QuestionAnd => collection_contains_all_strings_dyn(left, right),
+            Arrow | LongArrow | HashArrow | HashLongArrow | AtAt | HashMinus
+            | AtQuestion | IntegerDivide => {
                 not_impl_err!(
                     "Binary operator '{:?}' is not supported in the physical expr",
                     self.op
