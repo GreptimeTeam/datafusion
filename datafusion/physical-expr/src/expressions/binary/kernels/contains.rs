@@ -45,7 +45,7 @@ pub(crate) fn collection_contains_dyn(
     let mut results = BooleanBufferBuilder::new(left.len());
 
     for i in 0..left.len() {
-        if nulls.as_ref().map_or(false, |n| n.is_null(i)) {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
             results.append(false);
             continue;
         }
@@ -196,6 +196,404 @@ fn is_nested_scalar(scalar: &ScalarValue) -> bool {
     matches!(scalar, ScalarValue::List(_) | ScalarValue::Struct(_))
 }
 
+/// Test if collection (list or struct) contains string key, PostgreSQL `?` operator
+///
+/// Rule for `?` operator:
+/// https://www.postgresql.org/docs/18/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+/// - For arrays: tests if the string exists as an array element
+/// - For objects: tests if the string exists as a top-level key
+pub(crate) fn collection_contains_string_dyn(
+    left: Arc<dyn Array>,
+    right: Arc<dyn Array>,
+) -> Result<ArrayRef> {
+    if left.len() != right.len() {
+        return Err(ArrowError::ComputeError(format!(
+            "Arrays must have the same length: {} != {}",
+            left.len(),
+            right.len()
+        ))
+        .into());
+    }
+
+    let nulls = NullBuffer::union(left.nulls(), right.nulls());
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = ScalarValue::try_from_array(&left, i)?;
+        let right_value = ScalarValue::try_from_array(&right, i)?;
+
+        let contains = collection_contains_string_scalar(&left_value, &right_value)?;
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(nulls)
+            .build_unchecked()
+    };
+    Ok(Arc::new(BooleanArray::from(data)))
+}
+
+/// Test if collection scalar contains string scalar, PostgreSQL `?` operator
+fn collection_contains_string_scalar(
+    left: &ScalarValue,
+    right: &ScalarValue,
+) -> Result<bool> {
+    match (left, right) {
+        // Struct: test if string exists as top-level key
+        (ScalarValue::Struct(struct_array), ScalarValue::Utf8(Some(field_name))) => {
+            // Check if field exists in struct
+            let exists = struct_array.column_by_name(field_name).is_some();
+            Ok(exists)
+        }
+
+        // List: test if string exists as array element
+        (ScalarValue::List(list_array), ScalarValue::Utf8(Some(search_string))) => {
+            let list_values = extract_scalar_values_from_list(list_array)?;
+
+            // Search through list elements for the string
+            for element in &list_values {
+                if let ScalarValue::Utf8(Some(s)) = element {
+                    if s == search_string {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        _ => Ok(false),
+    }
+}
+
+/// Test if collection contains ANY of the strings in the array, PostgreSQL `?|` operator
+///
+/// Rule for `?|` operator:
+/// https://www.postgresql.org/docs/18/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+/// - For arrays: tests if ANY of the strings in the right array exist as array elements
+/// - For objects: tests if ANY of the strings in the right array exist as top-level keys
+pub(crate) fn collection_contains_any_string_dyn(
+    left: Arc<dyn Array>,
+    right: Arc<dyn Array>,
+) -> Result<ArrayRef> {
+    if left.len() != right.len() {
+        return Err(ArrowError::ComputeError(format!(
+            "Arrays must have the same length: {} != {}",
+            left.len(),
+            right.len()
+        ))
+        .into());
+    }
+
+    let nulls = NullBuffer::union(left.nulls(), right.nulls());
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = ScalarValue::try_from_array(&left, i)?;
+        let right_value = ScalarValue::try_from_array(&right, i)?;
+
+        let contains = collection_contains_any_string_scalar(&left_value, &right_value)?;
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(nulls)
+            .build_unchecked()
+    };
+    Ok(Arc::new(BooleanArray::from(data)))
+}
+
+/// Test if collection scalar contains ANY of the strings in the array scalar, PostgreSQL `?|` operator
+fn collection_contains_any_string_scalar(
+    left: &ScalarValue,
+    right: &ScalarValue,
+) -> Result<bool> {
+    match (left, right) {
+        // Struct: test if ANY of the strings exist as top-level keys
+        (ScalarValue::Struct(struct_array), ScalarValue::List(string_list)) => {
+            let search_strings = extract_scalar_values_from_list(string_list)?;
+
+            for search_string in &search_strings {
+                if let ScalarValue::Utf8(Some(field_name)) = search_string {
+                    if struct_array.column_by_name(field_name).is_some() {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        // List: test if ANY of the strings exist as array elements
+        (ScalarValue::List(list_array), ScalarValue::List(string_list)) => {
+            let list_values = extract_scalar_values_from_list(list_array)?;
+            let search_strings = extract_scalar_values_from_list(string_list)?;
+
+            for search_string in &search_strings {
+                if let ScalarValue::Utf8(Some(s)) = search_string {
+                    for element in &list_values {
+                        if let ScalarValue::Utf8(Some(e)) = element {
+                            if e == s {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        _ => Ok(false),
+    }
+}
+
+/// Test if collection contains ALL of the strings in the array, PostgreSQL `?&` operator
+///
+/// Rule for `?&` operator:
+/// https://www.postgresql.org/docs/18/functions-json.html#FUNCTIONS-JSONB-OP-TABLE
+/// - For arrays: tests if ALL of the strings in the right array exist as array elements
+/// - For objects: tests if ALL of the strings in the right array exist as top-level keys
+pub(crate) fn collection_contains_all_strings_dyn(
+    left: Arc<dyn Array>,
+    right: Arc<dyn Array>,
+) -> Result<ArrayRef> {
+    if left.len() != right.len() {
+        return Err(ArrowError::ComputeError(format!(
+            "Arrays must have the same length: {} != {}",
+            left.len(),
+            right.len()
+        ))
+        .into());
+    }
+
+    let nulls = NullBuffer::union(left.nulls(), right.nulls());
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = ScalarValue::try_from_array(&left, i)?;
+        let right_value = ScalarValue::try_from_array(&right, i)?;
+
+        let contains = collection_contains_all_strings_scalar(&left_value, &right_value)?;
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(nulls)
+            .build_unchecked()
+    };
+    Ok(Arc::new(BooleanArray::from(data)))
+}
+
+/// Test if collection scalar contains ALL of the strings in the array scalar, PostgreSQL `?&` operator
+fn collection_contains_all_strings_scalar(
+    left: &ScalarValue,
+    right: &ScalarValue,
+) -> Result<bool> {
+    match (left, right) {
+        // Struct: test if ALL of the strings exist as top-level keys
+        (ScalarValue::Struct(struct_array), ScalarValue::List(string_list)) => {
+            let search_strings = extract_scalar_values_from_list(string_list)?;
+
+            for search_string in &search_strings {
+                if let ScalarValue::Utf8(Some(field_name)) = search_string {
+                    if struct_array.column_by_name(field_name).is_none() {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+
+        // List: test if ALL of the strings exist as array elements
+        (ScalarValue::List(list_array), ScalarValue::List(string_list)) => {
+            let list_values = extract_scalar_values_from_list(list_array)?;
+            let search_strings = extract_scalar_values_from_list(string_list)?;
+
+            for search_string in &search_strings {
+                if let ScalarValue::Utf8(Some(s)) = search_string {
+                    let mut found = false;
+                    for element in &list_values {
+                        if let ScalarValue::Utf8(Some(e)) = element {
+                            if e == s {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+
+        _ => Ok(false),
+    }
+}
+
+/// Scalar version of collection_contains_dyn - array contains scalar
+pub(crate) fn collection_contains_dyn_scalar(
+    left: &dyn Array,
+    right: ScalarValue,
+) -> Option<Result<ArrayRef>> {
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if left.is_null(i) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = match ScalarValue::try_from_array(left, i) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let contains = match jsonb_contains_scalar(&left_value, &right) {
+            Ok(contains) => contains,
+            Err(e) => return Some(Err(e)),
+        };
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(left.nulls().cloned())
+            .build_unchecked()
+    };
+    Some(Ok(Arc::new(BooleanArray::from(data))))
+}
+
+/// Scalar version of collection_contains_string_dyn - array contains string scalar
+pub(crate) fn collection_contains_string_dyn_scalar(
+    left: &dyn Array,
+    right: ScalarValue,
+) -> Option<Result<ArrayRef>> {
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if left.is_null(i) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = match ScalarValue::try_from_array(left, i) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let contains = match collection_contains_string_scalar(&left_value, &right) {
+            Ok(contains) => contains,
+            Err(e) => return Some(Err(e)),
+        };
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(left.nulls().cloned())
+            .build_unchecked()
+    };
+    Some(Ok(Arc::new(BooleanArray::from(data))))
+}
+
+/// Scalar version of collection_contains_any_dyn - array contains ANY of the strings in scalar list
+pub(crate) fn collection_contains_any_string_dyn_scalar(
+    left: &dyn Array,
+    right: ScalarValue,
+) -> Option<Result<ArrayRef>> {
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if left.is_null(i) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = match ScalarValue::try_from_array(left, i) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let contains = match collection_contains_any_string_scalar(&left_value, &right) {
+            Ok(contains) => contains,
+            Err(e) => return Some(Err(e)),
+        };
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(left.nulls().cloned())
+            .build_unchecked()
+    };
+    Some(Ok(Arc::new(BooleanArray::from(data))))
+}
+
+/// Scalar version of collection_contains_all_dyn - array contains ALL of the strings in scalar list
+pub(crate) fn collection_contains_all_strings_dyn_scalar(
+    left: &dyn Array,
+    right: ScalarValue,
+) -> Option<Result<ArrayRef>> {
+    let mut results = BooleanBufferBuilder::new(left.len());
+
+    for i in 0..left.len() {
+        if left.is_null(i) {
+            results.append(false);
+            continue;
+        }
+
+        let left_value = match ScalarValue::try_from_array(left, i) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let contains = match collection_contains_all_strings_scalar(&left_value, &right) {
+            Ok(contains) => contains,
+            Err(e) => return Some(Err(e)),
+        };
+        results.append(contains);
+    }
+
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Boolean)
+            .len(left.len())
+            .buffers(vec![results.into()])
+            .nulls(left.nulls().cloned())
+            .build_unchecked()
+    };
+    Some(Ok(Arc::new(BooleanArray::from(data))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,17 +647,19 @@ mod tests {
     fn test_struct_contains_subset() -> Result<()> {
         // Test {"foo":{"bar":"baz"}} contains {"foo":{}}
         // This should return true because right struct is a subset of left struct
-        
+
         // Create left struct: {"foo":{"bar":"baz"}}
-        let inner_left_fields = Fields::from(vec![Field::new("bar", DataType::Utf8, true)]);
+        let inner_left_fields =
+            Fields::from(vec![Field::new("bar", DataType::Utf8, true)]);
         let inner_left_array = Arc::new(StringArray::from(vec!["baz"])) as ArrayRef;
-        let inner_left_struct = StructArray::new(
-            inner_left_fields.clone(),
-            vec![inner_left_array],
-            None,
-        );
-        
-        let outer_left_fields = Fields::from(vec![Field::new("foo", DataType::Struct(inner_left_fields), true)]);
+        let inner_left_struct =
+            StructArray::new(inner_left_fields.clone(), vec![inner_left_array], None);
+
+        let outer_left_fields = Fields::from(vec![Field::new(
+            "foo",
+            DataType::Struct(inner_left_fields),
+            true,
+        )]);
         let left = Arc::new(StructArray::new(
             outer_left_fields,
             vec![Arc::new(inner_left_struct) as ArrayRef],
@@ -274,8 +674,12 @@ mod tests {
             None,
             1,
         )?;
-        
-        let outer_right_fields = Fields::from(vec![Field::new("foo", DataType::Struct(inner_right_fields), true)]);
+
+        let outer_right_fields = Fields::from(vec![Field::new(
+            "foo",
+            DataType::Struct(inner_right_fields),
+            true,
+        )]);
         let right = Arc::new(StructArray::new(
             outer_right_fields,
             vec![Arc::new(inner_right_struct) as ArrayRef],
@@ -284,6 +688,260 @@ mod tests {
 
         let result = collection_contains_dyn(left, right)?;
         let expected = BooleanArray::from(vec![true]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_contains_scalar() -> Result<()> {
+        // Test scalar version of collection_contains_dyn
+        let left = Arc::new(StringArray::from(vec!["hello", "world"])) as ArrayRef;
+        let right = ScalarValue::Utf8(Some("hello".to_string()));
+        let result = collection_contains_dyn_scalar(left.as_ref(), right)
+            .unwrap()
+            .unwrap();
+        let expected = BooleanArray::from(vec![true, false]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_contains_string_scalar() -> Result<()> {
+        // Test scalar version of collection_contains_string_dyn
+        // Create a struct array with fields
+        let fields = Fields::from(vec![
+            Field::new("foo", DataType::Int32, true),
+            Field::new("bar", DataType::Utf8, true),
+        ]);
+
+        let foo_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let bar_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+
+        let left = Arc::new(StructArray::new(fields, vec![foo_array, bar_array], None))
+            as ArrayRef;
+        let right = ScalarValue::Utf8(Some("foo".to_string()));
+
+        let result = collection_contains_string_dyn_scalar(left.as_ref(), right)
+            .unwrap()
+            .unwrap();
+        let expected = BooleanArray::from(vec![true, true]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_contains_any_struct() -> Result<()> {
+        // Test struct contains ANY of the strings
+        let fields = Fields::from(vec![
+            Field::new("foo", DataType::Int32, true),
+            Field::new("bar", DataType::Utf8, true),
+        ]);
+
+        let foo_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let bar_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+
+        let left = Arc::new(StructArray::new(fields, vec![foo_array, bar_array], None));
+
+        // Create right array with list of strings using ListBuilder
+        let mut builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["foo", "baz"]
+        builder.values().append_value("foo");
+        builder.values().append_value("baz");
+        builder.append(true);
+
+        // Second row: ["qux", "quux"]
+        builder.values().append_value("qux");
+        builder.values().append_value("quux");
+        builder.append(true);
+
+        let right = Arc::new(builder.finish());
+
+        let result = collection_contains_any_string_dyn(left, right)?;
+        let expected = BooleanArray::from(vec![true, false]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_contains_any_list() -> Result<()> {
+        // Test list contains ANY of the strings
+        let mut left_builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["a", "b", "c"]
+        left_builder.values().append_value("a");
+        left_builder.values().append_value("b");
+        left_builder.values().append_value("c");
+        left_builder.append(true);
+
+        // Second row: ["x", "y"]
+        left_builder.values().append_value("x");
+        left_builder.values().append_value("y");
+        left_builder.append(true);
+
+        let left = Arc::new(left_builder.finish());
+
+        // Create right array with list of strings using ListBuilder
+        let mut right_builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["b", "d"] - contains "b"
+        right_builder.values().append_value("b");
+        right_builder.values().append_value("d");
+        right_builder.append(true);
+
+        // Second row: ["z", "w"] - contains neither
+        right_builder.values().append_value("z");
+        right_builder.values().append_value("w");
+        right_builder.append(true);
+
+        let right = Arc::new(right_builder.finish());
+
+        let result = collection_contains_any_string_dyn(left, right)?;
+        let expected = BooleanArray::from(vec![true, false]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_contains_all_struct() -> Result<()> {
+        // Test struct contains ALL of the strings
+        let fields = Fields::from(vec![
+            Field::new("foo", DataType::Int32, true),
+            Field::new("bar", DataType::Utf8, true),
+            Field::new("baz", DataType::Float64, true),
+        ]);
+
+        let foo_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let bar_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let baz_array = Arc::new(Float64Array::from(vec![1.0, 2.0])) as ArrayRef;
+
+        let left = Arc::new(StructArray::new(
+            fields,
+            vec![foo_array, bar_array, baz_array],
+            None,
+        ));
+
+        // Create right array with list of strings using ListBuilder
+        let mut builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["foo", "bar"] - contains both
+        builder.values().append_value("foo");
+        builder.values().append_value("bar");
+        builder.append(true);
+
+        // Second row: ["foo", "qux"] - missing "qux"
+        builder.values().append_value("foo");
+        builder.values().append_value("qux");
+        builder.append(true);
+
+        let right = Arc::new(builder.finish());
+
+        let result = collection_contains_all_strings_dyn(left, right)?;
+        let expected = BooleanArray::from(vec![true, false]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_contains_all_list() -> Result<()> {
+        // Test list contains ALL of the strings
+        let mut left_builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["a", "b", "c"]
+        left_builder.values().append_value("a");
+        left_builder.values().append_value("b");
+        left_builder.values().append_value("c");
+        left_builder.append(true);
+
+        // Second row: ["x", "y"]
+        left_builder.values().append_value("x");
+        left_builder.values().append_value("y");
+        left_builder.append(true);
+
+        let left = Arc::new(left_builder.finish());
+
+        // Create right array with list of strings using ListBuilder
+        let mut right_builder = ListBuilder::new(StringBuilder::new());
+
+        // First row: ["a", "b"] - contains both
+        right_builder.values().append_value("a");
+        right_builder.values().append_value("b");
+        right_builder.append(true);
+
+        // Second row: ["x", "z"] - missing "z"
+        right_builder.values().append_value("x");
+        right_builder.values().append_value("z");
+        right_builder.append(true);
+
+        let right = Arc::new(right_builder.finish());
+
+        let result = collection_contains_all_strings_dyn(left, right)?;
+        let expected = BooleanArray::from(vec![true, false]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_contains_any_scalar() -> Result<()> {
+        // Test scalar version of collection_contains_any_dyn
+        let fields = Fields::from(vec![
+            Field::new("foo", DataType::Int32, true),
+            Field::new("bar", DataType::Utf8, true),
+        ]);
+
+        let foo_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let bar_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+
+        let left = Arc::new(StructArray::new(fields, vec![foo_array, bar_array], None))
+            as ArrayRef;
+
+        // Create scalar list of strings using ListBuilder
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("foo");
+        builder.values().append_value("baz");
+        builder.append(true);
+        let string_list = Arc::new(builder.finish());
+        let right = ScalarValue::List(string_list);
+
+        let result = collection_contains_any_string_dyn_scalar(left.as_ref(), right)
+            .unwrap()
+            .unwrap();
+        let expected = BooleanArray::from(vec![true, true]);
+        assert_eq!(result.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_contains_all_scalar() -> Result<()> {
+        // Test scalar version of collection_contains_all_dyn
+        let fields = Fields::from(vec![
+            Field::new("foo", DataType::Int32, true),
+            Field::new("bar", DataType::Utf8, true),
+            Field::new("baz", DataType::Float64, true),
+        ]);
+
+        let foo_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let bar_array = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let baz_array = Arc::new(Float64Array::from(vec![1.0, 2.0])) as ArrayRef;
+
+        let left = Arc::new(StructArray::new(
+            fields,
+            vec![foo_array, bar_array, baz_array],
+            None,
+        )) as ArrayRef;
+
+        // Create scalar list of strings using ListBuilder
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.values().append_value("foo");
+        builder.values().append_value("bar");
+        builder.append(true);
+        let string_list = Arc::new(builder.finish());
+        let right = ScalarValue::List(string_list);
+
+        let result = collection_contains_all_strings_dyn_scalar(left.as_ref(), right)
+            .unwrap()
+            .unwrap();
+        let expected = BooleanArray::from(vec![true, true]);
         assert_eq!(result.as_ref(), &expected);
         Ok(())
     }
