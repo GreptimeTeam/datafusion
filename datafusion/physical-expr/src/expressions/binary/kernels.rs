@@ -32,6 +32,7 @@ use datafusion_common::{Result, ScalarValue};
 
 use std::sync::Arc;
 
+pub mod contains;
 pub mod select;
 
 /// Downcasts $LEFT and $RIGHT to $ARRAY_TYPE and then calls $KERNEL($LEFT, $RIGHT)
