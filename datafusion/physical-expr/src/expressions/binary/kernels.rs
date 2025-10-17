@@ -32,6 +32,9 @@ use datafusion_common::{Result, ScalarValue};
 
 use std::sync::Arc;
 
+pub mod contains;
+pub mod select;
+
 /// Downcasts $LEFT and $RIGHT to $ARRAY_TYPE and then calls $KERNEL($LEFT, $RIGHT)
 macro_rules! call_kernel {
     ($LEFT:expr, $RIGHT:expr, $KERNEL:expr, $ARRAY_TYPE:ident) => {{
@@ -194,6 +197,7 @@ macro_rules! regexp_is_match_flag {
         if $NOT {
             array = not(&array).unwrap();
         }
+
         Ok(Arc::new(array))
     }};
 }

@@ -17,6 +17,7 @@
 
 mod kernels;
 
+use crate::expressions::binary::kernels::contains::collection_contains_dyn;
 use crate::expressions::binary::kernels::select::{
     cast_to_string_array, collection_select_dyn_scalar, collection_select_path_dyn_scalar,
 };
@@ -651,9 +652,10 @@ impl BinaryExpr {
             BitwiseShiftRight => bitwise_shift_right_dyn(left, right),
             BitwiseShiftLeft => bitwise_shift_left_dyn(left, right),
             StringConcat => concat_elements(left, right),
-            AtArrow | ArrowAt | Arrow | LongArrow | HashArrow | HashLongArrow | AtAt
-            | HashMinus | AtQuestion | Question | QuestionAnd | QuestionPipe
-            | IntegerDivide => {
+            AtArrow => collection_contains_dyn(left, right),
+            ArrowAt => collection_contains_dyn(right, left),
+            Arrow | LongArrow | HashArrow | HashLongArrow | AtAt | HashMinus
+            | AtQuestion | Question | QuestionAnd | QuestionPipe | IntegerDivide => {
                 not_impl_err!(
                     "Binary operator '{:?}' is not supported in the physical expr",
                     self.op
