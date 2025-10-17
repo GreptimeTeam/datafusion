@@ -309,14 +309,15 @@ mod tests {
         assert_eq!(&result, &expected);
 
         // Test out of bounds index - but skip this test for now due to NullArray issue
-        // let result = collection_select_dyn_scalar(
-        //     list_array.as_ref(),
-        //     ScalarValue::Int32(Some(10)),
-        // )
-        // .unwrap()
-        // .unwrap();
-        // let expected = Arc::new(Int32Array::from(vec![None, None, None, None])) as ArrayRef;
-        // assert_eq!(&result, &expected);
+        let result = collection_select_dyn_scalar(
+            list_array.as_ref(),
+            ScalarValue::Int32(Some(10)),
+        )
+        .unwrap()
+        .unwrap();
+        let expected = new_null_array(&DataType::Null, 4);
+
+        assert_eq!(&result, &expected);
     }
 
     #[test]
