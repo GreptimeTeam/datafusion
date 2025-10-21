@@ -17,7 +17,15 @@
 
 mod kernels;
 
-use crate::expressions::binary::kernels::contains::collection_contains_dyn;
+use crate::expressions::binary::kernels::contains::{
+    collection_contains_all_strings_dyn, collection_contains_all_strings_dyn_scalar,
+    collection_contains_any_string_dyn, collection_contains_any_string_dyn_scalar,
+    collection_contains_dyn, collection_contains_dyn_scalar,
+    collection_contains_string_dyn, collection_contains_string_dyn_scalar,
+};
+use crate::expressions::binary::kernels::manipulate::{
+    collection_concat_dyn, collection_delete_key_dyn_scalar,
+};
 use crate::expressions::binary::kernels::select::{
     cast_to_string_array, collection_select_dyn_scalar, collection_select_path_dyn_scalar,
 };
@@ -255,6 +263,7 @@ impl PhysicalExpr for BinaryExpr {
         let schema = batch.schema();
         let input_schema = schema.as_ref();
 
+        // TODO: remove this
         if left_data_type.is_nested() {
             if !left_data_type.equals_datatype(&right_data_type) {
                 return internal_err!("Cannot evaluate binary expression because of type mismatch: left {}, right {} ", left_data_type, right_data_type);
@@ -265,6 +274,7 @@ impl PhysicalExpr for BinaryExpr {
         match self.op {
             Operator::Plus if self.fail_on_overflow => return apply(&lhs, &rhs, add),
             Operator::Plus => return apply(&lhs, &rhs, add_wrapping),
+            // TODO: exclude nested types
             Operator::Minus if self.fail_on_overflow => return apply(&lhs, &rhs, sub),
             Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
             Operator::Multiply if self.fail_on_overflow => return apply(&lhs, &rhs, mul),
@@ -599,6 +609,12 @@ impl BinaryExpr {
             HashArrow => collection_select_path_dyn_scalar(array, scalar),
             HashLongArrow => collection_select_path_dyn_scalar(array, scalar)
                 .map(|arr| arr.and_then(cast_to_string_array)),
+            AtArrow => collection_contains_dyn_scalar(&array, scalar),
+            // TODO: ArrowAt
+            Question => collection_contains_string_dyn_scalar(&array, scalar),
+            QuestionPipe => collection_contains_any_string_dyn_scalar(&array, scalar),
+            QuestionAnd => collection_contains_all_strings_dyn_scalar(&array, scalar),
+            Minus => collection_delete_key_dyn_scalar(&array, scalar),
             // if scalar operation is not supported - fallback to array implementation
             _ => None,
         };
@@ -633,6 +649,11 @@ impl BinaryExpr {
             Or => {
                 if left_data_type == &DataType::Boolean {
                     Ok(boolean_op(&left, &right, or_kleene)?)
+                } else if matches!(
+                    left_data_type,
+                    DataType::List(_) | DataType::Struct(_)
+                ) {
+                    collection_concat_dyn(left, right)
                 } else {
                     internal_err!(
                         "Cannot evaluate binary expression {:?} with types {:?} and {:?}",
@@ -654,8 +675,11 @@ impl BinaryExpr {
             StringConcat => concat_elements(left, right),
             AtArrow => collection_contains_dyn(left, right),
             ArrowAt => collection_contains_dyn(right, left),
+            Question => collection_contains_string_dyn(left, right),
+            QuestionPipe => collection_contains_any_string_dyn(left, right),
+            QuestionAnd => collection_contains_all_strings_dyn(left, right),
             Arrow | LongArrow | HashArrow | HashLongArrow | AtAt | HashMinus
-            | AtQuestion | Question | QuestionAnd | QuestionPipe | IntegerDivide => {
+            | AtQuestion | IntegerDivide => {
                 not_impl_err!(
                     "Binary operator '{:?}' is not supported in the physical expr",
                     self.op
