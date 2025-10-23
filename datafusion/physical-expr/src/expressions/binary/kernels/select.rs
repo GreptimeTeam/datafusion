@@ -345,23 +345,17 @@ mod tests {
             &DataType::Utf8,
         ));
 
-        // Debug: Check what type the path_list has
-        println!("Path list data type: {:?}", path_list.data_type());
-
         let result = collection_select_path_dyn_scalar(Arc::new(struct_array), path_list);
 
         match result {
             Some(Ok(array)) => {
-                println!("Success! Result data type: {:?}", array.data_type());
                 let expected = Arc::new(Int32Array::from(vec![Some(1)])) as ArrayRef;
                 assert_eq!(&array, &expected);
             }
             Some(Err(e)) => {
-                println!("Error: {:?}", e);
-                panic!("Unexpected error: {:?}", e);
+                panic!("Unexpected error: {e}");
             }
             None => {
-                println!("Result is None");
                 panic!("Unexpected None result");
             }
         }

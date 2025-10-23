@@ -35,7 +35,7 @@ use datafusion_common::{plan_err, Result, ScalarValue};
 /// - All other cases are treated by converting a non-array input into a
 ///   single-element array, and then proceeding as for two arrays.
 /// - Does not operate recursively: only the top-level array or object structure
-/// is merged.
+///   is merged.
 pub(crate) fn collection_concat_dyn(
     left: Arc<dyn Array>,
     right: Arc<dyn Array>,
@@ -96,7 +96,7 @@ pub(crate) fn collection_concat_dyn(
 
             // Create new ListArray
             Ok(Arc::new(ListArray::try_new(
-                list_type_left.clone(),
+                Arc::clone(list_type_left),
                 OffsetBuffer::new(new_offsets.into()),
                 concatenated_values,
                 nulls,
@@ -113,15 +113,15 @@ pub(crate) fn collection_concat_dyn(
             // First, add all fields from left struct that don't exist in right struct
             for (i, left_field) in left_fields.iter().enumerate() {
                 if !right_fields.iter().any(|f| f.name() == left_field.name()) {
-                    merged_fields.push(left_field.clone());
-                    merged_columns.push(left_struct.column(i).clone());
+                    merged_fields.push(Arc::clone(left_field));
+                    merged_columns.push(Arc::clone(left_struct.column(i)));
                 }
             }
 
             // Then add all fields from right struct (this handles duplicates by taking the right value)
             for (i, right_field) in right_fields.iter().enumerate() {
-                merged_fields.push(right_field.clone());
-                merged_columns.push(right_struct.column(i).clone());
+                merged_fields.push(Arc::clone(right_field));
+                merged_columns.push(Arc::clone(right_struct.column(i)));
             }
 
             // Create the merged struct array
@@ -134,7 +134,7 @@ pub(crate) fn collection_concat_dyn(
         (other1, other2) => {
             // TODO: we will support more data type by creating list of items
             // from both side.
-            return plan_err!("Unsupported data types {}, {} for concat operation collection_concat_dyn", other1, other2);
+            plan_err!("Unsupported data types {}, {} for concat operation collection_concat_dyn", other1, other2)
         }
     }
 }
@@ -220,8 +220,8 @@ fn struct_delete_keys(left: &StructArray, keys_to_delete: &[String]) -> Result<A
     // Filter out the fields that should be deleted
     for (i, field) in fields.iter().enumerate() {
         if !keys_to_delete.contains(field.name()) {
-            remaining_fields.push(field.clone());
-            remaining_columns.push(left.column(i).clone());
+            remaining_fields.push(Arc::clone(field));
+            remaining_columns.push(Arc::clone(left.column(i)));
         }
     }
 
@@ -268,12 +268,10 @@ fn list_delete_index(list_array: &ListArray, index_to_delete: i32) -> Result<Arr
             } else {
                 Some(list_len + index_to_delete)
             }
+        } else if index_to_delete >= list_len {
+            None // Out of bounds
         } else {
-            if index_to_delete >= list_len {
-                None // Out of bounds
-            } else {
-                Some(index_to_delete)
-            }
+            Some(index_to_delete)
         };
 
         // Add indices to keep
@@ -289,7 +287,7 @@ fn list_delete_index(list_array: &ListArray, index_to_delete: i32) -> Result<Arr
         } else {
             list_len
         };
-        new_offsets.push(*new_offsets.last().unwrap() + new_len as i32);
+        new_offsets.push(*new_offsets.last().unwrap() + new_len);
     }
 
     // Use take kernel to extract the values we want to keep
@@ -298,7 +296,7 @@ fn list_delete_index(list_array: &ListArray, index_to_delete: i32) -> Result<Arr
 
     // Get the field from the original list type
     let field = match list_array.data_type() {
-        DataType::List(field) => field.clone(),
+        DataType::List(field) => Arc::clone(field),
         _ => unreachable!(),
     };
 
@@ -521,8 +519,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(active_array.value(0), true);
-        assert_eq!(active_array.value(1), false);
+        assert!(active_array.value(0));
+        assert!(!active_array.value(1));
         assert!(active_array.is_null(2));
     }
 
@@ -579,8 +577,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(active_array.value(0), true);
-        assert_eq!(active_array.value(1), false);
+        assert!(active_array.value(0));
+        assert!(!active_array.value(1));
         assert!(active_array.is_null(2));
     }
 
@@ -623,8 +621,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(active_array.value(0), true);
-        assert_eq!(active_array.value(1), false);
+        assert!(active_array.value(0));
+        assert!(!active_array.value(1));
         assert!(active_array.is_null(2));
 
         // Test case 2: Delete multiple keys
