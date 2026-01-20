@@ -339,7 +339,7 @@ fn get_valid_types_with_udf<F: UDFCoercionExt>(
 
             // Every signature failed, return the joined error
             if res.is_empty() {
-                return internal_err!(
+                return exec_err!(
                     "Function '{}' failed to match any signature, errors: {}",
                     func.name(),
                     errors.join(",")
