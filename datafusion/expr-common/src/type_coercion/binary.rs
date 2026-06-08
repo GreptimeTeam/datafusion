@@ -2031,18 +2031,18 @@ fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
 fn timeunit_coercion(lhs_unit: &TimeUnit, rhs_unit: &TimeUnit) -> TimeUnit {
     use arrow::datatypes::TimeUnit::*;
     match (lhs_unit, rhs_unit) {
-        (Second, Millisecond) => Second,
-        (Second, Microsecond) => Second,
-        (Second, Nanosecond) => Second,
-        (Millisecond, Second) => Second,
-        (Millisecond, Microsecond) => Millisecond,
-        (Millisecond, Nanosecond) => Millisecond,
-        (Microsecond, Second) => Second,
-        (Microsecond, Millisecond) => Millisecond,
-        (Microsecond, Nanosecond) => Microsecond,
-        (Nanosecond, Second) => Second,
-        (Nanosecond, Millisecond) => Millisecond,
-        (Nanosecond, Microsecond) => Microsecond,
+        (Second, Millisecond) => Millisecond,
+        (Second, Microsecond) => Microsecond,
+        (Second, Nanosecond) => Nanosecond,
+        (Millisecond, Second) => Millisecond,
+        (Millisecond, Microsecond) => Microsecond,
+        (Millisecond, Nanosecond) => Nanosecond,
+        (Microsecond, Second) => Microsecond,
+        (Microsecond, Millisecond) => Microsecond,
+        (Microsecond, Nanosecond) => Nanosecond,
+        (Nanosecond, Second) => Nanosecond,
+        (Nanosecond, Millisecond) => Nanosecond,
+        (Nanosecond, Microsecond) => Nanosecond,
         (l, r) => {
             assert_eq!(l, r);
             *l
