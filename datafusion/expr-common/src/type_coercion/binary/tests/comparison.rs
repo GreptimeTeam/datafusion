@@ -575,6 +575,24 @@ fn test_type_coercion_compare() -> Result<()> {
         Operator::Eq,
         DataType::Timestamp(Second, Some("Europe/Brussels".into()))
     );
+    test_coercion_binary_rule!(
+        DataType::Timestamp(Second, None),
+        DataType::Timestamp(Millisecond, None),
+        Operator::Eq,
+        DataType::Timestamp(Millisecond, None)
+    );
+    test_coercion_binary_rule!(
+        DataType::Timestamp(Second, Some("America/New_York".into())),
+        DataType::Timestamp(Nanosecond, Some("Europe/Brussels".into())),
+        Operator::Lt,
+        DataType::Timestamp(Nanosecond, Some("America/New_York".into()))
+    );
+    test_coercion_binary_rule!(
+        DataType::Timestamp(Microsecond, None),
+        DataType::Timestamp(Nanosecond, None),
+        Operator::GtEq,
+        DataType::Timestamp(Nanosecond, None)
+    );
 
     // list
     let inner_field = Arc::new(Field::new_list_field(DataType::Int64, true));
@@ -790,4 +808,22 @@ fn test_decimal_cross_variant_comparison_coercion() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_type_union_coercion_prefers_finer_timestamp_unit() {
+    assert_eq!(
+        type_union_resolution(&[
+            DataType::Timestamp(Second, None),
+            DataType::Timestamp(Millisecond, None),
+        ]),
+        Some(DataType::Timestamp(Millisecond, None))
+    );
+    assert_eq!(
+        type_union_resolution(&[
+            DataType::Timestamp(Second, None),
+            DataType::Timestamp(Nanosecond, None),
+        ]),
+        Some(DataType::Timestamp(Nanosecond, None))
+    );
 }
