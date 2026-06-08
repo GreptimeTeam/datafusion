@@ -3916,11 +3916,21 @@ impl ScalarValue {
         cast_options: &CastOptions<'static>,
     ) -> Result<Self> {
         let source_type = self.data_type();
+
+        // Temporal casts that increase precision can overflow when the value is
+        // scaled to the target unit. For safe casts, return NULL for the
+        // overflowing scalar; otherwise preserve the regular cast error.
         if let Some(multiplier) = date_to_timestamp_multiplier(&source_type, target_type)
             .or_else(|| timestamp_to_timestamp_multiplier(&source_type, target_type))
             && let Some(value) = self.temporal_scalar_value_as_i64()
         {
-            ensure_timestamp_in_bounds(value, multiplier, &source_type, target_type)?;
+            if cast_options.safe {
+                if multiplier > 1 && value.checked_mul(multiplier).is_none() {
+                    return ScalarValue::try_new_null(target_type);
+                }
+            } else {
+                ensure_timestamp_in_bounds(value, multiplier, &source_type, target_type)?;
+            }
         }
 
         let scalar_array = self.to_array()?;

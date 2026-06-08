@@ -330,7 +330,9 @@ fn cast_array_by_name(
             )
         }
         _ => {
-            ensure_temporal_array_timestamp_bounds(array, cast_type)?;
+            if !cast_options.safe {
+                ensure_temporal_array_timestamp_bounds(array, cast_type)?;
+            }
             Ok(kernels::cast::cast_with_options(
                 array,
                 cast_type,
