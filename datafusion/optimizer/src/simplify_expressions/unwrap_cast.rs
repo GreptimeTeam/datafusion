@@ -34,24 +34,43 @@
 //! 3. `cast(literal_expr) IN (expr1, expr2, ...)`
 //! 4. `literal_expr IN (cast(expr1) , cast(expr2), ...)`
 //!
-//! If the expression matches one of the forms above, the rule will
-//! ensure the value of `literal` is in range(min, max) of the
-//! expr's data_type, and if the scalar is within range, the literal
-//! will be casted to the data type of expr on the other side, and the
-//! cast will be removed from the other side.
+//! ## Safety
 //!
-//! # Example
+//! Unwrap is **closed by default**: it is only allowed when the cast is
+//! known to preserve comparison semantics. The full allowlist is defined
+//! in `datafusion::expr::common::casts::is_supported_comparison_unwrap_cast`.
+//! Currently allowed families: timestamp precision widening (including
+//! cross-timezone), integer widening (including Date32↔Int32), binary
+//! widening, integer→string (Eq/NotEq/IsDistinctFrom/IsNotDistinctFrom
+//! only), dictionary/string, decimal widening, and integer→decimal (with
+//! sufficient precision).
+//! The literal must round-trip exactly through both types.
 //!
-//! If the DataType of c1 is INT32. Given the filter
+//! # Examples
+//!
+//! If `ts` has DataType `Timestamp(Millisecond, None)`. Given the filter:
 //!
 //! ```text
-//! cast(c1 as INT64) > INT64(10)`
+//! CAST(ts AS Timestamp(Nanosecond, None)) = TimestampNanosecond(1000000, None)
 //! ```
 //!
-//! This rule will remove the cast and rewrite the expression to:
+//! Since the literal round-trips exactly (1000000ns / 1e6 = 1ms, 1ms * 1e6 = 1000000ns),
+//! this rule will remove the cast and rewrite the expression to:
 //!
 //! ```text
-//! c1 > INT32(10)
+//! ts = TimestampMillisecond(1, None)
+//! ```
+//!
+//! If `c1` has DataType `Int32`. Given the filter:
+//!
+//! ```text
+//! CAST(c1 AS Int64) > Int64(10)
+//! ```
+//!
+//! Since `Int64(10)` round-trips exactly through `Int32`, this rule rewrites to:
+//!
+//! ```text
+//! c1 > Int32(10)
 //! ```
 
 use arrow::datatypes::DataType;
@@ -59,46 +78,42 @@ use datafusion_common::{Result, ScalarValue};
 use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
 use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
-use datafusion_expr_common::casts::{is_supported_type, try_cast_literal_to_type};
+use datafusion_expr_common::casts::{
+    CastComparisonRewrite, try_cast_literal_for_comparison_unwrap,
+    try_cast_literal_to_type,
+};
 
 pub(super) fn unwrap_cast_in_comparison_for_binary(
     info: &SimplifyContext,
-    cast_expr: Expr,
-    literal: Expr,
+    cast_expr: &Expr,
+    literal: &Expr,
     op: Operator,
 ) -> Result<Transformed<Expr>> {
     match (cast_expr, literal) {
         (
-            Expr::TryCast(TryCast { expr, .. }) | Expr::Cast(Cast { expr, .. }),
+            Expr::TryCast(TryCast { expr, field }) | Expr::Cast(Cast { expr, field }),
             Expr::Literal(lit_value, _),
         ) => {
-            let Ok(expr_type) = info.get_data_type(&expr) else {
+            let Ok(expr_type) = info.get_data_type(expr) else {
                 return internal_err!("Can't get the data type of the expr {:?}", &expr);
             };
 
-            if let Some(value) = cast_literal_to_type_with_op(&lit_value, &expr_type, op)
+            if let Some(value) =
+                comparison_unwrap_literal(lit_value, &expr_type, field.data_type(), op)
             {
                 return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr {
-                    left: expr,
+                    left: expr.clone(),
                     op,
                     right: Box::new(lit(value)),
                 })));
             };
 
-            // if the lit_value can be casted to the type of internal_left_expr
-            // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
-            let Some(value) = try_cast_literal_to_type(&lit_value, &expr_type) else {
-                return internal_err!(
-                    "Can't cast the literal expr {:?} to type {}",
-                    &lit_value,
-                    &expr_type
-                );
-            };
-            Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr {
-                left: expr,
+            let original = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(cast_expr.clone()),
                 op,
-                right: Box::new(lit(value)),
-            })))
+                right: Box::new(literal.clone()),
+            });
+            Ok(Transformed::no(original))
         }
         _ => internal_err!("Expect cast expr and literal"),
     }
@@ -113,10 +128,12 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
     match (expr, literal) {
         (
             Expr::TryCast(TryCast {
-                expr: left_expr, ..
+                expr: left_expr,
+                field,
             })
             | Expr::Cast(Cast {
-                expr: left_expr, ..
+                expr: left_expr,
+                field,
             }),
             Expr::Literal(lit_val, _),
         ) => {
@@ -124,17 +141,12 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
                 return false;
             };
 
-            let Ok(lit_type) = info.get_data_type(literal) else {
+            if info.get_data_type(literal).is_err() {
                 return false;
             };
 
-            if cast_literal_to_type_with_op(lit_val, &expr_type, op).is_some() {
-                return true;
-            }
-
-            try_cast_literal_to_type(lit_val, &expr_type).is_some()
-                && is_supported_type(&expr_type)
-                && is_supported_type(&lit_type)
+            comparison_unwrap_literal(lit_val, &expr_type, field.data_type(), op)
+                .is_some()
         }
         _ => false,
     }
@@ -146,10 +158,12 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
     list: &[Expr],
 ) -> bool {
     let (Expr::TryCast(TryCast {
-        expr: left_expr, ..
+        expr: left_expr,
+        field,
     })
     | Expr::Cast(Cast {
-        expr: left_expr, ..
+        expr: left_expr,
+        field,
     })) = expr
     else {
         return false;
@@ -159,22 +173,21 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
         return false;
     };
 
-    if !is_supported_type(&expr_type) {
-        return false;
-    }
-
     for right in list {
-        let Ok(right_type) = info.get_data_type(right) else {
+        let Ok(_right_type) = info.get_data_type(right) else {
             return false;
         };
 
-        if !is_supported_type(&right_type) {
-            return false;
-        }
-
         match right {
             Expr::Literal(lit_val, _)
-                if try_cast_literal_to_type(lit_val, &expr_type).is_some() => {}
+                if comparison_unwrap_literal(
+                    lit_val,
+                    &expr_type,
+                    field.data_type(),
+                    Operator::Eq,
+                )
+                .is_some()
+                    && try_cast_literal_to_type(lit_val, &expr_type).is_some() => {}
             _ => return false,
         }
     }
@@ -182,50 +195,15 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
     true
 }
 
-///// Tries to move a cast from an expression (such as column) to the literal other side of a comparison operator./
-///
-/// Specifically, rewrites
-/// ```sql
-/// cast(col) <op> <literal>
-/// ```
-///
-/// To
-///
-/// ```sql
-/// col <op> cast(<literal>)
-/// col <op> <casted_literal>
-/// ```
-fn cast_literal_to_type_with_op(
+/// Tries to move a cast from an expression to the literal side of a comparison.
+pub(super) fn comparison_unwrap_literal(
     lit_value: &ScalarValue,
-    target_type: &DataType,
+    from_type: &DataType,
+    to_type: &DataType,
     op: Operator,
 ) -> Option<ScalarValue> {
-    match (op, lit_value) {
-        (
-            Operator::Eq | Operator::NotEq,
-            ScalarValue::Utf8(Some(_))
-            | ScalarValue::Utf8View(Some(_))
-            | ScalarValue::LargeUtf8(Some(_)),
-        ) => {
-            // Only try for integer types (TODO can we do this for other types
-            // like timestamps)?
-            use DataType::*;
-            if matches!(
-                target_type,
-                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
-            ) {
-                let casted = lit_value.cast_to(target_type).ok()?;
-                let round_tripped = casted.cast_to(&lit_value.data_type()).ok()?;
-                if lit_value != &round_tripped {
-                    return None;
-                }
-                Some(casted)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    try_cast_literal_for_comparison_unwrap(lit_value, from_type, to_type, op)
+        .map(CastComparisonRewrite::into_literal)
 }
 
 #[cfg(test)]
@@ -255,7 +233,7 @@ mod tests {
         let expr_lt = cast(col("c1"), DataType::Int64).lt(lit(99999999999i64));
         assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
-        // cast(c1, UTF8) < '123', only eq/not_eq should be optimized
+        // cast(c1, UTF8) < '123', inequality with string cast is not unwrapped
         let expr_lt = cast(col("c1"), DataType::Utf8).lt(lit("123"));
         assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
@@ -277,21 +255,28 @@ mod tests {
     #[test]
     fn test_unwrap_cast_comparison() {
         let schema = expr_test_schema();
-        // cast(c1, INT64) < INT64(16) -> INT32(c1) < cast(INT32(16))
-        // the 16 is within the range of MAX(int32) and MIN(int32), we can cast the 16 to int32(16)
+        // Int32→Int64 widening cast is now unwrapped: literal 16i64 is cast back to 16i32.
         let expr_lt = cast(col("c1"), DataType::Int64).lt(lit(16i64));
         let expected = col("c1").lt(lit(16i32));
         assert_eq!(optimize_test(expr_lt, &schema), expected);
+        // try_cast Int32→Int64 widening is also unwrapped.
         let expr_lt = try_cast(col("c1"), DataType::Int64).lt(lit(16i64));
         let expected = col("c1").lt(lit(16i32));
         assert_eq!(optimize_test(expr_lt, &schema), expected);
 
-        // cast(c2, INT32) = INT32(16) => INT64(c2) = INT64(16)
+        // Int64 source domain is wider than Int32.
         let c2_eq_lit = cast(col("c2"), DataType::Int32).eq(lit(16i32));
-        let expected = col("c2").eq(lit(16i64));
-        assert_eq!(optimize_test(c2_eq_lit, &schema), expected);
+        assert_eq!(optimize_test(c2_eq_lit.clone(), &schema), c2_eq_lit);
 
-        // cast(c1, INT64) < INT64(NULL) => NULL
+        // Int32 contains negative values outside the UInt32 target domain.
+        let c1_eq_lit = cast(col("c1"), DataType::UInt32).eq(lit(16u32));
+        assert_eq!(optimize_test(c1_eq_lit.clone(), &schema), c1_eq_lit);
+
+        // UInt64 has values above Int64::MAX.
+        let c8_lt_lit = cast(col("c8"), DataType::Int64).lt(lit(16i64));
+        assert_eq!(optimize_test(c8_lt_lit.clone(), &schema), c8_lt_lit);
+
+        // Comparison against NULL is still folded by general simplification.
         let c1_lt_lit_null = cast(col("c1"), DataType::Int64).lt(null_i64());
         let expected = null_bool();
         assert_eq!(optimize_test(c1_lt_lit_null, &schema), expected);
@@ -301,17 +286,28 @@ mod tests {
         let expected = null_bool();
         assert_eq!(optimize_test(lit_lt_lit, &schema), expected);
 
-        // cast(c1, UTF8) = '123' => c1 = 123
+        // cast(c1, UTF8) = '123': should BE unwrapped (Int→String is allowed with round-trip)
         let expr_input = cast(col("c1"), DataType::Utf8).eq(lit("123"));
         let expected = col("c1").eq(lit(123i32));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // cast(c1, UTF8) != '123' => c1 != 123
+        // cast(c1, UTF8) != '123': Int→String is allowed for equality-like ops (Eq/NotEq/IsDistinctFrom/IsNotDistinctFrom)
         let expr_input = cast(col("c1"), DataType::Utf8).not_eq(lit("123"));
         let expected = col("c1").not_eq(lit(123i32));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // cast(c1, UTF8) = NULL => NULL
+        // cast(c1, UTF8) IS DISTINCT FROM '123': Int→String also allowed for IsDistinctFrom
+        let expr_input = is_distinct_from(cast(col("c1"), DataType::Utf8), lit("123"));
+        let expected = is_distinct_from(col("c1"), lit(123i32));
+        assert_eq!(optimize_test(expr_input, &schema), expected);
+
+        // cast(c1, UTF8) IS NOT DISTINCT FROM '123': Int→String also allowed for IsNotDistinctFrom
+        let expr_input =
+            is_not_distinct_from(cast(col("c1"), DataType::Utf8), lit("123"));
+        let expected = is_not_distinct_from(col("c1"), lit(123i32));
+        assert_eq!(optimize_test(expr_input, &schema), expected);
+
+        // Comparison against NULL is still folded by general simplification.
         let expr_input = cast(col("c1"), DataType::Utf8).eq(lit(ScalarValue::Utf8(None)));
         let expected = null_bool();
         assert_eq!(optimize_test(expr_input, &schema), expected);
@@ -319,18 +315,18 @@ mod tests {
 
     #[test]
     fn test_unwrap_cast_comparison_unsigned() {
-        // "cast(c6, UINT64) = 0u64 => c6 = 0u32
+        // UInt32→UInt64 widening is now unwrapped.
         let schema = expr_test_schema();
         let expr_input = cast(col("c6"), DataType::UInt64).eq(lit(0u64));
         let expected = col("c6").eq(lit(0u32));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // cast(c6, UTF8) = "123" => c6 = 123
+        // cast(c6, UTF8) = "123": Integer→String is allowed for Eq (round-trip safe).
         let expr_input = cast(col("c6"), DataType::Utf8).eq(lit("123"));
         let expected = col("c6").eq(lit(123u32));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // cast(c6, UTF8) != "123" => c6 != 123
+        // cast(c6, UTF8) != "123": Integer→String also allowed for NotEq.
         let expr_input = cast(col("c6"), DataType::Utf8).not_eq(lit("123"));
         let expected = col("c6").not_eq(lit(123u32));
         assert_eq!(optimize_test(expr_input, &schema), expected);
@@ -344,27 +340,29 @@ mod tests {
             Box::new(ScalarValue::from("value")),
         );
 
-        // cast(str1 as Dictionary<Int32, Utf8>) = arrow_cast('value', 'Dictionary<Int32, Utf8>') => str1 = Utf8('value1')
+        // Dictionary wrapping is widening: Utf8→Dict(Int32,Utf8) is now unwrapped.
         let expr_input = cast(col("str1"), dict.data_type()).eq(lit(dict.clone()));
-        let expected = col("str1").eq(lit("value"));
+        let expected = col("str1").eq(lit(ScalarValue::from("value")));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // cast(tag as Utf8) = Utf8('value') => tag = arrow_cast('value', 'Dictionary<Int32, Utf8>')
+        // Dictionary unwrapping: Dict→Utf8 is now unwrapped (widening from Utf8→Dict).
         let expr_input = cast(col("tag"), DataType::Utf8).eq(lit("value"));
-        let expected = col("tag").eq(lit(dict.clone()));
+        let expected = col("tag").eq(lit(ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some("value".to_owned()))),
+        )));
         assert_eq!(optimize_test(expr_input, &schema), expected);
 
-        // Verify reversed argument order
-        // arrow_cast('value', 'Dictionary<Int32, Utf8>') = cast(str1 as Dictionary<Int32, Utf8>) => Utf8('value1') = str1
+        // Reversed argument order: optimizer normalizes column-on-left.
         let expr_input = lit(dict.clone()).eq(cast(col("str1"), dict.data_type()));
-        let expected = col("str1").eq(lit("value"));
+        let expected = col("str1").eq(lit(ScalarValue::Utf8(Some("value".to_owned()))));
         assert_eq!(optimize_test(expr_input, &schema), expected);
     }
 
     #[test]
     fn test_unwrap_cast_comparison_large_string() {
         let schema = expr_test_schema();
-        // cast(largestr as Dictionary<Int32, LargeUtf8>) = arrow_cast('value', 'Dictionary<Int32, LargeUtf8>') => str1 = LargeUtf8('value1')
+        // Dictionary casts between string-like types can be unwrapped.
         let dict = ScalarValue::Dictionary(
             Box::new(DataType::Int32),
             Box::new(ScalarValue::LargeUtf8(Some("value".to_owned()))),
@@ -403,39 +401,43 @@ mod tests {
         let expr_eq =
             cast(col("c1"), DataType::Decimal128(10, 2)).eq(lit_decimal(1230, 10, 2));
         assert_eq!(optimize_test(expr_eq.clone(), &schema), expr_eq);
+
+        // Decimal(10, 2) cannot represent the scaled Int64 domain.
+        let expr_lt =
+            cast(col("c2"), DataType::Decimal128(10, 2)).lt(lit_decimal(12300, 10, 2));
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
     }
 
     #[test]
     fn test_unwrap_cast_with_decimal_lit_comparison() {
         let schema = expr_test_schema();
-        // integer to decimal
-        // c3 < INT64(16) -> c3 < (CAST(INT64(16) AS DECIMAL(18,2));
+        // Fractional decimal -> integer is lossy.
         let expr_lt = try_cast(col("c3"), DataType::Int64).lt(lit(16i64));
-        let expected = col("c3").lt(lit_decimal(1600, 18, 2));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
         // c3 < INT64(NULL)
         let c1_lt_lit_null = cast(col("c3"), DataType::Int64).lt(null_i64());
         let expected = null_bool();
         assert_eq!(optimize_test(c1_lt_lit_null, &schema), expected);
 
-        // decimal to decimal
-        // c3 < Decimal(123,10,0) -> c3 < CAST(DECIMAL(123,10,0) AS DECIMAL(18,2)) -> c3 < DECIMAL(12300,18,2)
+        // Decimal scale downcast is lossy.
         let expr_lt =
             cast(col("c3"), DataType::Decimal128(10, 0)).lt(lit_decimal(123, 10, 0));
-        let expected = col("c3").lt(lit_decimal(12300, 18, 2));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
-        // c3 < Decimal(1230,10,3) -> c3 < CAST(DECIMAL(1230,10,3) AS DECIMAL(18,2)) -> c3 < DECIMAL(123,18,2)
+        // Increasing scale can still reduce the integer range.
         let expr_lt =
             cast(col("c3"), DataType::Decimal128(10, 3)).lt(lit_decimal(1230, 10, 3));
-        let expected = col("c3").lt(lit_decimal(123, 18, 2));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
-        // decimal to integer
-        // c1 < Decimal(12300, 10, 2) -> c1 < CAST(DECIMAL(12300,10,2) AS INT32) -> c1 < INT32(123)
+        // Int32→Decimal(10,2): p-s=8 < 10 integer digits → NOT safe, stays blocked
         let expr_lt =
             cast(col("c1"), DataType::Decimal128(10, 2)).lt(lit_decimal(12300, 10, 2));
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
+
+        // Int32→Decimal(12,2): p-s=10 ≥ 10 → now unwraps
+        let expr_lt =
+            cast(col("c1"), DataType::Decimal128(12, 2)).lt(lit_decimal(12300, 12, 2));
         let expected = col("c1").lt(lit(123i32));
         assert_eq!(optimize_test(expr_lt, &schema), expected);
     }
@@ -472,10 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unwrap_list_cast_comparison() {
+    fn test_not_unwrap_list_cast_comparison() {
         let schema = expr_test_schema();
-        // INT32(C1) IN (INT32(12),INT64(23),INT64(34),INT64(56),INT64(78)) ->
-        // INT32(C1) IN (INT32(12),INT32(23),INT32(34),INT32(56),INT32(78))
+        // Int32→Int64 widening IN-list is now unwrapped.
         let expr_lt = cast(col("c1"), DataType::Int64).in_list(
             vec![lit(12i64), lit(23i64), lit(34i64), lit(56i64), lit(78i64)],
             false,
@@ -485,22 +486,15 @@ mod tests {
             false,
         );
         assert_eq!(optimize_test(expr_lt, &schema), expected);
-        // INT32(C2) IN (INT64(NULL),INT64(24),INT64(34),INT64(56),INT64(78)) ->
-        // INT32(C2) IN (INT32(NULL),INT32(24),INT32(34),INT32(56),INT32(78))
+        // Int32 cannot represent the full Int64 source domain.
         let expr_lt = cast(col("c2"), DataType::Int32).in_list(
             vec![null_i32(), lit(24i32), lit(34i64), lit(56i64), lit(78i64)],
             false,
         );
-        let expected = col("c2").in_list(
-            vec![null_i64(), lit(24i64), lit(34i64), lit(56i64), lit(78i64)],
-            false,
-        );
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
-
-        // decimal test case
-        // c3 is decimal(18,2)
-        let expr_lt = cast(col("c3"), DataType::Decimal128(19, 3)).in_list(
+        // Decimal widening (18,2)→(19,3) is now unwrapped: same integer digits, scale 2→3.
+        let cast_expr = cast(col("c3"), DataType::Decimal128(19, 3)).in_list(
             vec![
                 lit_decimal(12000, 19, 3),
                 lit_decimal(24000, 19, 3),
@@ -518,7 +512,7 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(cast_expr, &schema), expected);
 
         // cast(INT32(12), INT64) IN (.....) =>
         // INT64(12) IN (INT64(12),INT64(13),INT64(14),INT64(15),INT64(16))
@@ -534,8 +528,7 @@ mod tests {
     #[test]
     fn aliased() {
         let schema = expr_test_schema();
-        // c1 < INT64(16) -> c1 < cast(INT32(16))
-        // the 16 is within the range of MAX(int32) and MIN(int32), we can cast the 16 to int32(16)
+        // Int32→Int64 widening with alias is now unwrapped.
         let expr_lt = cast(col("c1"), DataType::Int64).lt(lit(16i64)).alias("x");
         let expected = col("c1").lt(lit(16i32)).alias("x");
         assert_eq!(optimize_test(expr_lt, &schema), expected);
@@ -544,8 +537,7 @@ mod tests {
     #[test]
     fn nested() {
         let schema = expr_test_schema();
-        // c1 < INT64(16) OR c1 > INT64(32) -> c1 < INT32(16) OR c1 > INT32(32)
-        // the 16 and 32 are within the range of MAX(int32) and MIN(int32), we can cast them to int32
+        // Int32→Int64 widening in nested OR is now unwrapped.
         let expr_lt = cast(col("c1"), DataType::Int64).lt(lit(16i64)).or(cast(
             col("c1"),
             DataType::Int64,
@@ -575,15 +567,227 @@ mod tests {
     }
 
     #[test]
-    /// Basic integration test for unwrapping casts with different timezones
-    fn test_unwrap_cast_with_timestamp_nanos() {
+    /// Cross-timezone timestamp casts are now unwrapped (raw i64 stores UTC epoch).
+    fn test_unwrap_cast_cross_timezone() {
         let schema = expr_test_schema();
-        // cast(ts_nano as Timestamp(Nanosecond, UTC)) < 1666612093000000000::Timestamp(Nanosecond, Utc))
         let expr_lt = try_cast(col("ts_nano_none"), timestamp_nano_utc_type())
             .lt(lit_timestamp_nano_utc(1666612093000000000));
-        let expected =
-            col("ts_nano_none").lt(lit_timestamp_nano_none(1666612093000000000));
+        let expected = col("ts_nano_none").lt(lit(ScalarValue::TimestampNanosecond(
+            Some(1666612093000000000),
+            None,
+        )));
         assert_eq!(optimize_test(expr_lt, &schema), expected);
+    }
+
+    #[test]
+    /// Cross-timezone unwrap works for non-UTC timezones (e.g. +08:00).
+    fn test_unwrap_cast_cross_timezone_non_utc() {
+        let schema = expr_test_schema();
+        // Cast from None → +08:00 with precision widening (ms → ns).
+        let tz = Some("+08:00".into());
+        let cast_type = DataType::Timestamp(TimeUnit::Nanosecond, tz.clone());
+        // 1000ms = 1_000_000_000ns at a boundary, so round-trips exactly.
+        let lit_ns = lit(ScalarValue::TimestampNanosecond(Some(1_000_000_000), tz));
+        let expr_lt = try_cast(col("ts_millis_none"), cast_type).lt(lit_ns);
+        let expected = col("ts_millis_none").lt(lit_timestamp_millis_none(1000));
+        assert_eq!(optimize_test(expr_lt, &schema), expected);
+    }
+
+    #[test]
+    fn test_not_unwrap_cast_with_timestamp_precision_downcast() {
+        let schema = expr_test_schema();
+
+        // Nanoseconds -> milliseconds loses precision.
+        for op in [
+            Operator::Eq,
+            Operator::NotEq,
+            Operator::Lt,
+            Operator::LtEq,
+            Operator::Gt,
+            Operator::GtEq,
+        ] {
+            let expr = binary_expr(
+                cast(col("ts_nano_none"), timestamp_millis_none_type()),
+                op,
+                lit_timestamp_millis_none(1000),
+            );
+            assert_eq!(optimize_test(expr.clone(), &schema), expr);
+
+            let literal_left = binary_expr(
+                lit_timestamp_millis_none(1000),
+                op,
+                cast(col("ts_nano_none"), timestamp_millis_none_type()),
+            );
+            assert_eq!(optimize_test(literal_left.clone(), &schema), literal_left);
+        }
+
+        let try_cast_expr = try_cast(col("ts_nano_none"), timestamp_millis_none_type())
+            .gt(lit_timestamp_millis_none(1000));
+        assert_eq!(optimize_test(try_cast_expr.clone(), &schema), try_cast_expr);
+
+        let timezone_expr = cast(col("ts_nano_utf"), timestamp_millis_utc_type())
+            .eq(lit_timestamp_millis_utc(1000));
+        assert_eq!(optimize_test(timezone_expr.clone(), &schema), timezone_expr);
+
+        let in_list_expr = in_list(
+            cast(col("ts_nano_none"), timestamp_millis_none_type()),
+            vec![
+                lit_timestamp_millis_none(1000),
+                lit_timestamp_millis_none(1001),
+            ],
+            false,
+        );
+        assert_eq!(optimize_test(in_list_expr.clone(), &schema), in_list_expr);
+    }
+
+    #[test]
+    fn test_unwrap_cast_with_non_lossy_timestamp_precision_casts() {
+        let schema = expr_test_schema();
+
+        let same_precision = cast(col("ts_nano_none"), timestamp_nano_none_type())
+            .eq(lit_timestamp_nano_none(1000));
+        let expected = col("ts_nano_none").eq(lit_timestamp_nano_none(1000));
+        assert_eq!(optimize_test(same_precision, &schema), expected);
+
+        let same_precision_literal_left = binary_expr(
+            lit_timestamp_nano_none(1000),
+            Operator::Gt,
+            cast(col("ts_nano_none"), timestamp_nano_none_type()),
+        );
+        let expected = col("ts_nano_none").lt(lit_timestamp_nano_none(1000));
+        assert_eq!(
+            optimize_test(same_precision_literal_left, &schema),
+            expected
+        );
+
+        let upcast = cast(col("ts_millis_none"), timestamp_nano_none_type())
+            .lt(lit_timestamp_nano_none(1_000_000_000));
+        let expected = col("ts_millis_none").lt(lit_timestamp_millis_none(1000));
+        assert_eq!(optimize_test(upcast, &schema), expected);
+
+        let non_boundary_upcast = cast(col("ts_millis_none"), timestamp_nano_none_type())
+            .eq(lit_timestamp_nano_none(1_000_000_001));
+        assert_eq!(
+            optimize_test(non_boundary_upcast.clone(), &schema),
+            non_boundary_upcast
+        );
+
+        let upcast_literal_left = binary_expr(
+            lit_timestamp_nano_none(1_000_000_000),
+            Operator::Gt,
+            cast(col("ts_millis_none"), timestamp_nano_none_type()),
+        );
+        let expected = col("ts_millis_none").lt(lit_timestamp_millis_none(1000));
+        assert_eq!(optimize_test(upcast_literal_left, &schema), expected);
+    }
+
+    #[test]
+    fn test_not_unwrap_cast_with_lossy_decimal_precision_casts() {
+        let schema = expr_test_schema();
+
+        // Decimal scale downcast loses fractional precision.
+        let expr =
+            cast(col("c3"), DataType::Decimal128(18, 1)).eq(lit_decimal(123, 18, 1));
+        assert_eq!(optimize_test(expr.clone(), &schema), expr);
+
+        // Precision downcast narrows the integer range.
+        let precision_downcast =
+            cast(col("c3"), DataType::Decimal128(10, 2)).eq(lit_decimal(12345, 10, 2));
+        assert_eq!(
+            optimize_test(precision_downcast.clone(), &schema),
+            precision_downcast
+        );
+
+        // Increasing scale can still narrow range if it reduces integer digits.
+        let scale_up_range_downcast =
+            cast(col("c3"), DataType::Decimal128(12, 4)).eq(lit_decimal(1234500, 12, 4));
+        assert_eq!(
+            optimize_test(scale_up_range_downcast.clone(), &schema),
+            scale_up_range_downcast
+        );
+
+        let literal_left = binary_expr(
+            lit_decimal(123, 18, 1),
+            Operator::LtEq,
+            cast(col("c3"), DataType::Decimal128(18, 1)),
+        );
+        assert_eq!(optimize_test(literal_left.clone(), &schema), literal_left);
+
+        let in_list_expr = in_list(
+            cast(col("c3"), DataType::Decimal128(18, 1)),
+            vec![lit_decimal(123, 18, 1), lit_decimal(124, 18, 1)],
+            false,
+        );
+        assert_eq!(optimize_test(in_list_expr.clone(), &schema), in_list_expr);
+
+        let decimal_to_integer = cast(col("c3"), DataType::Int64).eq(lit(16i64));
+        assert_eq!(
+            optimize_test(decimal_to_integer.clone(), &schema),
+            decimal_to_integer
+        );
+    }
+
+    #[test]
+    fn test_not_unwrap_cast_with_lossy_date_timestamp_casts() {
+        let schema = expr_test_schema();
+
+        let timestamp_to_date = cast(col("ts_nano_none"), DataType::Date32)
+            .eq(lit(ScalarValue::Date32(Some(0))));
+        assert_eq!(
+            optimize_test(timestamp_to_date.clone(), &schema),
+            timestamp_to_date
+        );
+
+        let date_to_timestamp = cast(col("date32"), timestamp_millis_none_type())
+            .eq(lit_timestamp_millis_none(0));
+        assert_eq!(
+            optimize_test(date_to_timestamp.clone(), &schema),
+            date_to_timestamp
+        );
+
+        let timestamp_to_date_inequality = cast(col("ts_nano_none"), DataType::Date32)
+            .lt_eq(lit(ScalarValue::Date32(Some(0))));
+        assert_eq!(
+            optimize_test(timestamp_to_date_inequality.clone(), &schema),
+            timestamp_to_date_inequality
+        );
+
+        let timestamp_to_date_in_list = in_list(
+            cast(col("ts_nano_none"), DataType::Date32),
+            vec![
+                lit(ScalarValue::Date32(Some(0))),
+                lit(ScalarValue::Date32(Some(1))),
+            ],
+            false,
+        );
+        assert_eq!(
+            optimize_test(timestamp_to_date_in_list.clone(), &schema),
+            timestamp_to_date_in_list
+        );
+    }
+
+    #[test]
+    fn test_not_unwrap_cast_with_lossy_float_casts() {
+        let schema = expr_test_schema();
+
+        // Float64 -> Float32 loses precision.
+        let float_precision_downcast =
+            cast(col("c7"), DataType::Float32).eq(lit(ScalarValue::Float32(Some(1.25))));
+        assert_eq!(
+            optimize_test(float_precision_downcast.clone(), &schema),
+            float_precision_downcast
+        );
+
+        // Float32 -> integer is lossy.
+        let float_to_integer = cast(col("c5"), DataType::Int32).lt(lit(1i32));
+        assert_eq!(
+            optimize_test(float_to_integer.clone(), &schema),
+            float_to_integer
+        );
+
+        let literal_left =
+            binary_expr(lit(1i32), Operator::GtEq, cast(col("c5"), DataType::Int32));
+        assert_eq!(optimize_test(literal_left.clone(), &schema), literal_left);
     }
 
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
@@ -606,7 +810,11 @@ mod tests {
                     Field::new("c4", DataType::Decimal128(38, 37), false),
                     Field::new("c5", DataType::Float32, false),
                     Field::new("c6", DataType::UInt32, false),
+                    Field::new("c7", DataType::Float64, false),
+                    Field::new("c8", DataType::UInt64, false),
+                    Field::new("date32", DataType::Date32, false),
                     Field::new("ts_nano_none", timestamp_nano_none_type(), false),
+                    Field::new("ts_millis_none", timestamp_millis_none_type(), false),
                     Field::new("ts_nano_utf", timestamp_nano_utc_type(), false),
                     Field::new("str1", DataType::Utf8, false),
                     Field::new("largestr", DataType::LargeUtf8, false),
@@ -648,8 +856,42 @@ mod tests {
         lit(ScalarValue::TimestampNanosecond(Some(ts), utc))
     }
 
+    fn lit_timestamp_millis_none(ts: i64) -> Expr {
+        lit(ScalarValue::TimestampMillisecond(Some(ts), None))
+    }
+
+    fn lit_timestamp_millis_utc(ts: i64) -> Expr {
+        let utc = Some("+0:00".into());
+        lit(ScalarValue::TimestampMillisecond(Some(ts), utc))
+    }
+
+    fn binary_expr(left: Expr, op: Operator, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    fn is_distinct_from(left: Expr, right: Expr) -> Expr {
+        binary_expr(left, Operator::IsDistinctFrom, right)
+    }
+
+    fn is_not_distinct_from(left: Expr, right: Expr) -> Expr {
+        binary_expr(left, Operator::IsNotDistinctFrom, right)
+    }
+
     fn timestamp_nano_none_type() -> DataType {
         DataType::Timestamp(TimeUnit::Nanosecond, None)
+    }
+
+    fn timestamp_millis_none_type() -> DataType {
+        DataType::Timestamp(TimeUnit::Millisecond, None)
+    }
+
+    fn timestamp_millis_utc_type() -> DataType {
+        let utc = Some("+0:00".into());
+        DataType::Timestamp(TimeUnit::Millisecond, utc)
     }
 
     // this is the type that now() returns

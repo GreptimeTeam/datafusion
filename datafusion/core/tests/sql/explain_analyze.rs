@@ -530,12 +530,15 @@ async fn csv_explain_inlist_verbose() {
     // flatten to a single string
     let actual = actual.into_iter().map(|r| r.join("\t")).collect::<String>();
 
-    // before optimization (Int64 literals)
+    // Before optimization: type coercion may present Int64 literals.
+    // After note: unwrap_cast converts CAST(c2 AS Int64) IN [Int64(…)]
+    // → c2 IN [Int8(…)], so the optimized plan shows Int8 literals below.
     assert_contains!(
         &actual,
         "aggregate_test_100.c2 IN ([Int64(1), Int64(2), Int64(4), Int64(5)])"
     );
-    // after optimization (casted to Int8)
+    // After unwrap_cast: CAST(c2 AS Int64) is removed, Int64 literals
+    // become Int8 literals since Int8→Int64 is a widening cast.
     assert_contains!(
         &actual,
         "aggregate_test_100.c2 IN ([Int8(1), Int8(2), Int8(4), Int8(5)])"
