@@ -840,9 +840,9 @@ impl HashJoinExec {
     }
 
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
-        if self.join_type != JoinType::Inner
-            || !config.optimizer.enable_join_dynamic_filter_pushdown
-        {
+        let (_, probe_preserved) = self.join_type.on_lr_is_preserved();
+
+        if !probe_preserved || !config.optimizer.enable_join_dynamic_filter_pushdown {
             return false;
         }
 
@@ -5937,5 +5937,91 @@ mod tests {
         assert_eq!(lr_is_preserved(JoinType::RightSemi), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightAnti), (true, true));
         assert_eq!(lr_is_preserved(JoinType::RightMark), (false, true));
+    }
+
+    #[test]
+    fn test_on_lr_is_preserved() {
+        assert_eq!(JoinType::Inner.on_lr_is_preserved(), (true, true));
+        assert_eq!(JoinType::Left.on_lr_is_preserved(), (false, true));
+        assert_eq!(JoinType::Right.on_lr_is_preserved(), (true, false));
+        assert_eq!(JoinType::Full.on_lr_is_preserved(), (false, false));
+        assert_eq!(JoinType::LeftSemi.on_lr_is_preserved(), (true, true));
+        assert_eq!(JoinType::RightSemi.on_lr_is_preserved(), (true, true));
+        assert_eq!(JoinType::LeftAnti.on_lr_is_preserved(), (false, true));
+        assert_eq!(JoinType::RightAnti.on_lr_is_preserved(), (true, false));
+        assert_eq!(JoinType::LeftMark.on_lr_is_preserved(), (false, true));
+        assert_eq!(JoinType::RightMark.on_lr_is_preserved(), (true, false));
+    }
+
+    #[test]
+    fn test_allow_join_dynamic_filter_pushdown_gate() -> Result<()> {
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![1]), ("c1", &vec![1]));
+        let right = build_table(("a2", &vec![1]), ("b1", &vec![1]), ("c2", &vec![1]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+
+        let mut config = ConfigOptions::default();
+        config.optimizer.enable_join_dynamic_filter_pushdown = true;
+
+        for (join_type, expected) in [
+            (JoinType::Inner, true),
+            (JoinType::Left, true),
+            (JoinType::Right, false),
+            (JoinType::Full, false),
+            (JoinType::LeftSemi, true),
+            (JoinType::RightSemi, true),
+            (JoinType::LeftAnti, true),
+            (JoinType::RightAnti, false),
+            (JoinType::LeftMark, true),
+            (JoinType::RightMark, false),
+        ] {
+            let join = HashJoinExec::try_new(
+                Arc::clone(&left),
+                Arc::clone(&right),
+                on.clone(),
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?;
+            assert_eq!(
+                join.allow_join_dynamic_filter_pushdown(&config),
+                expected,
+                "join_type: {join_type:?}"
+            );
+        }
+
+        let null_aware_left_anti = HashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+        assert!(null_aware_left_anti.allow_join_dynamic_filter_pushdown(&config));
+
+        config.optimizer.enable_join_dynamic_filter_pushdown = false;
+        let inner_join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        assert!(!inner_join.allow_join_dynamic_filter_pushdown(&config));
+
+        Ok(())
     }
 }
