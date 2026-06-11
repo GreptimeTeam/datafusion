@@ -18,6 +18,7 @@
 //! [`SimplifyExpressions`] simplifies expressions in the logical plan,
 //! [`ExprSimplifier`] simplifies individual `Expr`s.
 
+mod cast_preimage;
 pub mod expr_simplifier;
 mod inlist_simplifier;
 mod linear_aggregates;
@@ -26,7 +27,6 @@ pub mod simplify_exprs;
 pub mod simplify_literal;
 mod simplify_predicates;
 mod udf_preimage;
-mod unwrap_cast;
 mod utils;
 
 // backwards compatibility
