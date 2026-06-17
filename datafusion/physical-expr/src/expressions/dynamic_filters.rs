@@ -272,6 +272,15 @@ impl DynamicFilterPhysicalExpr {
         });
     }
 
+    /// Returns whether this dynamic filter has been marked complete.
+    ///
+    /// This is a non-blocking snapshot of the completion state. It does not
+    /// synchronize with concurrent updates; use [`Self::wait_complete`] when
+    /// callers need to wait until completion.
+    pub fn is_complete(&self) -> bool {
+        self.inner.read().is_complete
+    }
+
     /// Wait asynchronously for any update to this filter.
     ///
     /// This method will return when [`Self::update`] is called and the generation increases.
@@ -636,9 +645,53 @@ mod test {
 
         // Mark as complete immediately
         dynamic_filter.mark_complete();
+        assert!(dynamic_filter.is_complete());
 
         // wait_complete should return immediately
         dynamic_filter.wait_complete().await;
+    }
+
+    #[test]
+    fn test_is_complete_initially_false() {
+        let dynamic_filter =
+            DynamicFilterPhysicalExpr::new(vec![], lit(42) as Arc<dyn PhysicalExpr>);
+
+        assert!(!dynamic_filter.is_complete());
+    }
+
+    #[test]
+    fn test_is_complete_false_after_update() {
+        let dynamic_filter =
+            DynamicFilterPhysicalExpr::new(vec![], lit(42) as Arc<dyn PhysicalExpr>);
+
+        dynamic_filter
+            .update(lit(43) as Arc<dyn PhysicalExpr>)
+            .expect("Failed to update expression");
+
+        assert!(!dynamic_filter.is_complete());
+    }
+
+    #[test]
+    fn test_is_complete_true_after_mark_complete() {
+        let dynamic_filter =
+            DynamicFilterPhysicalExpr::new(vec![], lit(42) as Arc<dyn PhysicalExpr>);
+
+        dynamic_filter.mark_complete();
+
+        assert!(dynamic_filter.is_complete());
+    }
+
+    #[test]
+    fn test_is_complete_true_after_update_then_mark_complete() {
+        let dynamic_filter =
+            DynamicFilterPhysicalExpr::new(vec![], lit(42) as Arc<dyn PhysicalExpr>);
+
+        dynamic_filter
+            .update(lit(43) as Arc<dyn PhysicalExpr>)
+            .expect("Failed to update expression");
+        dynamic_filter.mark_complete();
+
+        assert!(dynamic_filter.is_complete());
     }
 
     #[test]
