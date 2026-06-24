@@ -134,6 +134,13 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Visit each distinct hash value stored in this map exactly once.
+    ///
+    /// This is an internal/non-stable API intended for Bloom filter construction
+    /// and similar introspection. The visitor is called once per distinct hash,
+    /// regardless of how many build-side rows share that hash.
+    fn visit_hashes(&self, visitor: &mut dyn FnMut(u64));
 }
 
 pub struct JoinHashMapU32 {
@@ -212,6 +219,10 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn visit_hashes(&self, visitor: &mut dyn FnMut(u64)) {
+        visit_hashes(&self.map, visitor)
+    }
 }
 
 pub struct JoinHashMapU64 {
@@ -289,6 +300,10 @@ impl JoinHashMapType for JoinHashMapU64 {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn visit_hashes(&self, visitor: &mut dyn FnMut(u64)) {
+        visit_hashes(&self.map, visitor)
     }
 }
 
@@ -472,9 +487,16 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
     BooleanArray::new(buffer, None)
 }
 
+pub fn visit_hashes<T>(map: &HashTable<(u64, T)>, visitor: &mut dyn FnMut(u64)) {
+    for entry in map.iter() {
+        visitor(entry.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_contain_hashes() {
@@ -493,5 +515,35 @@ mod tests {
                 assert!(!array.value(i), "Hash {hash} should NOT exist in the map");
             }
         }
+    }
+
+    #[test]
+    fn test_visit_hashes_u32_distinct() {
+        let mut hash_map = JoinHashMapU32::with_capacity(10);
+        // Insert hashes: 10 appears twice (collision), 20 appears once, 30 appears three times
+        let hashes_to_insert: Vec<u64> = vec![10, 20, 10, 30, 30, 30];
+        hash_map.update_from_iter(Box::new(hashes_to_insert.iter().enumerate()), 0);
+
+        let mut visited = vec![];
+        hash_map.visit_hashes(&mut |h| visited.push(h));
+
+        // Each distinct hash should appear exactly once (order not guaranteed)
+        let visited_set: HashSet<u64> = visited.into_iter().collect();
+        let expected: HashSet<u64> = [10u64, 20, 30].into_iter().collect();
+        assert_eq!(visited_set, expected);
+    }
+
+    #[test]
+    fn test_visit_hashes_u64_distinct() {
+        let mut hash_map = JoinHashMapU64::with_capacity(10);
+        let hashes_to_insert: Vec<u64> = vec![100, 100, 200, 300, 100, 300];
+        hash_map.update_from_iter(Box::new(hashes_to_insert.iter().enumerate()), 0);
+
+        let mut visited = vec![];
+        hash_map.visit_hashes(&mut |h| visited.push(h));
+
+        let visited_set: HashSet<u64> = visited.into_iter().collect();
+        let expected: HashSet<u64> = [100u64, 200, 300].into_iter().collect();
+        assert_eq!(visited_set, expected);
     }
 }

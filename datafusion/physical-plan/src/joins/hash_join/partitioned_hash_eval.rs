@@ -244,6 +244,61 @@ impl HashTableLookupExpr {
             description,
         }
     }
+
+    /// Returns a reference to the columns used for computing the join key.
+    ///
+    /// This is public for internal testing purposes only and is not
+    /// guaranteed to be stable across versions.
+    pub fn on_columns(&self) -> &[PhysicalExprRef] {
+        &self.on_columns
+    }
+
+    /// Returns the seeds used for hashing join keys.
+    ///
+    /// This is public for internal testing purposes only and is not
+    /// guaranteed to be stable across versions.
+    pub fn seeds(&self) -> (u64, u64, u64, u64) {
+        self.random_state.seeds()
+    }
+
+    /// Returns the number of distinct join hash values stored in the
+    /// underlying [`Map::HashMap`].
+    ///
+    /// Returns `Some(count)` for [`Map::HashMap`], where `count` matches the
+    /// number of values visited by [`Self::visit_distinct_join_hashes`].
+    /// Returns `None` for [`Map::ArrayMap`] because it does not expose join
+    /// hashes and callers should fall back instead of approximating.
+    ///
+    /// This is public for internal testing purposes only and is not
+    /// guaranteed to be stable across versions.
+    pub fn distinct_join_hash_count(&self) -> Option<usize> {
+        match self.map.as_ref() {
+            Map::HashMap(map) => Some(map.len()),
+            Map::ArrayMap(_) => None,
+        }
+    }
+
+    /// Visit each distinct join hash value stored in the underlying [`Map`].
+    ///
+    /// Returns `Ok(true)` if the map is a [`Map::HashMap`] and the visitor was
+    /// called for each distinct hash. Returns `Ok(false)` if the map is a
+    /// [`Map::ArrayMap`] (which does not expose hashes — the caller should fall
+    /// back instead of treating this as an error).
+    ///
+    /// This is public for internal testing purposes only and is not
+    /// guaranteed to be stable across versions.
+    pub fn visit_distinct_join_hashes(
+        &self,
+        visitor: &mut dyn FnMut(u64),
+    ) -> Result<bool> {
+        match self.map.as_ref() {
+            Map::HashMap(map) => {
+                map.visit_hashes(visitor);
+                Ok(true)
+            }
+            Map::ArrayMap(_) => Ok(false),
+        }
+    }
 }
 
 impl std::fmt::Debug for HashTableLookupExpr {
@@ -365,8 +420,10 @@ fn evaluate_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::joins::join_hash_map::JoinHashMapU32;
+    use crate::joins::join_hash_map::{JoinHashMapType, JoinHashMapU32};
+    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::Column;
+    use std::collections::HashSet;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
 
@@ -598,5 +655,62 @@ mod tests {
         // Equal expressions should have equal hashes
         assert_eq!(expr1, expr2);
         assert_eq!(compute_hash(&expr1), compute_hash(&expr2));
+    }
+
+    #[test]
+    fn test_hash_table_lookup_expr_on_columns_and_seeds() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let col_b: PhysicalExprRef = Arc::new(Column::new("b", 1));
+        let hash_map =
+            Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(10))));
+
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a), Arc::clone(&col_b)],
+            SeededRandomState::with_seeds(11, 22, 33, 44),
+            Arc::clone(&hash_map),
+            "lookup".to_string(),
+        );
+
+        let cols = expr.on_columns();
+        assert_eq!(cols.len(), 2);
+        assert_columns_eq(cols[0].as_ref(), col_a.as_ref());
+        assert_columns_eq(cols[1].as_ref(), col_b.as_ref());
+
+        assert_eq!(expr.seeds(), (11, 22, 33, 44));
+    }
+
+    #[test]
+    fn test_visit_distinct_join_hashes_hash_map() {
+        let col_a: PhysicalExprRef = Arc::new(Column::new("a", 0));
+
+        // Build a HashMap with some duplicate hashes (collisions)
+        let mut hash_map = JoinHashMapU32::with_capacity(10);
+        // Insert hashes: 10 appears 3 times, 20 once, 30 twice
+        let hashes: Vec<u64> = vec![10, 20, 10, 30, 30, 10];
+        hash_map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+
+        let map = Arc::new(Map::HashMap(Box::new(hash_map)));
+        let expr = HashTableLookupExpr::new(
+            vec![Arc::clone(&col_a)],
+            SeededRandomState::with_seeds(1, 2, 3, 4),
+            map,
+            "lookup".to_string(),
+        );
+
+        let mut visited = vec![];
+        let result = expr.visit_distinct_join_hashes(&mut |h| visited.push(h));
+
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Should return true for HashMap");
+        assert_eq!(expr.distinct_join_hash_count(), Some(3));
+
+        let visited_set: HashSet<u64> = visited.into_iter().collect();
+        let expected: HashSet<u64> = [10u64, 20, 30].into_iter().collect();
+        assert_eq!(visited_set, expected);
+    }
+
+    fn assert_columns_eq(a: &dyn PhysicalExpr, b: &dyn PhysicalExpr) {
+        // Simple comparison via Debug representation
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 }

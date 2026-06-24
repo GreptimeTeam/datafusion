@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::joins::MapOffset;
 use crate::joins::join_hash_map::{
     contain_hashes, get_matched_indices, get_matched_indices_with_limit_offset,
-    update_from_iter,
+    update_from_iter, visit_hashes,
 };
 use crate::joins::utils::{JoinFilter, JoinHashMapType};
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder};
@@ -106,6 +106,10 @@ impl JoinHashMapType for PruningJoinHashMap {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn visit_hashes(&self, visitor: &mut dyn FnMut(u64)) {
+        visit_hashes(&self.map, visitor)
     }
 }
 
