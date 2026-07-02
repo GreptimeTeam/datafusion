@@ -166,10 +166,7 @@ mod tests {
         let result_left = result_binary.left();
         assert!(
             result_left.as_any().downcast_ref::<CastExpr>().is_some()
-                || result_left
-                    .as_any()
-                    .downcast_ref::<TryCastExpr>()
-                    .is_some(),
+                || result_left.as_any().downcast_ref::<TryCastExpr>().is_some(),
             "CAST(c2 AS Int32) should remain as Int64→Int32 is narrowing"
         );
     }
@@ -215,7 +212,10 @@ mod tests {
         let right_binary = as_binary(or_binary.right());
         let right_left_expr = right_binary.left();
         assert!(
-            right_left_expr.as_any().downcast_ref::<CastExpr>().is_some()
+            right_left_expr
+                .as_any()
+                .downcast_ref::<CastExpr>()
+                .is_some()
                 || right_left_expr
                     .as_any()
                     .downcast_ref::<TryCastExpr>()
