@@ -52,12 +52,15 @@ pub fn try_cast_literal_to_type(
     target_type: &DataType,
 ) -> Option<ScalarValue> {
     let lit_data_type = lit_value.data_type();
-    if !is_supported_type(&lit_data_type) || !is_supported_type(target_type) {
-        return None;
-    }
     if lit_value.is_null() {
         // null value can be cast to any type of null value
         return ScalarValue::try_from(target_type).ok();
+    }
+    if let Some(value) = try_cast_date_integer_literal(lit_value, target_type) {
+        return Some(value);
+    }
+    if !is_supported_type(&lit_data_type) || !is_supported_type(target_type) {
+        return None;
     }
     try_cast_numeric_literal(lit_value, target_type)
         .or_else(|| try_cast_string_literal(lit_value, target_type))
@@ -494,27 +497,6 @@ pub fn is_supported_type(data_type: &DataType) -> bool {
         || is_supported_binary_type(data_type)
 }
 
-fn is_date_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Date32 | DataType::Date64)
-}
-
-/// Returns true when unwrapping a date/timestamp cast could change comparison
-/// semantics.
-///
-/// A `Date` stores only a calendar day, while a `Timestamp` stores a specific
-/// instant or wall-clock time. `Timestamp -> Date` is lossy because it drops the
-/// time-of-day. `Date -> Timestamp` is also lossy in this optimizer context
-/// because there is no unique inverse: converting a date to a timestamp has to
-/// invent a time component such as midnight.
-///
-/// For example, `CAST(ts AS DATE) = DATE '2024-01-01'` means "any timestamp
-/// during that day", but unwrapping it to `ts = TIMESTAMP '2024-01-01
-/// 00:00:00'` matches only midnight.
-fn is_lossy_temporal_cast(from_type: &DataType, to_type: &DataType) -> bool {
-    (is_date_type(from_type) && to_type.is_temporal())
-        || (is_date_type(to_type) && from_type.is_temporal())
-}
-
 /// Returns true if unwrap_cast_in_comparison supports this numeric type
 fn is_supported_numeric_type(data_type: &DataType) -> bool {
     matches!(
@@ -550,6 +532,19 @@ fn is_supported_dictionary_type(data_type: &DataType) -> bool {
 
 fn is_supported_binary_type(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Binary | DataType::FixedSizeBinary(_))
+}
+
+fn try_cast_date_integer_literal(
+    lit_value: &ScalarValue,
+    target_type: &DataType,
+) -> Option<ScalarValue> {
+    match (lit_value, target_type) {
+        (ScalarValue::Date32(v), DataType::Int32) => Some(ScalarValue::Int32(*v)),
+        (ScalarValue::Int32(v), DataType::Date32) => Some(ScalarValue::Date32(*v)),
+        (ScalarValue::Date64(v), DataType::Int64) => Some(ScalarValue::Int64(*v)),
+        (ScalarValue::Int64(v), DataType::Date64) => Some(ScalarValue::Date64(*v)),
+        _ => None,
+    }
 }
 
 /// Convert a numeric value from one numeric data type to another

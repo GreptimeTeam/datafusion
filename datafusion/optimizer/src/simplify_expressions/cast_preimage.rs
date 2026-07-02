@@ -169,18 +169,24 @@ pub(super) fn rewrite_cast_predicate_for_inlist(
 
 fn cast_input_and_type(cast_expr: Expr) -> Option<(Box<Expr>, DataType)> {
     match cast_expr {
-        Expr::TryCast(TryCast { expr, field, .. })
-        | Expr::Cast(Cast { expr, field, .. }) => Some((expr, field.data_type().clone())),
+        Expr::TryCast(TryCast {
+            expr, data_type, ..
+        })
+        | Expr::Cast(Cast {
+            expr, data_type, ..
+        }) => Some((expr, data_type)),
         _ => None,
     }
 }
 
 fn cast_input_and_type_ref(cast_expr: &Expr) -> Option<(&Expr, &DataType)> {
     match cast_expr {
-        Expr::TryCast(TryCast { expr, field, .. })
-        | Expr::Cast(Cast { expr, field, .. }) => {
-            Some((expr.as_ref(), field.data_type()))
-        }
+        Expr::TryCast(TryCast {
+            expr, data_type, ..
+        })
+        | Expr::Cast(Cast {
+            expr, data_type, ..
+        }) => Some((expr.as_ref(), data_type)),
         _ => None,
     }
 }
@@ -443,9 +449,7 @@ mod tests {
 
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
         let simplifier = ExprSimplifier::new(
-            SimplifyContext::builder()
-                .with_schema(Arc::clone(schema))
-                .build(),
+            SimplifyContext::default().with_schema(Arc::clone(schema)),
         );
 
         simplifier.simplify(expr).unwrap()

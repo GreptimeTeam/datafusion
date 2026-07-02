@@ -201,7 +201,7 @@ fn binary(
 mod tests {
     use super::*;
     use crate::expressions::{col, lit};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_common::{ScalarValue, tree_node::TreeNode};
     use datafusion_expr::Operator;
 
@@ -679,10 +679,14 @@ mod tests {
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
 
         assert!(result.transformed);
-        let optimized_binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        let optimized_binary = result.data.as_any().downcast_ref::<BinaryExpr>().unwrap();
         assert_eq!(*optimized_binary.op(), Operator::GtEq);
         assert!(!is_cast_expr(optimized_binary.left()));
-        let right_literal = optimized_binary.right().downcast_ref::<Literal>().unwrap();
+        let right_literal = optimized_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             right_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(1_001_000_000), None)
@@ -702,20 +706,36 @@ mod tests {
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
 
         assert!(result.transformed);
-        let and_binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        let and_binary = result.data.as_any().downcast_ref::<BinaryExpr>().unwrap();
         assert_eq!(*and_binary.op(), Operator::And);
 
-        let lower_binary = and_binary.left().downcast_ref::<BinaryExpr>().unwrap();
+        let lower_binary = and_binary
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*lower_binary.op(), Operator::GtEq);
-        let lower_literal = lower_binary.right().downcast_ref::<Literal>().unwrap();
+        let lower_literal = lower_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             lower_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(-1_999_999), None)
         );
 
-        let upper_binary = and_binary.right().downcast_ref::<BinaryExpr>().unwrap();
+        let upper_binary = and_binary
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*upper_binary.op(), Operator::Lt);
-        let upper_literal = upper_binary.right().downcast_ref::<Literal>().unwrap();
+        let upper_literal = upper_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             upper_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(-999_999), None)
@@ -735,10 +755,14 @@ mod tests {
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
 
         assert!(result.transformed);
-        let optimized_binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        let optimized_binary = result.data.as_any().downcast_ref::<BinaryExpr>().unwrap();
         assert_eq!(*optimized_binary.op(), Operator::GtEq);
         assert!(!is_cast_expr(optimized_binary.left()));
-        let right_literal = optimized_binary.right().downcast_ref::<Literal>().unwrap();
+        let right_literal = optimized_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             right_literal.value(),
             &ScalarValue::TimestampMillisecond(Some(123), None)
@@ -770,34 +794,55 @@ mod tests {
         assert!(result.transformed);
 
         // Expected: OR( OR(expr < lower, expr >= upper), IS NULL(expr) )
-        let outer_or = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        let outer_or = result.data.as_any().downcast_ref::<BinaryExpr>().unwrap();
         assert_eq!(*outer_or.op(), Operator::Or);
 
         // Right side of outer OR → IS NULL
         assert!(
             outer_or
                 .right()
+                .as_any()
                 .downcast_ref::<crate::expressions::IsNullExpr>()
                 .is_some()
         );
 
         // Left side of outer OR → OR(expr < lower, expr >= upper)
-        let inner_or = outer_or.left().downcast_ref::<BinaryExpr>().unwrap();
+        let inner_or = outer_or
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*inner_or.op(), Operator::Or);
 
         // Left-left: expr < lower
-        let lt_binary = inner_or.left().downcast_ref::<BinaryExpr>().unwrap();
+        let lt_binary = inner_or
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*lt_binary.op(), Operator::Lt);
-        let lt_literal = lt_binary.right().downcast_ref::<Literal>().unwrap();
+        let lt_literal = lt_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             lt_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(1_000_000_000), None)
         );
 
         // Left-right: expr >= upper
-        let gte_binary = inner_or.right().downcast_ref::<BinaryExpr>().unwrap();
+        let gte_binary = inner_or
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*gte_binary.op(), Operator::GtEq);
-        let gte_literal = gte_binary.right().downcast_ref::<Literal>().unwrap();
+        let gte_literal = gte_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             gte_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(1_001_000_000), None)
@@ -819,34 +864,55 @@ mod tests {
         assert!(result.transformed);
 
         // Expected: AND( AND(IS NOT NULL(expr), expr >= lower), expr < upper )
-        let outer_and = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        let outer_and = result.data.as_any().downcast_ref::<BinaryExpr>().unwrap();
         assert_eq!(*outer_and.op(), Operator::And);
 
         // Right side of outer AND → expr < upper
-        let upper_binary = outer_and.right().downcast_ref::<BinaryExpr>().unwrap();
+        let upper_binary = outer_and
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*upper_binary.op(), Operator::Lt);
-        let upper_literal = upper_binary.right().downcast_ref::<Literal>().unwrap();
+        let upper_literal = upper_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             upper_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(1_001_000_000), None)
         );
 
         // Left side of outer AND → AND(IS NOT NULL(expr), expr >= lower)
-        let inner_and = outer_and.left().downcast_ref::<BinaryExpr>().unwrap();
+        let inner_and = outer_and
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*inner_and.op(), Operator::And);
 
         // Left-left: IS NOT NULL
         assert!(
             inner_and
                 .left()
+                .as_any()
                 .downcast_ref::<crate::expressions::IsNotNullExpr>()
                 .is_some()
         );
 
         // Left-right: expr >= lower
-        let gte_binary = inner_and.right().downcast_ref::<BinaryExpr>().unwrap();
+        let gte_binary = inner_and
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap();
         assert_eq!(*gte_binary.op(), Operator::GtEq);
-        let gte_literal = gte_binary.right().downcast_ref::<Literal>().unwrap();
+        let gte_literal = gte_binary
+            .right()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .unwrap();
         assert_eq!(
             gte_literal.value(),
             &ScalarValue::TimestampNanosecond(Some(1_000_000_000), None)

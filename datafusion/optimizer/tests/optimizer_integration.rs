@@ -16,16 +16,24 @@
 // under the License.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{Result, TableReference, plan_err};
+use datafusion_common::{
+    DFSchemaRef, Result, ScalarValue, TableReference, ToDFSchema, plan_err,
+};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::test::function_stub::sum_udaf;
-use datafusion_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF};
+use datafusion_expr::{
+    AggregateUDF, Cast, Expr, Extension, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
+    SortExpr, TableProviderFilterPushDown, TableSource, UserDefinedLogicalNodeCore,
+    WindowUDF, col,
+};
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::planner::AggregateFunctionPlanner;
@@ -750,6 +758,10 @@ struct InexactFilterTableSource {
 }
 
 impl TableSource for InexactFilterTableSource {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -818,9 +830,14 @@ fn extension_node_does_not_block_projection_pruning() -> Result<()> {
     OpaqueRequirementsExtension
       Sort: t.a ASC NULLS FIRST, t.ts ASC NULLS FIRST
         Projection: t.a, CAST(t.ts AS Timestamp(ms, "UTC")) AS ts
-          Filter: __common_expr_3 > TimestampMillisecond(1000, Some("UTC")) AND __common_expr_3 < TimestampMillisecond(2000, Some("UTC"))
-            Projection: CAST(t.ts AS Timestamp(ms, "UTC")) AS __common_expr_3, t.a, t.ts
-              TableScan: t projection=[a, ts], partial_filters=[t.ts >= TimestampNanosecond(1001000000, None), t.ts < TimestampNanosecond(2000000000, None), CAST(t.ts AS Timestamp(ms, "UTC")) > TimestampMillisecond(1000, Some("UTC")), CAST(t.ts AS Timestamp(ms, "UTC")) < TimestampMillisecond(2000, Some("UTC"))]
+          Projection: t.a, t.b, t.ts
+            Projection: CAST(t.ts AS Timestamp(ms, "UTC")) AS __common_expr_1, t.a, t.b, t.ts
+              Projection: t.a, t.b, t.ts
+                Projection: CAST(t.ts AS Timestamp(ms, "UTC")) AS __common_expr_2, t.a, t.b, t.ts
+                  Projection: t.a, t.b, t.ts
+                    Filter: __common_expr_3 > TimestampMillisecond(1000, Some("UTC")) AND __common_expr_3 < TimestampMillisecond(2000, Some("UTC"))
+                      Projection: CAST(t.ts AS Timestamp(ms, "UTC")) AS __common_expr_3, t.a, t.b, t.ts
+                        TableScan: t, partial_filters=[t.ts >= TimestampNanosecond(1001000000, None), t.ts < TimestampNanosecond(2000000000, None), CAST(t.ts AS Timestamp(ms, "UTC")) > TimestampMillisecond(1000, Some("UTC")), CAST(t.ts AS Timestamp(ms, "UTC")) < TimestampMillisecond(2000, Some("UTC"))]
     "#,
     );
 
