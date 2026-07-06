@@ -445,6 +445,80 @@ fn keeps_pushed_local_limit_exec_when_there_are_multiple_input_partitions() -> R
 }
 
 #[test]
+fn keeps_global_limit_when_fetching_filter_has_multiple_output_partitions() -> Result<()>
+{
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let global_limit = global_limit_exec(filter, 0, Some(5));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=5
+      FilterExec: c3@2 > 0
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=5
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn keeps_global_skip_when_fetching_filter_has_multiple_output_partitions() -> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let global_limit = global_limit_exec(filter, 2, Some(5));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=2, fetch=5
+      FilterExec: c3@2 > 0
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    GlobalLimitExec: skip=2, fetch=5
+      CoalescePartitionsExec: fetch=7
+        FilterExec: c3@2 > 0, fetch=7
+          RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+            StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
 fn merges_local_limit_with_local_limit() -> Result<()> {
     let schema = create_schema();
     let empty_exec = empty_exec(schema);

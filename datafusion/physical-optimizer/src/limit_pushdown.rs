@@ -266,15 +266,12 @@ pub fn pushdown_limit_helper(
                     .with_preserve_order(global_state.preserve_order)
                     .unwrap_or(plan_with_fetch);
 
-                if global_skip > 0 {
-                    add_global_limit(
-                        plan_with_preserve_order,
-                        global_skip,
-                        Some(global_fetch),
-                    )
-                } else {
-                    plan_with_preserve_order
-                }
+                add_global_limit_to_fetchable_plan(
+                    plan_with_preserve_order,
+                    global_skip,
+                    global_fetch,
+                    global_state.preserve_order,
+                )
             } else {
                 add_limit(pushdown_plan, global_skip, global_fetch)
             };
@@ -347,6 +344,46 @@ fn add_limit(
         add_global_limit(pushdown_plan, skip, Some(fetch))
     } else {
         Arc::new(LocalLimitExec::new(pushdown_plan, fetch + skip)) as _
+    }
+}
+
+/// Adds a global limit above a plan that already absorbed the limit as a
+/// fetch. The embedded fetch is only a global limit when the plan has a single
+/// output partition. For multi-partition plans, the fetch is applied per
+/// partition, so we must still merge partitions before enforcing the global
+/// skip/fetch.
+fn add_global_limit_to_fetchable_plan(
+    pushdown_plan: Arc<dyn ExecutionPlan>,
+    skip: usize,
+    fetch: usize,
+    preserve_order: bool,
+) -> Arc<dyn ExecutionPlan> {
+    if pushdown_plan.output_partitioning().partition_count() == 1 {
+        if skip > 0 {
+            add_global_limit(pushdown_plan, skip, Some(fetch))
+        } else {
+            pushdown_plan
+        }
+    } else {
+        let skip_and_fetch = Some(fetch + skip);
+        let merged: Arc<dyn ExecutionPlan> = if preserve_order
+            && let Some(ordering) = pushdown_plan.output_ordering().cloned()
+        {
+            Arc::new(
+                SortPreservingMergeExec::new(ordering, pushdown_plan)
+                    .with_fetch(skip_and_fetch),
+            )
+        } else {
+            Arc::new(
+                CoalescePartitionsExec::new(pushdown_plan).with_fetch(skip_and_fetch),
+            )
+        };
+
+        if skip > 0 {
+            add_global_limit(merged, skip, Some(fetch))
+        } else {
+            merged
+        }
     }
 }
 
