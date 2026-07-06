@@ -519,6 +519,42 @@ fn keeps_global_skip_when_fetching_filter_has_multiple_output_partitions() -> Re
 }
 
 #[test]
+fn preserves_local_limit_when_fetching_filter_has_multiple_output_partitions()
+-> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let local_limit = local_limit_exec(filter, 5);
+
+    let initial = format_plan(&local_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    LocalLimitExec: fetch=5
+      FilterExec: c3@2 > 0
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(local_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    FilterExec: c3@2 > 0, fetch=5
+      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+        StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
 fn merges_local_limit_with_local_limit() -> Result<()> {
     let schema = create_schema();
     let empty_exec = empty_exec(schema);
