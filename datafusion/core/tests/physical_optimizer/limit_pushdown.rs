@@ -76,6 +76,23 @@ fn filter_exec(
     )?))
 }
 
+fn filter_exec_with_fetch(
+    schema: SchemaRef,
+    input: Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let filter = FilterExec::try_new(
+        Arc::new(BinaryExpr::new(
+            col("c3", schema.as_ref()).unwrap(),
+            Operator::Gt,
+            lit(0),
+        )),
+        input,
+    )?;
+
+    Ok(filter.with_fetch(Some(fetch)).unwrap())
+}
+
 fn repartition_exec(
     streaming_table: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -546,6 +563,117 @@ fn preserves_local_limit_when_fetching_filter_has_multiple_output_partitions()
         optimized,
         @r"
     FilterExec: c3@2 > 0, fetch=5
+      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+        StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserves_inner_local_limit_after_outer_global_limit_is_satisfied() -> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let local_limit = local_limit_exec(filter, 5);
+    let coalesce_partitions = coalesce_partitions_exec(local_limit);
+    let global_limit = global_limit_exec(coalesce_partitions, 0, Some(100));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=100
+      CoalescePartitionsExec
+        LocalLimitExec: fetch=5
+          FilterExec: c3@2 > 0
+            RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+              StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=100
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn keeps_global_limit_when_child_with_existing_fetch_has_multiple_output_partitions()
+-> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec_with_fetch(schema, repartition, 5)?;
+    let global_limit = global_limit_exec(filter, 0, Some(5));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=5
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=5
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn keeps_global_limit_when_unfetchable_plan_has_multiple_output_partitions() -> Result<()>
+{
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let global_limit = global_limit_exec(repartition, 0, Some(5));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=5
+      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+        StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=5
       RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
         StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
     "
