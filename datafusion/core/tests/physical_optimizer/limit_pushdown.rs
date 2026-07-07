@@ -36,7 +36,7 @@ use datafusion_physical_optimizer::limit_pushdown::LimitPushdown;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::NestedLoopJoinExec;
-use datafusion_physical_plan::limit::GlobalLimitExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::{ExecutionPlan, get_plan_string};
@@ -718,6 +718,100 @@ fn preserves_inner_local_limit_after_outer_global_limit_is_satisfied() -> Result
       FilterExec: c3@2 > 0, fetch=5
         RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
           StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserves_order_for_required_inner_local_limit_under_outer_global_limit() -> Result<()>
+{
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let streaming_table = stream_exec_ordered(&schema, ordering.clone());
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let mut local_limit = LocalLimitExec::new(filter, 5);
+    local_limit.set_required_ordering(Some(ordering));
+    let global_limit = global_limit_exec(
+        Arc::new(local_limit) as Arc<dyn ExecutionPlan>,
+        0,
+        Some(100),
+    );
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=100
+      LocalLimitExec: fetch=5
+        FilterExec: c3@2 > 0
+          RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+            StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    SortPreservingMergeExec: [c1@0 ASC], fetch=100
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserves_order_across_nested_limits() -> Result<()> {
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let streaming_table = stream_exec_ordered(&schema, ordering.clone());
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(schema, repartition)?;
+    let inner_global_limit = global_limit_exec(filter, 0, Some(10));
+    let mut outer_global_limit = GlobalLimitExec::new(inner_global_limit, 0, Some(5));
+    outer_global_limit.set_required_ordering(Some(ordering));
+    let outer_global_limit = Arc::new(outer_global_limit) as Arc<dyn ExecutionPlan>;
+
+    let initial = format_plan(&outer_global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=5
+      GlobalLimitExec: skip=0, fetch=10
+        FilterExec: c3@2 > 0
+          RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+            StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(outer_global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    SortPreservingMergeExec: [c1@0 ASC], fetch=5
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
     "
     );
 

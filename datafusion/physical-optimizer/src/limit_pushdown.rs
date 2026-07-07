@@ -154,6 +154,7 @@ pub fn pushdown_limit_helper(
             && !limit_exec.is_global()
             && limit_exec.input().output_partitioning().partition_count() > 1
         {
+            global_state.preserve_order |= limit_exec.preserve_order();
             let local_fetch = limit_exec.fetch();
             let child_fetch = limit_exec.input().fetch();
             let fetch_for_input = match (local_fetch, child_fetch) {
@@ -203,7 +204,7 @@ pub fn pushdown_limit_helper(
         );
         global_state.skip = skip;
         global_state.fetch = fetch;
-        global_state.preserve_order = limit_exec.preserve_order();
+        global_state.preserve_order |= limit_exec.preserve_order();
         global_state.requires_global_limit |= limit_exec.is_global();
         global_state.satisfied = false;
 
