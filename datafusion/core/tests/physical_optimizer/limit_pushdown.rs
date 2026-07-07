@@ -649,6 +649,42 @@ fn keeps_global_limit_when_child_with_existing_fetch_has_multiple_output_partiti
 }
 
 #[test]
+fn keeps_larger_global_limit_when_existing_child_fetch_is_per_partition() -> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec_with_fetch(schema, repartition, 3)?;
+    let global_limit = global_limit_exec(filter, 0, Some(5));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=5
+      FilterExec: c3@2 > 0, fetch=3
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=5
+      FilterExec: c3@2 > 0, fetch=3
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
 fn keeps_global_limit_when_unfetchable_plan_has_multiple_output_partitions() -> Result<()>
 {
     let schema = create_schema();
