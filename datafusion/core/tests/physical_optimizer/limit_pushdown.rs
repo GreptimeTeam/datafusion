@@ -610,6 +610,44 @@ fn preserves_inner_local_limit_under_outer_global_limit() -> Result<()> {
 }
 
 #[test]
+fn preserves_smaller_child_fetch_under_local_and_global_limits() -> Result<()> {
+    let schema = create_schema();
+    let streaming_table = stream_exec(&schema);
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec_with_fetch(schema, repartition, 3)?;
+    let local_limit = local_limit_exec(filter, 5);
+    let global_limit = global_limit_exec(local_limit, 0, Some(100));
+
+    let initial = format_plan(&global_limit);
+    insta::assert_snapshot!(
+        initial,
+        @r"
+    GlobalLimitExec: skip=0, fetch=100
+      LocalLimitExec: fetch=5
+        FilterExec: c3@2 > 0, fetch=3
+          RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+            StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    let after_optimize =
+        LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+
+    let optimized = format_plan(&after_optimize);
+    insta::assert_snapshot!(
+        optimized,
+        @r"
+    CoalescePartitionsExec: fetch=100
+      FilterExec: c3@2 > 0, fetch=3
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
 fn preserves_unfetchable_inner_local_limit_under_outer_global_limit() -> Result<()> {
     let schema = create_schema();
     let streaming_table = stream_exec(&schema);

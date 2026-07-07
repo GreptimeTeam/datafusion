@@ -154,8 +154,15 @@ pub fn pushdown_limit_helper(
             && !limit_exec.is_global()
             && limit_exec.input().output_partitioning().partition_count() > 1
         {
-            if let Some(input_with_fetch) =
-                limit_exec.input().with_fetch(limit_exec.fetch())
+            let local_fetch = limit_exec.fetch();
+            let child_fetch = limit_exec.input().fetch();
+            let fetch_for_input = match (local_fetch, child_fetch) {
+                (Some(local), Some(child)) => Some(local.min(child)),
+                (Some(local), None) => Some(local),
+                (None, Some(child)) => Some(child),
+                (None, None) => None,
+            };
+            if let Some(input_with_fetch) = limit_exec.input().with_fetch(fetch_for_input)
             {
                 return Ok((
                     Transformed {
