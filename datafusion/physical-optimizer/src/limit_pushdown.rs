@@ -153,17 +153,37 @@ pub fn pushdown_limit_helper(
         if global_state.requires_global_limit
             && !limit_exec.is_global()
             && limit_exec.input().output_partitioning().partition_count() > 1
-            && let Some(input_with_fetch) =
-                limit_exec.input().with_fetch(limit_exec.fetch())
         {
-            return Ok((
-                Transformed {
-                    data: input_with_fetch,
-                    transformed: true,
-                    tnr: TreeNodeRecursion::Stop,
-                },
-                global_state,
-            ));
+            if let Some(input_with_fetch) =
+                limit_exec.input().with_fetch(limit_exec.fetch())
+            {
+                return Ok((
+                    Transformed {
+                        data: input_with_fetch,
+                        transformed: true,
+                        tnr: TreeNodeRecursion::Stop,
+                    },
+                    global_state,
+                ));
+            }
+
+            if let Some(global_fetch) = global_state.fetch {
+                let global_skip = global_state.skip;
+                global_state.fetch = None;
+                global_state.skip = 0;
+                global_state.satisfied = true;
+                global_state.requires_global_limit = false;
+
+                return Ok((
+                    Transformed::yes(add_global_limit_to_unfetchable_plan(
+                        pushdown_plan,
+                        global_skip,
+                        global_fetch,
+                        global_state.preserve_order,
+                    )),
+                    global_state,
+                ));
+            }
         }
 
         // If we have fetch/skip info in the global state already, we need to
