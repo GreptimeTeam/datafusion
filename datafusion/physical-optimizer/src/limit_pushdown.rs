@@ -150,6 +150,22 @@ pub fn pushdown_limit_helper(
 ) -> Result<(Transformed<Arc<dyn ExecutionPlan>>, GlobalRequirements)> {
     // Extract limit, if exist, and return child inputs.
     if let Some(limit_exec) = extract_limit(&pushdown_plan) {
+        if global_state.requires_global_limit
+            && !limit_exec.is_global()
+            && limit_exec.input().output_partitioning().partition_count() > 1
+            && let Some(input_with_fetch) =
+                limit_exec.input().with_fetch(limit_exec.fetch())
+        {
+            return Ok((
+                Transformed {
+                    data: input_with_fetch,
+                    transformed: true,
+                    tnr: TreeNodeRecursion::Stop,
+                },
+                global_state,
+            ));
+        }
+
         // If we have fetch/skip info in the global state already, we need to
         // decide which one to continue with:
         let (skip, fetch) = combine_limit(
