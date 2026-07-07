@@ -392,19 +392,24 @@ pub(crate) fn pushdown_limits(
 /// [`GlobalLimitExec`] or a [`LocalLimitExec`].
 fn extract_limit(plan: &Arc<dyn ExecutionPlan>) -> Option<LimitExec> {
     if let Some(global_limit) = plan.as_any().downcast_ref::<GlobalLimitExec>() {
-        Some(LimitExec::Global(GlobalLimitExec::new(
+        let mut new_global_limit = GlobalLimitExec::new(
             Arc::clone(global_limit.input()),
             global_limit.skip(),
             global_limit.fetch(),
-        )))
+        );
+        new_global_limit.set_required_ordering(global_limit.required_ordering().clone());
+        Some(LimitExec::Global(new_global_limit))
     } else {
         plan.as_any()
             .downcast_ref::<LocalLimitExec>()
             .map(|local_limit| {
-                LimitExec::Local(LocalLimitExec::new(
+                let mut new_local_limit = LocalLimitExec::new(
                     Arc::clone(local_limit.input()),
                     local_limit.fetch(),
-                ))
+                );
+                new_local_limit
+                    .set_required_ordering(local_limit.required_ordering().clone());
+                LimitExec::Local(new_local_limit)
             })
     }
 }
