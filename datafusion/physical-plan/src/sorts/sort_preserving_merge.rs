@@ -381,7 +381,8 @@ impl ExecutionPlan for SortPreservingMergeExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(None)
+        let statistics = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+        Ok(Arc::new(statistics.with_fetch(self.fetch, 0, 1)?))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -433,7 +434,9 @@ mod tests {
     use crate::sorts::sort::SortExec;
     use crate::stream::RecordBatchReceiverStream;
     use crate::test::TestMemoryExec;
-    use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
+    use crate::test::exec::{
+        BlockingExec, StatisticsExec, assert_strong_count_converges_to_zero,
+    };
     use crate::test::{self, assert_is_pending, make_partition};
     use crate::{collect, common};
 
@@ -443,8 +446,9 @@ mod tests {
     };
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
-    use datafusion_common::{assert_batches_eq, exec_err};
+    use datafusion_common::{ColumnStatistics, assert_batches_eq, exec_err};
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -457,6 +461,45 @@ mod tests {
     use futures::{FutureExt, Stream, StreamExt};
     use insta::assert_snapshot;
     use tokio::time::timeout;
+
+    #[test]
+    fn test_fetch_caps_statistics() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Exact(1_000),
+                total_byte_size: Precision::Exact(8_000),
+                column_statistics: vec![ColumnStatistics::new_unknown()],
+            },
+            schema.clone(),
+        ));
+        let sort = [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
+
+        let spm = SortPreservingMergeExec::new(sort, input).with_fetch(Some(1));
+        let statistics = spm.partition_statistics(None)?;
+
+        assert_eq!(statistics.num_rows, Precision::Exact(1));
+        assert_eq!(statistics.total_byte_size, Precision::Inexact(8));
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_fetch_preserves_statistics() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Exact(8_000),
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        let input = Arc::new(StatisticsExec::new(input_stats.clone(), schema.clone()));
+        let sort = [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
+
+        let spm = SortPreservingMergeExec::new(sort, input);
+        let statistics = spm.partition_statistics(None)?;
+
+        assert_eq!(*statistics, input_stats);
+        Ok(())
+    }
 
     // The number in the function is highly related to the memory limit we are testing
     // any change of the constant should be aware of
