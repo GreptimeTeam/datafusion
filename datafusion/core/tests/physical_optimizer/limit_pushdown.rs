@@ -19,13 +19,17 @@ use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
     coalesce_partitions_exec, global_limit_exec, hash_join_exec, local_limit_exec,
-    sort_exec, sort_preserving_merge_exec, stream_exec,
+    sort_exec, sort_preserving_merge_exec, stream_exec, stream_exec_ordered,
 };
+use arrow::array::Int32Array;
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use datafusion_common::assert_batches_eq;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
+use datafusion_execution::TaskContext;
 use datafusion_expr::{JoinType, Operator};
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
@@ -36,9 +40,11 @@ use datafusion_physical_optimizer::limit_pushdown::LimitPushdown;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::NestedLoopJoinExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
-use datafusion_physical_plan::{ExecutionPlan, get_plan_string};
+use datafusion_physical_plan::test::TestMemoryExec;
+use datafusion_physical_plan::{ExecutionPlan, collect, get_plan_string};
 
 fn create_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -76,6 +82,23 @@ fn filter_exec(
     )?))
 }
 
+fn filter_exec_with_fetch(
+    schema: SchemaRef,
+    input: Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    Ok(FilterExec::try_new(
+        Arc::new(BinaryExpr::new(
+            col("c3", schema.as_ref())?,
+            Operator::Gt,
+            lit(0),
+        )),
+        input,
+    )?
+    .with_fetch(Some(fetch))
+    .expect("FilterExec supports fetch"))
+}
+
 fn repartition_exec(
     streaming_table: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -101,6 +124,303 @@ fn nested_loop_join_exec(
 
 fn format_plan(plan: &Arc<dyn ExecutionPlan>) -> String {
     get_plan_string(plan).join("\n")
+}
+
+fn two_partition_memory_filter() -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+    let partitions = [
+        vec![RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?],
+        vec![RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![3, 4]))],
+        )?],
+    ];
+    let input = TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+    Ok(Arc::new(FilterExec::try_new(
+        Arc::new(BinaryExpr::new(
+            col("c1", schema.as_ref())?,
+            Operator::Gt,
+            lit(0),
+        )),
+        input,
+    )?))
+}
+
+#[tokio::test]
+async fn global_limit_fetching_filter_multi_partition_returns_exact_no_skip_rows()
+-> Result<()> {
+    let plan = global_limit_exec(two_partition_memory_filter()?, 0, Some(2));
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let batches = collect(optimized, Arc::new(TaskContext::default())).await?;
+
+    assert_batches_eq!(
+        ["+----+", "| c1 |", "+----+", "| 1  |", "| 2  |", "+----+",],
+        &batches
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_limit_fetching_filter_multi_partition_returns_exact_skip_rows()
+-> Result<()> {
+    let plan = global_limit_exec(two_partition_memory_filter()?, 1, Some(2));
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let batches = collect(optimized, Arc::new(TaskContext::default())).await?;
+
+    assert_batches_eq!(
+        ["+----+", "| c1 |", "+----+", "| 2  |", "| 3  |", "+----+",],
+        &batches
+    );
+    Ok(())
+}
+
+#[test]
+fn keeps_global_limit_when_fetching_filter_has_multiple_output_partitions() -> Result<()>
+{
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+        0,
+        Some(5),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert_eq!(
+        format_plan(&optimized),
+        "CoalescePartitionsExec: fetch=5\n  FilterExec: c3@2 > 0, fetch=5\n    RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1\n      StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true"
+    );
+    Ok(())
+}
+
+#[test]
+fn keeps_global_skip_when_fetching_filter_has_multiple_output_partitions() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+        2,
+        Some(5),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert_eq!(
+        format_plan(&optimized),
+        "GlobalLimitExec: skip=2, fetch=5\n  CoalescePartitionsExec: fetch=7\n    FilterExec: c3@2 > 0, fetch=7\n      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1\n        StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true"
+    );
+    Ok(())
+}
+
+#[test]
+fn preserves_local_limit_when_fetching_filter_has_multiple_output_partitions()
+-> Result<()> {
+    let schema = create_schema();
+    let plan = local_limit_exec(
+        filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+        5,
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert!(format_plan(&optimized).starts_with("FilterExec: c3@2 > 0, fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn keeps_global_limit_when_child_with_existing_fetch_has_multiple_output_partitions()
+-> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        filter_exec_with_fetch(
+            schema,
+            repartition_exec(stream_exec(&create_schema()))?,
+            5,
+        )?,
+        0,
+        Some(5),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let plan = format_plan(&optimized);
+    assert!(plan.starts_with("CoalescePartitionsExec: fetch=5"));
+    assert!(plan.contains("FilterExec: c3@2 > 0, fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn keeps_larger_global_limit_when_existing_child_fetch_is_per_partition() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        filter_exec_with_fetch(
+            schema,
+            repartition_exec(stream_exec(&create_schema()))?,
+            3,
+        )?,
+        0,
+        Some(5),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let plan = format_plan(&optimized);
+    assert!(plan.starts_with("CoalescePartitionsExec: fetch=5"));
+    assert!(plan.contains("FilterExec: c3@2 > 0, fetch=3"));
+    Ok(())
+}
+
+#[test]
+fn keeps_global_limit_when_unfetchable_plan_has_multiple_output_partitions() -> Result<()>
+{
+    let plan =
+        global_limit_exec(repartition_exec(stream_exec(&create_schema()))?, 0, Some(5));
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert!(format_plan(&optimized).starts_with("CoalescePartitionsExec: fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn preserves_inner_local_limit_under_outer_global_limit() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        local_limit_exec(
+            filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+            5,
+        ),
+        0,
+        Some(100),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let plan = format_plan(&optimized);
+    assert!(plan.starts_with("CoalescePartitionsExec: fetch=100"));
+    assert!(plan.contains("FilterExec: c3@2 > 0, fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn preserves_smaller_child_fetch_under_local_and_global_limits() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        local_limit_exec(
+            filter_exec_with_fetch(
+                schema,
+                repartition_exec(stream_exec(&create_schema()))?,
+                3,
+            )?,
+            5,
+        ),
+        0,
+        Some(100),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert!(format_plan(&optimized).contains("FilterExec: c3@2 > 0, fetch=3"));
+    Ok(())
+}
+
+#[test]
+fn preserves_inner_local_limit_after_outer_global_limit_is_satisfied() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        coalesce_partitions_exec(local_limit_exec(
+            filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+            5,
+        )),
+        0,
+        Some(100),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert!(format_plan(&optimized).contains("FilterExec: c3@2 > 0, fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn limit_pushdown_is_idempotent_for_multi_partition_global_limit() -> Result<()> {
+    let schema = create_schema();
+    let plan = global_limit_exec(
+        filter_exec(schema, repartition_exec(stream_exec(&create_schema()))?)?,
+        1,
+        Some(2),
+    );
+    let first = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let second =
+        LimitPushdown::new().optimize(Arc::clone(&first), &ConfigOptions::new())?;
+    assert_eq!(format_plan(&first), format_plan(&second));
+    Ok(())
+}
+
+#[test]
+fn preserves_unfetchable_inner_local_limit_under_outer_global_limit() -> Result<()> {
+    let plan = global_limit_exec(
+        local_limit_exec(repartition_exec(stream_exec(&create_schema()))?, 5),
+        0,
+        Some(100),
+    );
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    let plan = format_plan(&optimized);
+    assert!(plan.starts_with("CoalescePartitionsExec: fetch=100"));
+    assert!(plan.contains("LocalLimitExec: fetch=5"));
+    Ok(())
+}
+
+#[test]
+fn preserves_order_for_required_inner_local_limit_under_outer_global_limit() -> Result<()>
+{
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let input = repartition_exec(stream_exec_ordered(&schema, ordering.clone()))?;
+    let mut limit = LocalLimitExec::new(filter_exec(schema, input)?, 5);
+    limit.set_required_ordering(Some(ordering));
+    let plan = global_limit_exec(Arc::new(limit), 0, Some(100));
+    let optimized = LimitPushdown::new().optimize(plan, &ConfigOptions::new())?;
+    assert!(
+        format_plan(&optimized)
+            .starts_with("SortPreservingMergeExec: [c1@0 ASC], fetch=100")
+    );
+    Ok(())
+}
+
+#[test]
+fn preserves_order_across_nested_limits() -> Result<()> {
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let input = filter_exec(
+        schema,
+        repartition_exec(stream_exec_ordered(&create_schema(), ordering.clone()))?,
+    )?;
+    let inner = global_limit_exec(input, 0, Some(10));
+    let mut outer = GlobalLimitExec::new(inner, 0, Some(5));
+    outer.set_required_ordering(Some(ordering));
+    let optimized =
+        LimitPushdown::new().optimize(Arc::new(outer), &ConfigOptions::new())?;
+    assert!(
+        format_plan(&optimized)
+            .starts_with("SortPreservingMergeExec: [c1@0 ASC], fetch=5")
+    );
+    Ok(())
+}
+
+#[test]
+fn preserves_required_ordering_when_extracting_global_limit() -> Result<()> {
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let input = filter_exec(
+        schema,
+        repartition_exec(stream_exec_ordered(&create_schema(), ordering.clone()))?,
+    )?;
+    let mut limit = GlobalLimitExec::new(input, 0, Some(5));
+    limit.set_required_ordering(Some(ordering));
+    let optimized =
+        LimitPushdown::new().optimize(Arc::new(limit), &ConfigOptions::new())?;
+    assert!(
+        format_plan(&optimized)
+            .starts_with("SortPreservingMergeExec: [c1@0 ASC], fetch=5")
+    );
+    Ok(())
 }
 
 #[test]
