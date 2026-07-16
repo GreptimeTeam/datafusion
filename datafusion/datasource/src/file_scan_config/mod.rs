@@ -44,7 +44,7 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, is_volatile};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::coop::cooperative;
@@ -571,6 +571,35 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
     }
 }
 
+fn would_duplicate_volatile_exprs(
+    inner: &ProjectionExprs,
+    outer: &ProjectionExprs,
+) -> bool {
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    let inner_exprs = inner.as_ref();
+
+    let mut ref_counts = vec![0usize; inner_exprs.len()];
+    for proj_expr in outer.as_ref() {
+        proj_expr
+            .expr
+            .apply(|e| {
+                if let Some(col) = e.as_ref().downcast_ref::<Column>()
+                    && let Some(count) = ref_counts.get_mut(col.index())
+                {
+                    *count += 1;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("infallible closure should not fail");
+    }
+
+    ref_counts
+        .iter()
+        .enumerate()
+        .any(|(idx, &count)| count > 1 && is_volatile(&inner_exprs[idx].expr))
+}
+
 impl DataSource for FileScanConfig {
     fn open(
         &self,
@@ -853,6 +882,11 @@ impl DataSource for FileScanConfig {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
+        if let Some(inner) = self.file_source.projection()
+            && would_duplicate_volatile_exprs(inner, projection)
+        {
+            return Ok(None);
+        }
         match self.file_source.try_pushdown_projection(projection)? {
             Some(new_source) => {
                 let mut new_file_scan_config = self.clone();
@@ -2040,6 +2074,172 @@ mod tests {
             assert_eq!(stat.max_value, Precision::Absent);
             assert_eq!(stat.null_count, Precision::Absent);
         }
+    }
+
+    fn make_projection(pairs: Vec<(Arc<dyn PhysicalExpr>, &str)>) -> ProjectionExprs {
+        ProjectionExprs::new(
+            pairs
+                .into_iter()
+                .map(|(expr, alias)| ProjectionExpr::new(expr, alias)),
+        )
+    }
+
+    fn make_volatile_expr() -> Arc<dyn PhysicalExpr> {
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_expr::ScalarUDF;
+        use datafusion_functions::math::random::RandomFunc;
+        use datafusion_physical_expr::ScalarFunctionExpr;
+
+        Arc::new(ScalarFunctionExpr::new(
+            "random",
+            Arc::new(ScalarUDF::from(RandomFunc::new())),
+            vec![],
+            Arc::new(Field::new("random", DataType::Float64, false)),
+            Arc::new(ConfigOptions::default()),
+        ))
+    }
+
+    #[test]
+    fn test_would_duplicate_allows_column_only_inner() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let inner =
+            make_projection(vec![(Arc::clone(&col_a), "a"), (Arc::clone(&col_b), "b")]);
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("a", 0)), "x"),
+            (Arc::new(Column::new("a", 0)), "y"),
+        ]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_allows_deterministic_computed_multi_ref() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let inner = make_projection(vec![
+            (
+                Arc::new(BinaryExpr::new(
+                    Arc::clone(&col_a),
+                    Operator::Plus,
+                    Arc::clone(&col_b),
+                )),
+                "sum",
+            ),
+            (Arc::clone(&col_b), "b"),
+        ]);
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("sum", 0)), "x"),
+            (Arc::new(Column::new("sum", 0)), "y"),
+        ]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_allows_unreferenced_volatile() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let inner =
+            make_projection(vec![(make_volatile_expr(), "r"), (Arc::clone(&col_a), "a")]);
+        let outer = make_projection(vec![(Arc::new(Column::new("a", 1)), "a")]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_blocks_multi_ref_volatile() {
+        let inner = make_projection(vec![(make_volatile_expr(), "r")]);
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("r", 0)), "x"),
+            (Arc::new(Column::new("r", 0)), "y"),
+        ]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_allows_single_ref_volatile() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let inner =
+            make_projection(vec![(make_volatile_expr(), "r"), (Arc::clone(&col_a), "a")]);
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("r", 0)), "x"),
+            (Arc::new(Column::new("a", 1)), "a"),
+        ]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_blocks_single_expr_self_ref_volatile() {
+        let inner = make_projection(vec![(make_volatile_expr(), "r")]);
+        let outer = make_projection(vec![(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("r", 0)),
+                Operator::Plus,
+                Arc::new(Column::new("r", 0)),
+            )),
+            "x",
+        )]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_blocks_volatile_nested_in_arithmetic() {
+        let inner = make_projection(vec![(
+            Arc::new(BinaryExpr::new(
+                make_volatile_expr(),
+                Operator::Plus,
+                Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))),
+            )),
+            "expr",
+        )]);
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("expr", 0)), "x"),
+            (Arc::new(Column::new("expr", 0)), "y"),
+        ]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_would_duplicate_empty_projections() {
+        let inner = make_projection(vec![]);
+        let outer = make_projection(vec![]);
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    #[test]
+    fn test_try_swapping_with_projection_declines_duplicate_volatile_expr() -> Result<()>
+    {
+        let file_schema = Arc::new(Schema::empty());
+        let table_schema = TableSchema::new(file_schema, vec![]);
+        let source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
+        let mut config =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                .build();
+
+        let inner = make_projection(vec![(make_volatile_expr(), "r")]);
+        config.file_source = config
+            .file_source
+            .try_pushdown_projection(&inner)?
+            .expect("MockSource accepts projections");
+
+        let outer = make_projection(vec![(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("r", 0)),
+                Operator::Plus,
+                Arc::new(Column::new("r", 0)),
+            )),
+            "x",
+        )]);
+
+        assert!(
+            config.try_swapping_with_projection(&outer)?.is_none(),
+            "merging duplicated the volatile inner expression"
+        );
+        Ok(())
     }
 
     #[test]

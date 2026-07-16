@@ -642,6 +642,27 @@ SELECT id, s['value'] + 1 FROM simple_struct WHERE id > 1 ORDER BY id LIMIT 2;
 statement ok
 SET datafusion.execution.target_partitions = 4;
 
+#####################
+# Volatile expressions are not duplicated by projection pushdown.
+#####################
+
+statement ok
+COPY (SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 3)
+TO 'test_files/scratch/projection_pushdown/volatile.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE volatile_scan STORED AS PARQUET
+LOCATION 'test_files/scratch/projection_pushdown/volatile.parquet';
+
+query B rowsort
+SELECT s.x = s.y
+FROM (SELECT r AS x, r AS y FROM (SELECT random() AS r FROM volatile_scan) AS t) AS s;
+----
+true
+true
+true
+
 # Create 5 parquet files (more than partitions) for parallel tests
 statement ok
 COPY (SELECT 1 as id, {value: 100, label: 'alpha'} as s)
