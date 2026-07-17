@@ -146,3 +146,165 @@ logical_plan
 physical_plan
 01)ProjectionExec: expr=[column1@0 = 1 as opt1, column1@0 = 2 AND column1@0 != 2 as noopt1, column1@0 = 4 as opt2, column1@0 != 5 AND column1@0 = 5 as noopt2]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Narrowing Int64 to Int32 is fallible. The cast must remain observable rather
+# than being removed and silently suppressing this source overflow.
+query error .*Can't cast value 4294967301 to type Int32.*
+SELECT x
+FROM (VALUES (5::BIGINT), (4294967301::BIGINT)) AS t(x)
+WHERE CAST(x AS INT) = 5
+ORDER BY x;
+
+# TRY_CAST must preserve the NULL produced by an overflowing narrowing cast.
+query I
+SELECT x
+FROM (VALUES (5::BIGINT), (4294967301::BIGINT)) AS t(x)
+WHERE TRY_CAST(x AS INT) IS NULL
+----
+4294967301
+
+# Reducing decimal scale makes both values equal at scale 1.
+query R
+SELECT x
+FROM (VALUES (1.20::DECIMAL(3,2)), (1.21::DECIMAL(3,2))) AS t(x)
+WHERE CAST(x AS DECIMAL(3,1)) = 1.2::DECIMAL(2,1)
+ORDER BY x;
+----
+1.2
+1.21
+
+# Date64 to Int32 is fallible. Keep the cast so its source overflow remains
+# observable instead of turning this predicate into a source comparison.
+query error .*Can't cast value 4294967296 to type Int32.*
+SELECT d
+FROM (
+    VALUES (arrow_cast(0, 'Date64')), (arrow_cast(4294967296, 'Date64'))
+) AS t(d)
+WHERE CAST(d AS INT) = 0
+ORDER BY d;
+
+# Timestamp(ns) to Timestamp(ms) uses range preimages for positive, zero, and
+# negative buckets in equality and strict predicates.
+query I
+SELECT n
+FROM (
+    VALUES (1000000::BIGINT), (1999999::BIGINT)
+) AS t(n)
+WHERE CAST(arrow_cast(n, 'Timestamp(Nanosecond, None)') AS TIMESTAMP(3)) = CAST(1 AS TIMESTAMP(3))
+ORDER BY n;
+----
+1000000
+1999999
+
+query I
+SELECT n
+FROM (
+    VALUES (0::BIGINT), (999999::BIGINT)
+) AS t(n)
+WHERE CAST(arrow_cast(n, 'Timestamp(Nanosecond, None)') AS TIMESTAMP(3)) = CAST(0 AS TIMESTAMP(3))
+ORDER BY n;
+----
+0
+999999
+
+query I
+SELECT n
+FROM (
+    VALUES (-1999999::BIGINT), (-1000000::BIGINT)
+) AS t(n)
+WHERE CAST(arrow_cast(n, 'Timestamp(Nanosecond, None)') AS TIMESTAMP(3)) = CAST(-1 AS TIMESTAMP(3))
+ORDER BY n;
+----
+-1999999
+-1000000
+
+query I
+SELECT n
+FROM (
+    VALUES (1::BIGINT), (1000000::BIGINT)
+) AS t(n)
+WHERE CAST(arrow_cast(n, 'Timestamp(Nanosecond, None)') AS TIMESTAMP(3)) > CAST(0 AS TIMESTAMP(3))
+ORDER BY n;
+----
+1000000
+
+query I
+SELECT n
+FROM (
+    VALUES (-1000000::BIGINT), (-1::BIGINT)
+) AS t(n)
+WHERE CAST(arrow_cast(n, 'Timestamp(Nanosecond, None)') AS TIMESTAMP(3)) < CAST(0 AS TIMESTAMP(3))
+ORDER BY n;
+----
+-1000000
+
+# Changing a timezone-free timestamp to +05:30 stays a cast-bearing comparison.
+statement ok
+SET datafusion.execution.time_zone = '+05:30';
+
+query P
+SELECT ts
+FROM (VALUES (CAST(0 AS TIMESTAMP(9)))) AS t(ts)
+WHERE CAST(ts AS TIMESTAMP WITH TIME ZONE) = CAST(0 AS TIMESTAMP WITH TIME ZONE)
+----
+
+statement ok
+RESET datafusion.execution.time_zone;
+
+# Widening timestamp precision can overflow at runtime. The source overflows,
+# while the Timestamp(ns) zero target is exactly representable.
+query error .*(overflow|exceeds the representable i64 range).*
+SELECT ts
+FROM (VALUES (CAST(9223372036854775807 AS TIMESTAMP(3)))) AS t(ts)
+WHERE CAST(ts AS TIMESTAMP(9)) = CAST(0 AS TIMESTAMP(9));
+
+# TRY_CAST suppresses that source overflow to NULL rather than comparing the
+# pre-cast value to the exactly representable Timestamp(ns) zero target.
+query B
+SELECT TRY_CAST(ts AS TIMESTAMP(9)) = CAST(0 AS TIMESTAMP(9))
+FROM (VALUES (CAST(9223372036854775807 AS TIMESTAMP(3)))) AS t(ts);
+----
+NULL
+
+# Unsafe narrowing IN / NOT IN must keep the fallible cast observable, even
+# when the list includes a typed NULL.
+query error .*Can't cast value 4294967301 to type Int32.*
+SELECT x
+FROM (VALUES (5::BIGINT), (4294967301::BIGINT), (6::BIGINT)) AS t(x)
+WHERE CAST(x AS INT) IN (5, CAST(NULL AS INT))
+ORDER BY x;
+
+query error .*Can't cast value 4294967301 to type Int32.*
+SELECT x, CAST(x AS INT) NOT IN (5, CAST(NULL AS INT))
+FROM (VALUES (5::BIGINT), (4294967301::BIGINT), (6::BIGINT)) AS t(x)
+ORDER BY x;
+
+# The exact Int32 -> Int64 widening is safe to unwrap. Keep five list members
+# so IN / NOT IN are not inlined, and verify typed NULL three-valued semantics.
+query IB
+SELECT x, CAST(x AS BIGINT) IN (1::BIGINT, 2::BIGINT, 3::BIGINT, 4::BIGINT, CAST(NULL AS BIGINT))
+FROM (VALUES (1::INT), (5::INT), (CAST(NULL AS INT))) AS t(x)
+ORDER BY x NULLS LAST;
+----
+1 true
+5 NULL
+NULL NULL
+
+query IB
+SELECT x, CAST(x AS BIGINT) NOT IN (1::BIGINT, 2::BIGINT, 3::BIGINT, 4::BIGINT, CAST(NULL AS BIGINT))
+FROM (VALUES (1::INT), (5::INT), (CAST(NULL AS INT))) AS t(x)
+ORDER BY x NULLS LAST;
+----
+1 false
+5 NULL
+NULL NULL
+
+# DISTINCT predicates must preserve the nullable result.
+query I
+SELECT x
+FROM (
+    VALUES (CAST(NULL AS BIGINT)), (5::BIGINT)
+) AS t(x)
+WHERE CAST(x AS INT) IS DISTINCT FROM 5
+----
+NULL
