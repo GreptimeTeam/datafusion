@@ -97,9 +97,19 @@ mod tests {
     use crate::expressions::{
         BinaryExpr, CastExpr, Literal, NotExpr, TryCastExpr, col, in_list, lit,
     };
-    use arrow::datatypes::{DataType, Field};
-    use datafusion_common::ScalarValue;
+    use arrow::{
+        array::{
+            Array, ArrayRef, BooleanArray, Date64Array, Decimal128Array, Int32Array,
+            Int64Array, StringArray, StringDictionaryBuilder, TimestampMillisecondArray,
+            TimestampNanosecondArray,
+        },
+        compute::CastOptions,
+        datatypes::{DataType, Field, TimeUnit, UInt8Type},
+        record_batch::RecordBatch,
+    };
+    use datafusion_common::{ScalarValue, format::DEFAULT_FORMAT_OPTIONS};
     use datafusion_expr::Operator;
+    use std::collections::HashMap;
 
     fn test_schema() -> Schema {
         Schema::new(vec![
@@ -142,6 +152,666 @@ mod tests {
         );
     }
 
+    fn boolean_values(
+        expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<Vec<Option<bool>>> {
+        let values = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        let values = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("comparison expression must evaluate to a BooleanArray");
+        Ok((0..values.len())
+            .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+            .collect())
+    }
+
+    /// Verifies that a cast rewrite preserves every row's Boolean or NULL result.
+    fn assert_cast_predicate_equivalent(
+        name: &str,
+        schema: &Schema,
+        batch: &RecordBatch,
+        original: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        let simplified = PhysicalExprSimplifier::new(schema)
+            .simplify(Arc::clone(&original))
+            .unwrap();
+        let original_values =
+            boolean_values(&original, batch).map_err(|error| error.to_string());
+        let simplified_values =
+            boolean_values(&simplified, batch).map_err(|error| error.to_string());
+        assert_eq!(
+            original_values, simplified_values,
+            "{name}: cast unwrapping changed predicate results\n  original: {original}\n  simplified: {simplified}"
+        );
+        simplified
+    }
+
+    fn assert_comparison_left_cast_removed(name: &str, expr: &Arc<dyn PhysicalExpr>) {
+        let binary = as_binary(expr);
+        assert!(
+            binary.left().downcast_ref::<CastExpr>().is_none()
+                && binary.left().downcast_ref::<TryCastExpr>().is_none(),
+            "{name}: simplification must remove the comparison's left cast, got: {expr}"
+        );
+    }
+
+    fn contains_cast(expr: &Arc<dyn PhysicalExpr>) -> bool {
+        expr.downcast_ref::<CastExpr>().is_some()
+            || expr.downcast_ref::<TryCastExpr>().is_some()
+            || expr.children().into_iter().any(contains_cast)
+    }
+
+    #[test]
+    fn narrowing_try_cast_equality_retains_cast_and_nulls() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int64, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(0),
+                Some(i64::from(i32::MAX) + 1),
+                None,
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(TryCastExpr::new(
+                col("i", &schema).unwrap(),
+                DataType::Int32,
+            )),
+            Operator::Eq,
+            lit(0i32),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "Int64 -> Int32 equality",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn decimal_scale_narrowing_equality_retains_cast() {
+        let schema =
+            Schema::new(vec![Field::new("d", DataType::Decimal128(10, 3), true)]);
+        let values = Decimal128Array::from(vec![Some(1_001), Some(1_000), None])
+            .with_precision_and_scale(10, 3)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)])
+                .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("d", &schema).unwrap(),
+                DataType::Decimal128(10, 2),
+                None,
+            )),
+            Operator::Eq,
+            lit(ScalarValue::Decimal128(Some(100), 10, 2)),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "decimal scale narrowing equality",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn decimal_scale_narrowing_literal_left_inequality_retains_cast() {
+        let schema =
+            Schema::new(vec![Field::new("d", DataType::Decimal128(10, 3), false)]);
+        let values = Decimal128Array::from(vec![1_001])
+            .with_precision_and_scale(10, 3)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)])
+                .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            lit(ScalarValue::Decimal128(Some(100), 10, 2)),
+            Operator::Lt,
+            Arc::new(CastExpr::new(
+                col("d", &schema).unwrap(),
+                DataType::Decimal128(10, 2),
+                None,
+            )),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "decimal scale narrowing literal-left strict inequality",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn decimal_scale_narrowing_distinctness_retains_cast() {
+        let schema =
+            Schema::new(vec![Field::new("d", DataType::Decimal128(10, 3), true)]);
+        let values = Decimal128Array::from(vec![Some(1_001), None])
+            .with_precision_and_scale(10, 3)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)])
+                .unwrap();
+
+        let outcomes =
+            [Operator::IsDistinctFrom, Operator::IsNotDistinctFrom].map(|op| {
+                let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    Arc::new(CastExpr::new(
+                        col("d", &schema).unwrap(),
+                        DataType::Decimal128(10, 2),
+                        None,
+                    )),
+                    op,
+                    lit(ScalarValue::Decimal128(Some(100), 10, 2)),
+                ));
+                let simplified = PhysicalExprSimplifier::new(&schema)
+                    .simplify(Arc::clone(&original))
+                    .unwrap();
+                (
+                    boolean_values(&original, &batch).unwrap(),
+                    boolean_values(&simplified, &batch).unwrap(),
+                    contains_cast(&simplified),
+                )
+            });
+        let [
+            (distinct_original, distinct_simplified, distinct_retains_cast),
+            (not_distinct_original, not_distinct_simplified, not_distinct_retains_cast),
+        ] = outcomes;
+        assert_eq!(
+            (distinct_original, not_distinct_original),
+            (distinct_simplified, not_distinct_simplified),
+            "decimal scale narrowing changed nullable IS DISTINCT FROM and IS NOT DISTINCT FROM results"
+        );
+        assert!(distinct_retains_cast && not_distinct_retains_cast);
+    }
+
+    #[test]
+    fn date64_to_int32_try_cast_retains_cast() {
+        let schema = Schema::new(vec![Field::new("d", DataType::Date64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Date64Array::from(vec![2_147_483_648]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(TryCastExpr::new(
+                col("d", &schema).unwrap(),
+                DataType::Int32,
+            )),
+            Operator::Eq,
+            lit(i32::MIN),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "Date64 -> Int32 equality",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn timestamp_narrowing_equality_uses_half_open_range() {
+        let source_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                -1_000_001, -1_000_000, -1, 0, 1, 999_999, 1_000_000, 1_000_001,
+            ]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("ts", &schema).unwrap(),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                None,
+            )),
+            Operator::Eq,
+            lit(ScalarValue::TimestampMillisecond(Some(0), None)),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "timestamp ns -> ms buckets",
+            &schema,
+            &batch,
+            original,
+        );
+        let range = as_binary(&simplified);
+        assert_eq!(*range.op(), Operator::And);
+        assert!(!contains_cast(&simplified));
+    }
+
+    #[test]
+    fn timestamp_narrowing_literal_left_swaps_to_source_range() {
+        let source_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                -1, 0, 1_000_000,
+            ]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            lit(ScalarValue::TimestampMillisecond(Some(-1), None)),
+            Operator::Lt,
+            Arc::new(CastExpr::new(
+                col("ts", &schema).unwrap(),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                None,
+            )),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "timestamp narrowing literal-left strict inequality",
+            &schema,
+            &batch,
+            original,
+        );
+        let comparison = as_binary(&simplified);
+        assert_eq!(*comparison.op(), Operator::GtEq);
+        assert_eq!(
+            as_literal(comparison.right()).value(),
+            &ScalarValue::TimestampNanosecond(Some(-999_999), None)
+        );
+        assert!(!contains_cast(&simplified));
+    }
+
+    #[test]
+    fn timestamp_narrowing_distinctness_uses_null_aware_range() {
+        let source_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(-1),
+                Some(0),
+                Some(1_000_000),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        for op in [Operator::IsDistinctFrom, Operator::IsNotDistinctFrom] {
+            let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(CastExpr::new(
+                    col("ts", &schema).unwrap(),
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    None,
+                )),
+                op,
+                lit(ScalarValue::TimestampMillisecond(Some(0), None)),
+            ));
+            let simplified = assert_cast_predicate_equivalent(
+                "timestamp narrowing nullable distinctness",
+                &schema,
+                &batch,
+                original,
+            );
+            assert!(!contains_cast(&simplified));
+        }
+    }
+
+    #[test]
+    fn timestamp_timezone_metadata_change_retains_cast() {
+        let source_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let target_type =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("+05:30")));
+        let schema = Schema::new(vec![Field::new("ts", source_type, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![0]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("ts", &schema).unwrap(),
+                target_type,
+                None,
+            )),
+            Operator::Eq,
+            lit(ScalarValue::TimestampNanosecond(
+                Some(0),
+                Some(Arc::from("+05:30")),
+            )),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "timestamp timezone metadata",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(
+            simplified
+                .downcast_ref::<BinaryExpr>()
+                .unwrap()
+                .left()
+                .downcast_ref::<CastExpr>()
+                .is_some(),
+            "timezone metadata cast must not be removed: {simplified}"
+        );
+    }
+
+    #[test]
+    fn timestamp_coarse_to_fine_cast_overflow_retains_cast() {
+        let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![Some(
+                9_223_372_036_855,
+            )]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("ts", &schema).unwrap(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                None,
+            )),
+            Operator::Eq,
+            lit(ScalarValue::TimestampNanosecond(Some(0), None)),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "timestamp coarse -> fine Cast overflow with zero literal",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn timestamp_coarse_to_fine_try_cast_overflow_retains_cast() {
+        let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![Some(
+                9_223_372_036_855,
+            )]))],
+        )
+        .unwrap();
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(TryCastExpr::new(
+                col("ts", &schema).unwrap(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )),
+            Operator::Eq,
+            lit(ScalarValue::TimestampNanosecond(Some(0), None)),
+        ));
+
+        let simplified = assert_cast_predicate_equivalent(
+            "timestamp coarse -> fine TryCast overflow with zero literal",
+            &schema,
+            &batch,
+            original,
+        );
+        assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn dictionary_encoding_overflow_retains_cast_and_error() {
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, false)]);
+        let values =
+            StringArray::from_iter_values((0..257).map(|index| format!("value-{index}")));
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)])
+                .unwrap();
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("s", &schema).unwrap(),
+                dictionary_type,
+                None,
+            )),
+            Operator::Eq,
+            lit("value-256"),
+        ));
+
+        let simplified = PhysicalExprSimplifier::new(&schema)
+            .simplify(Arc::clone(&original))
+            .unwrap();
+        let original_error = boolean_values(&original, &batch)
+            .expect_err(
+                "257 distinct Utf8 values must overflow Dictionary(UInt8, Utf8) keys",
+            )
+            .to_string();
+        let simplified_result = boolean_values(&simplified, &batch);
+        let simplified_retains_cast = as_binary(&simplified)
+            .left()
+            .downcast_ref::<CastExpr>()
+            .is_some();
+        assert_eq!(
+            (
+                original_error.contains("Dictionary key bigger than the key type"),
+                simplified_result.is_err(),
+                simplified_retains_cast,
+            ),
+            (true, true, true),
+            "dictionary encoding must preserve its key-overflow error and retain CastExpr\n  original: {original}\n  simplified: {simplified}"
+        );
+    }
+
+    #[test]
+    fn dictionary_identity_and_decode_controls_remain_equivalent() {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let schema = Schema::new(vec![Field::new("d", dictionary_type.clone(), true)]);
+        let mut builder = StringDictionaryBuilder::<UInt8Type>::new();
+        builder.append("one").unwrap();
+        builder.append("two").unwrap();
+        builder.append_null();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(builder.finish())],
+        )
+        .unwrap();
+
+        let identity: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("d", &schema).unwrap(),
+                dictionary_type,
+                None,
+            )),
+            Operator::Eq,
+            lit("one"),
+        ));
+        let simplified = assert_cast_predicate_equivalent(
+            "dictionary identity",
+            &schema,
+            &batch,
+            identity,
+        );
+        assert_comparison_left_cast_removed("dictionary identity", &simplified);
+
+        let decode: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("d", &schema).unwrap(),
+                DataType::Utf8,
+                None,
+            )),
+            Operator::Eq,
+            lit("one"),
+        ));
+        let simplified = assert_cast_predicate_equivalent(
+            "dictionary decode",
+            &schema,
+            &batch,
+            decode,
+        );
+        assert_comparison_left_cast_removed("dictionary decode", &simplified);
+    }
+
+    #[test]
+    fn nondefault_cast_options_and_target_fields_retain_cast() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let target_type = DataType::Int64;
+        let cases = [
+            (
+                "safe cast options",
+                Arc::new(CastExpr::new(
+                    col("i", &schema).unwrap(),
+                    target_type.clone(),
+                    Some(CastOptions {
+                        safe: true,
+                        format_options: DEFAULT_FORMAT_OPTIONS,
+                    }),
+                )) as Arc<dyn PhysicalExpr>,
+            ),
+            (
+                "format cast options",
+                Arc::new(CastExpr::new(
+                    col("i", &schema).unwrap(),
+                    target_type.clone(),
+                    Some(CastOptions {
+                        safe: false,
+                        format_options: DEFAULT_FORMAT_OPTIONS.with_null("NULL"),
+                    }),
+                )) as Arc<dyn PhysicalExpr>,
+            ),
+            (
+                "named target field",
+                Arc::new(CastExpr::new_with_target_field(
+                    col("i", &schema).unwrap(),
+                    Arc::new(Field::new("named_target", target_type.clone(), true)),
+                    None,
+                )) as Arc<dyn PhysicalExpr>,
+            ),
+            (
+                "nonnullable target field",
+                Arc::new(CastExpr::new_with_target_field(
+                    col("i", &schema).unwrap(),
+                    Arc::new(Field::new("", target_type.clone(), false)),
+                    None,
+                )) as Arc<dyn PhysicalExpr>,
+            ),
+            (
+                "metadata-bearing target field",
+                Arc::new(CastExpr::new_with_target_field(
+                    col("i", &schema).unwrap(),
+                    Arc::new(Field::new("", target_type, true).with_metadata(
+                        HashMap::from([("semantic".to_string(), "preserve".to_string())]),
+                    )),
+                    None,
+                )) as Arc<dyn PhysicalExpr>,
+            ),
+        ];
+
+        let retained = cases.map(|(name, cast)| {
+            let original: Arc<dyn PhysicalExpr> =
+                Arc::new(BinaryExpr::new(cast, Operator::Eq, lit(1i64)));
+            let simplified =
+                assert_cast_predicate_equivalent(name, &schema, &batch, original);
+            simplified
+                .downcast_ref::<BinaryExpr>()
+                .unwrap()
+                .left()
+                .downcast_ref::<CastExpr>()
+                .is_some()
+        });
+        assert_eq!(
+            retained, [true; 5],
+            "case order: safe options, format options, named field, nonnullable field, metadata-bearing field"
+        );
+    }
+
+    #[test]
+    fn default_cast_options_and_target_field_control_rewrites() {
+        let schema = Schema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let simplifier = PhysicalExprSimplifier::new(&schema);
+        let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("i", &schema).unwrap(),
+                DataType::Int64,
+                None,
+            )),
+            Operator::Eq,
+            lit(1i64),
+        ));
+        let simplified = simplifier.simplify(original).unwrap();
+        assert!(
+            simplified
+                .downcast_ref::<BinaryExpr>()
+                .unwrap()
+                .left()
+                .downcast_ref::<CastExpr>()
+                .is_none(),
+            "default CastExpr should remain eligible for unwrapping"
+        );
+    }
+
+    #[test]
+    fn widening_cast_controls_unwrap_safely() {
+        let int_schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
+        let int_batch = RecordBatch::try_new(
+            Arc::new(int_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![Some(0), Some(1), None]))],
+        )
+        .unwrap();
+        let int_original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("i", &int_schema).unwrap(),
+                DataType::Int64,
+                None,
+            )),
+            Operator::Gt,
+            lit(0i64),
+        ));
+        let simplified = assert_cast_predicate_equivalent(
+            "Int32 -> Int64 widening",
+            &int_schema,
+            &int_batch,
+            int_original,
+        );
+        assert!(!contains_cast(&simplified));
+
+        let decimal_schema =
+            Schema::new(vec![Field::new("d", DataType::Decimal128(10, 2), false)]);
+        let values = Decimal128Array::from(vec![101])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let decimal_batch = RecordBatch::try_new(
+            Arc::new(decimal_schema.clone()),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        let decimal_original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                col("d", &decimal_schema).unwrap(),
+                DataType::Decimal128(20, 4),
+                None,
+            )),
+            Operator::Eq,
+            lit(ScalarValue::Decimal128(Some(10_100), 20, 4)),
+        ));
+        let simplified = assert_cast_predicate_equivalent(
+            "decimal scale widening",
+            &decimal_schema,
+            &decimal_batch,
+            decimal_original,
+        );
+        assert!(!contains_cast(&simplified));
+    }
+
     #[test]
     fn test_simplify() {
         let schema = test_schema();
@@ -159,14 +829,12 @@ mod tests {
 
         let optimized_binary = as_binary(&optimized);
 
-        // Should be optimized to: c2 != INT64(99) (c2 is INT64, literal cast to match)
+        // Int64 -> Int32 is narrowing, so it must remain cast-bearing.
         let left_expr = optimized_binary.left();
         assert!(
-            left_expr.downcast_ref::<CastExpr>().is_none()
-                && left_expr.downcast_ref::<TryCastExpr>().is_none()
+            left_expr.downcast_ref::<CastExpr>().is_some()
+                || left_expr.downcast_ref::<TryCastExpr>().is_some()
         );
-        let right_literal = as_literal(optimized_binary.right());
-        assert_eq!(right_literal.value(), &ScalarValue::Int64(Some(99)));
     }
 
     #[test]
@@ -202,15 +870,13 @@ mod tests {
         let left_literal = as_literal(left_binary.right());
         assert_eq!(left_literal.value(), &ScalarValue::Int32(Some(5)));
 
-        // Verify right side: c2 <= INT64(10)
+        // Verify right side remains cast-bearing: Int64 -> Int32 narrows.
         let right_binary = as_binary(or_binary.right());
         let right_left_expr = right_binary.left();
         assert!(
-            right_left_expr.downcast_ref::<CastExpr>().is_none()
-                && right_left_expr.downcast_ref::<TryCastExpr>().is_none()
+            right_left_expr.downcast_ref::<CastExpr>().is_some()
+                || right_left_expr.downcast_ref::<TryCastExpr>().is_some()
         );
-        let right_literal = as_literal(right_binary.right());
-        assert_eq!(right_literal.value(), &ScalarValue::Int64(Some(10)));
     }
 
     #[test]

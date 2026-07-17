@@ -741,10 +741,15 @@ impl TableSource for InexactFilterTableSource {
 /// the optimizer from pruning unnecessary columns in subtrees.
 #[test]
 fn extension_node_does_not_block_projection_pruning() -> Result<()> {
+    let timezone = "+05:30";
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Int32, true),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.into())),
+            true,
+        ),
     ]));
 
     let table_source: Arc<dyn TableSource> = Arc::new(InexactFilterTableSource {
@@ -753,14 +758,14 @@ fn extension_node_does_not_block_projection_pruning() -> Result<()> {
 
     let ts_cast = Expr::Cast(Cast::new(
         Box::new(col("t.ts")),
-        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(timezone.into())),
     ));
     let ts_millis_1000 = Expr::Literal(
-        ScalarValue::TimestampMillisecond(Some(1000), Some("UTC".into())),
+        ScalarValue::TimestampMillisecond(Some(1000), Some(timezone.into())),
         None,
     );
     let ts_millis_2000 = Expr::Literal(
-        ScalarValue::TimestampMillisecond(Some(2000), Some("UTC".into())),
+        ScalarValue::TimestampMillisecond(Some(2000), Some(timezone.into())),
         None,
     );
 
@@ -791,11 +796,46 @@ fn extension_node_does_not_block_projection_pruning() -> Result<()> {
         @r#"
     OpaqueRequirementsExtension
       Sort: t.a ASC NULLS FIRST, t.ts ASC NULLS FIRST
-        Projection: t.a, CAST(t.ts AS Timestamp(ms, "UTC")) AS ts
-          Filter: __common_expr_3 > TimestampMillisecond(1000, Some("UTC")) AND __common_expr_3 < TimestampMillisecond(2000, Some("UTC"))
-            Projection: CAST(t.ts AS Timestamp(ms, "UTC")) AS __common_expr_3, t.a, t.ts
-              TableScan: t projection=[a, ts], partial_filters=[CAST(t.ts AS Timestamp(ms, "UTC")) > TimestampMillisecond(1000, Some("UTC")), CAST(t.ts AS Timestamp(ms, "UTC")) < TimestampMillisecond(2000, Some("UTC"))]
+        Projection: t.a, CAST(t.ts AS Timestamp(ms, "+05:30")) AS ts
+          Projection: t.a, t.ts
+            Filter: __common_expr_3 > TimestampMillisecond(1000, Some("+05:30")) AND __common_expr_3 < TimestampMillisecond(2000, Some("+05:30"))
+              Projection: CAST(t.ts AS Timestamp(ms, "+05:30")) AS __common_expr_3, t.a, t.ts
+                TableScan: t projection=[a, ts], partial_filters=[t.ts >= TimestampNanosecond(1001000000, Some("+05:30")), t.ts < TimestampNanosecond(2000000000, Some("+05:30")), CAST(t.ts AS Timestamp(ms, "+05:30")) > TimestampMillisecond(1000, Some("+05:30")), CAST(t.ts AS Timestamp(ms, "+05:30")) < TimestampMillisecond(2000, Some("+05:30"))]
     "#,
+    );
+
+    Ok(())
+}
+
+/// A narrowing cast must remain in an inexact pushed filter: Int64 values that
+/// differ before narrowing can compare equal after the cast.
+#[test]
+fn opaque_extension_keeps_unsafe_narrowing_cast_in_pushed_filter() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+    let table_source: Arc<dyn TableSource> = Arc::new(InexactFilterTableSource {
+        schema: Arc::clone(&schema),
+    });
+    let predicate = Expr::Cast(Cast::new(Box::new(col("t.a")), DataType::Int32))
+        .eq(Expr::Literal(ScalarValue::Int32(Some(5)), None));
+
+    let plan = LogicalPlanBuilder::scan("t", table_source, None)?
+        .filter(predicate)?
+        .build()?;
+    let plan = LogicalPlan::Extension(Extension {
+        node: Arc::new(OpaqueRequirementsExtension {
+            input: Arc::new(plan),
+            schema: schema.to_dfschema_ref()?,
+        }),
+    });
+
+    let optimized = format!("{}", optimize_plan(plan)?);
+    assert!(
+        optimized.contains("partial_filters=[CAST(t.a AS Int32) = Int32(5)]"),
+        "{optimized}"
+    );
+    assert!(
+        !optimized.contains("partial_filters=[t.a = Int64(5)]"),
+        "{optimized}"
     );
 
     Ok(())
