@@ -22,7 +22,10 @@
 //! unwrap_cast module to be shared between logical and physical layers.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
+use crate::interval_arithmetic::Interval;
+use crate::operator::Operator;
 use arrow::datatypes::{
     DataType, MAX_DECIMAL32_FOR_EACH_PRECISION, MAX_DECIMAL64_FOR_EACH_PRECISION,
     MAX_DECIMAL128_FOR_EACH_PRECISION, MIN_DECIMAL32_FOR_EACH_PRECISION,
@@ -31,7 +34,18 @@ use arrow::datatypes::{
 use arrow::temporal_conversions::{
     MICROSECONDS, MILLISECONDS, MILLISECONDS_IN_DAY, NANOSECONDS,
 };
-use datafusion_common::ScalarValue;
+use datafusion_common::{Result, ScalarValue};
+
+/// Source-domain preimage of `CAST(source_expr AS target_type) OP literal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CastPredicatePreimage {
+    /// A singleton preimage represented by a literal in the source type. This
+    /// can keep the original comparison operator.
+    Exact(ScalarValue),
+    /// A half-open source-domain interval `[lower, upper)`. The caller must
+    /// map the comparison operator to range predicates.
+    Range(Interval),
+}
 
 /// Convert a literal [`ScalarValue`] to `target_type`, preserving the exact value.
 ///
@@ -74,6 +88,353 @@ pub fn try_cast_literal_to_type(
         .or_else(|| try_cast_string_literal(lit_value, target_type))
         .or_else(|| try_cast_dictionary(lit_value, target_type))
         .or_else(|| try_cast_binary(lit_value, target_type))
+}
+
+/// Computes a source-domain preimage for `CAST(source AS target_type) OP literal`.
+///
+/// This is the shared semantic core for logical and physical cast-predicate
+/// rewrites. It returns a singleton [`CastPredicatePreimage::Exact`] for casts
+/// where moving the cast to the literal preserves comparison semantics, and a
+/// [`CastPredicatePreimage::Range`] for many-to-one casts with known preimages
+/// such as timestamp precision narrowing.
+pub fn cast_predicate_preimage(
+    source_type: &DataType,
+    target_type: &DataType,
+    op: Operator,
+    lit_value: &ScalarValue,
+) -> Result<Option<CastPredicatePreimage>> {
+    if let Some(preimage) = maybe_range_preimage(source_type, target_type, lit_value)? {
+        return Ok(Some(preimage));
+    }
+
+    if let Some(value) =
+        exact_preimage_int_to_str_eq_like(source_type, target_type, op, lit_value)
+    {
+        return Ok(Some(CastPredicatePreimage::Exact(value)));
+    }
+
+    Ok(exact_preimage_cast(source_type, target_type, lit_value)
+        .map(CastPredicatePreimage::Exact))
+}
+
+fn maybe_range_preimage(
+    source_type: &DataType,
+    target_type: &DataType,
+    lit_value: &ScalarValue,
+) -> Result<Option<CastPredicatePreimage>> {
+    if !is_timestamp_precision_narrowing_cast(source_type, target_type) {
+        return Ok(None);
+    }
+
+    Ok(
+        timestamp_narrowing_range_preimage(source_type, target_type, lit_value)?
+            .map(CastPredicatePreimage::Range),
+    )
+}
+
+/// Computes a singleton source-domain literal for exact cast-predicate rewrites.
+///
+/// This intentionally returns `None` for timestamp precision narrowing: those
+/// casts are many-to-one and need range preimages instead.
+pub fn exact_preimage_cast(
+    source_type: &DataType,
+    target_type: &DataType,
+    lit_value: &ScalarValue,
+) -> Option<ScalarValue> {
+    if !is_exact_cast_safe(source_type, target_type) {
+        return None;
+    }
+
+    if source_type == target_type && lit_value.data_type() == *target_type {
+        return Some(lit_value.clone());
+    }
+
+    let source_value = try_cast_literal_to_type(lit_value, source_type)?;
+    if is_timestamp_cast(source_type, target_type) {
+        let round_tripped = try_cast_literal_to_type(&source_value, target_type)?;
+        if &round_tripped != lit_value {
+            return None;
+        }
+    }
+
+    Some(source_value)
+}
+
+fn is_timestamp_cast(source_type: &DataType, target_type: &DataType) -> bool {
+    matches!(
+        (source_type, target_type),
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _))
+    )
+}
+
+/// Returns `true` when the cast from `source_type` to `target_type` is
+/// value-preserving (injective) and order-preserving at the family level.
+///
+/// Anything not in this closed allow-list is considered potentially
+/// information-losing and is blocked.
+fn is_exact_cast_safe(source_type: &DataType, target_type: &DataType) -> bool {
+    match (source_type, target_type) {
+        // Dictionary casts can affect cardinality and fail for a source row.
+        // Only identical dictionary types, and decoding a dictionary into its
+        // exact value type, are eligible for an exact preimage.
+        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
+            return source_type == target_type;
+        }
+        (DataType::Dictionary(_, source_value), target) => {
+            return source_value.as_ref() == target;
+        }
+        (_, DataType::Dictionary(_, _)) => return false,
+        _ => {}
+    }
+
+    if source_type == target_type {
+        return true;
+    }
+    if let (
+        DataType::Timestamp(source_unit, source_tz),
+        DataType::Timestamp(target_unit, target_tz),
+    ) = (source_type, target_type)
+    {
+        // Timestamp widening is not exact-safe: #4 makes overflow observable
+        // for source rows. Exact timestamp casts are only identity metadata.
+        return source_unit == target_unit && source_tz == target_tz;
+    }
+
+    if is_integer_type(source_type) && is_integer_type(target_type) {
+        return is_safe_integer_cast(source_type, target_type);
+    }
+    if matches!(
+        (source_type, target_type),
+        (DataType::Date32, DataType::Int32)
+            | (DataType::Int32, DataType::Date32)
+            | (DataType::Date64, DataType::Int64)
+            | (DataType::Int64, DataType::Date64)
+    ) {
+        return true;
+    }
+    if is_supported_string_type(source_type) && is_supported_string_type(target_type) {
+        return true;
+    }
+    if is_decimal_type(source_type) && is_decimal_type(target_type) {
+        return is_safe_decimal_widening(source_type, target_type);
+    }
+    if is_integer_type(source_type) && is_decimal_type(target_type) {
+        return is_safe_integer_to_decimal(source_type, target_type);
+    }
+    if matches!(
+        (source_type, target_type),
+        (DataType::FixedSizeBinary(_), DataType::Binary)
+    ) {
+        return true;
+    }
+    matches!(
+        (source_type, target_type),
+        (DataType::FixedSizeBinary(source_len), DataType::FixedSizeBinary(target_len))
+            if source_len == target_len
+    )
+}
+
+fn is_integer_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+fn is_safe_integer_cast(source_type: &DataType, target_type: &DataType) -> bool {
+    use DataType::*;
+    matches!(
+        (source_type, target_type),
+        (Int8, Int16 | Int32 | Int64)
+            | (Int16, Int32 | Int64)
+            | (Int32, Int64)
+            | (UInt8, UInt16 | UInt32 | UInt64)
+            | (UInt16, UInt32 | UInt64)
+            | (UInt32, UInt64)
+            | (UInt8, Int16 | Int32 | Int64)
+            | (UInt16, Int32 | Int64)
+            | (UInt32, Int64)
+    )
+}
+
+fn is_decimal_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+    )
+}
+
+fn decimal_precision_scale(data_type: &DataType) -> (u8, i8) {
+    match data_type {
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale) => (*precision, *scale),
+        _ => unreachable!(),
+    }
+}
+
+fn is_safe_decimal_widening(source_type: &DataType, target_type: &DataType) -> bool {
+    let (source_precision, source_scale) = decimal_precision_scale(source_type);
+    let (target_precision, target_scale) = decimal_precision_scale(target_type);
+    if source_scale < 0 || target_scale < 0 {
+        return false;
+    }
+    let source_integer_digits = i16::from(source_precision) - i16::from(source_scale);
+    let target_integer_digits = i16::from(target_precision) - i16::from(target_scale);
+    target_integer_digits >= source_integer_digits && target_scale >= source_scale
+}
+
+fn is_safe_integer_to_decimal(integer_type: &DataType, decimal_type: &DataType) -> bool {
+    let (precision, scale) = decimal_precision_scale(decimal_type);
+    scale >= 0
+        && i32::from(precision) - i32::from(scale)
+            >= i32::from(integer_decimal_digits(integer_type))
+}
+
+fn integer_decimal_digits(integer_type: &DataType) -> u8 {
+    match integer_type {
+        DataType::Int8 | DataType::UInt8 => 3,
+        DataType::Int16 | DataType::UInt16 => 5,
+        DataType::Int32 | DataType::UInt32 => 10,
+        DataType::Int64 => 19,
+        DataType::UInt64 => 20,
+        _ => unreachable!(),
+    }
+}
+
+/// Computes a singleton preimage for equality-like predicates over casts whose
+/// target value is a string representation of an integer source value.
+fn exact_preimage_int_to_str_eq_like(
+    source_type: &DataType,
+    target_type: &DataType,
+    op: Operator,
+    lit_value: &ScalarValue,
+) -> Option<ScalarValue> {
+    if !matches!(
+        target_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return None;
+    }
+
+    match (op, lit_value) {
+        (
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom,
+            ScalarValue::Utf8(Some(_))
+            | ScalarValue::Utf8View(Some(_))
+            | ScalarValue::LargeUtf8(Some(_)),
+        ) if is_integer_type(source_type) => {
+            let casted = lit_value.cast_to(source_type).ok()?;
+            let round_tripped = casted.cast_to(&lit_value.data_type()).ok()?;
+            (lit_value == &round_tripped).then_some(casted)
+        }
+        _ => None,
+    }
+}
+
+/// Computes the source-domain preimage interval for timestamp precision
+/// narrowing casts. Bounds preserve the source timezone metadata.
+fn timestamp_narrowing_range_preimage(
+    source_type: &DataType,
+    target_type: &DataType,
+    lit_value: &ScalarValue,
+) -> Result<Option<Interval>> {
+    let (
+        DataType::Timestamp(source_unit, source_tz),
+        DataType::Timestamp(target_unit, target_tz),
+    ) = (source_type, target_type)
+    else {
+        return Ok(None);
+    };
+
+    // Arrow applies a timezone conversion when metadata differs, which this
+    // arithmetic preimage does not model.
+    if source_tz != target_tz {
+        return Ok(None);
+    }
+
+    let source_scale = timestamp_unit_scale(source_unit);
+    let target_scale = timestamp_unit_scale(target_unit);
+    if source_scale <= target_scale {
+        return Ok(None);
+    }
+
+    let Some(target_value) = timestamp_literal_value(lit_value, target_unit) else {
+        return Ok(None);
+    };
+    let bucket_width = source_scale / target_scale;
+    let Some((lower, upper)) = trunc_toward_zero_bucket(target_value, bucket_width)
+    else {
+        return Ok(None);
+    };
+    let (Ok(lower), Ok(upper)) = (i64::try_from(lower), i64::try_from(upper)) else {
+        return Ok(None);
+    };
+
+    Interval::try_new(
+        timestamp_scalar(source_unit, source_tz.clone(), lower),
+        timestamp_scalar(source_unit, source_tz.clone(), upper),
+    )
+    .map(Some)
+}
+
+/// Returns the half-open source-domain bucket `[lower, upper)` that truncates
+/// toward zero to `value` when divided by `bucket_width`.
+fn trunc_toward_zero_bucket(value: i64, bucket_width: i128) -> Option<(i128, i128)> {
+    let value = i128::from(value);
+    if value > 0 {
+        Some((
+            value.checked_mul(bucket_width)?,
+            value.checked_add(1)?.checked_mul(bucket_width)?,
+        ))
+    } else if value == 0 {
+        Some((1_i128.checked_sub(bucket_width)?, bucket_width))
+    } else {
+        Some((
+            value
+                .checked_sub(1)?
+                .checked_mul(bucket_width)?
+                .checked_add(1)?,
+            value.checked_mul(bucket_width)?.checked_add(1)?,
+        ))
+    }
+}
+
+fn timestamp_literal_value(lit_value: &ScalarValue, unit: &TimeUnit) -> Option<i64> {
+    match (lit_value, unit) {
+        (ScalarValue::TimestampSecond(Some(value), _), TimeUnit::Second)
+        | (ScalarValue::TimestampMillisecond(Some(value), _), TimeUnit::Millisecond)
+        | (ScalarValue::TimestampMicrosecond(Some(value), _), TimeUnit::Microsecond)
+        | (ScalarValue::TimestampNanosecond(Some(value), _), TimeUnit::Nanosecond) => {
+            Some(*value)
+        }
+        _ => None,
+    }
+}
+
+fn timestamp_scalar(
+    unit: &TimeUnit,
+    timezone: Option<Arc<str>>,
+    value: i64,
+) -> ScalarValue {
+    match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), timezone),
+        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(value), timezone),
+        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(value), timezone),
+        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(value), timezone),
+    }
 }
 
 /// Returns true if unwrap_cast_in_comparison supports this data type
@@ -1254,6 +1615,194 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_predicate_preimage_exact() {
+        assert_preimage_exact(
+            &DataType::Int32,
+            &DataType::Int64,
+            Operator::Gt,
+            &ScalarValue::Int64(Some(10)),
+            ScalarValue::Int32(Some(10)),
+        );
+        assert_preimage_exact(
+            &DataType::Int32,
+            &DataType::Utf8,
+            Operator::Eq,
+            &ScalarValue::Utf8(Some("123".to_string())),
+            ScalarValue::Int32(Some(123)),
+        );
+        assert_preimage_none(
+            &DataType::Int32,
+            &DataType::Utf8,
+            Operator::Eq,
+            &ScalarValue::Utf8(Some("0123".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_timestamp_narrowing_range() {
+        for (literal_ms, lower_ns, upper_ns) in [
+            (1000, 1_000_000_000, 1_001_000_000),
+            (0, -999_999, 1_000_000),
+            (-1, -1_999_999, -999_999),
+        ] {
+            assert_timestamp_narrowing_range(literal_ms, lower_ns, upper_ns);
+        }
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_timestamp_extreme_literals() {
+        let timestamp_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let timestamp_ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        for value in [i64::MAX, i64::MIN] {
+            assert_preimage_none(
+                &timestamp_ns,
+                &timestamp_ms,
+                Operator::Eq,
+                &ScalarValue::TimestampMillisecond(Some(value), None),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_exact_timestamp_guards() {
+        let timestamp_ms =
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+05:30".into()));
+        let timestamp_ns =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("+05:30".into()));
+        let timestamp_ms_utc =
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+
+        assert_preimage_exact(
+            &timestamp_ms,
+            &timestamp_ms,
+            Operator::Eq,
+            &ScalarValue::TimestampMillisecond(Some(123), Some("+05:30".into())),
+            ScalarValue::TimestampMillisecond(Some(123), Some("+05:30".into())),
+        );
+        assert_preimage_none(
+            &timestamp_ms,
+            &timestamp_ns,
+            Operator::Eq,
+            &ScalarValue::TimestampNanosecond(Some(123_000_000), Some("+05:30".into())),
+        );
+        assert_preimage_none(
+            &timestamp_ms,
+            &timestamp_ms_utc,
+            Operator::Eq,
+            &ScalarValue::TimestampMillisecond(Some(123), Some("UTC".into())),
+        );
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_narrowing_timestamp_timezone_guards() {
+        let source_type =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("+05:30".into()));
+        let target_type =
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+05:30".into()));
+        let literal =
+            ScalarValue::TimestampMillisecond(Some(1000), Some("+05:30".into()));
+
+        let Some(CastPredicatePreimage::Range(interval)) =
+            cast_predicate_preimage(&source_type, &target_type, Operator::Eq, &literal)
+                .unwrap()
+        else {
+            panic!("expected timestamp narrowing range");
+        };
+        let (lower, upper) = interval.into_bounds();
+        assert_eq!(
+            lower,
+            ScalarValue::TimestampNanosecond(Some(1_000_000_000), Some("+05:30".into()))
+        );
+        assert_eq!(
+            upper,
+            ScalarValue::TimestampNanosecond(Some(1_001_000_000), Some("+05:30".into()))
+        );
+
+        assert_preimage_none(
+            &source_type,
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            Operator::Eq,
+            &ScalarValue::TimestampMillisecond(Some(1000), Some("UTC".into())),
+        );
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_dictionary_policy() {
+        let dictionary_i8_utf8 =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let dictionary_i16_utf8 =
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+        let literal = ScalarValue::Utf8(Some("value".to_string()));
+        let dictionary_literal =
+            ScalarValue::Dictionary(Box::new(DataType::Int8), Box::new(literal.clone()));
+
+        assert_preimage_exact(
+            &dictionary_i8_utf8,
+            &dictionary_i8_utf8,
+            Operator::Eq,
+            &dictionary_literal,
+            dictionary_literal.clone(),
+        );
+        assert_preimage_exact(
+            &dictionary_i8_utf8,
+            &DataType::Utf8,
+            Operator::Eq,
+            &literal,
+            dictionary_literal.clone(),
+        );
+        assert_preimage_none(
+            &DataType::Utf8,
+            &dictionary_i8_utf8,
+            Operator::Eq,
+            &dictionary_literal,
+        );
+        assert_preimage_none(
+            &dictionary_i8_utf8,
+            &dictionary_i16_utf8,
+            Operator::Eq,
+            &ScalarValue::Dictionary(Box::new(DataType::Int16), Box::new(literal)),
+        );
+    }
+
+    #[test]
+    fn test_exact_preimage_closed_allow_list() {
+        assert_preimage_none(
+            &DataType::Int64,
+            &DataType::Int32,
+            Operator::Eq,
+            &ScalarValue::Int32(Some(10)),
+        );
+        assert_preimage_none(
+            &DataType::Decimal128(18, 2),
+            &DataType::Int64,
+            Operator::Eq,
+            &ScalarValue::Int64(Some(123)),
+        );
+        assert_preimage_none(
+            &DataType::Date32,
+            &DataType::Date64,
+            Operator::Eq,
+            &ScalarValue::Date64(Some(1_641_600_000)),
+        );
+    }
+
+    #[test]
+    fn test_trunc_toward_zero_bucket() {
+        assert_eq!(
+            trunc_toward_zero_bucket(1000, 1_000_000),
+            Some((1_000_000_000, 1_001_000_000))
+        );
+        assert_eq!(
+            trunc_toward_zero_bucket(0, 1_000_000),
+            Some((-999_999, 1_000_000))
+        );
+        assert_eq!(
+            trunc_toward_zero_bucket(-1, 1_000_000),
+            Some((-1_999_999, -999_999))
+        );
+    }
+
+    #[test]
     fn test_try_cast_to_string_type() {
         let scalars = vec![
             ScalarValue::from("string"),
@@ -1686,6 +2235,54 @@ mod tests {
             ScalarValue::Int32(Some(123)),
             bad_dict,
             ExpectedCast::NoValue,
+        );
+    }
+
+    fn assert_preimage_exact(
+        source_type: &DataType,
+        target_type: &DataType,
+        op: Operator,
+        literal: &ScalarValue,
+        expected_source: ScalarValue,
+    ) {
+        assert_eq!(
+            cast_predicate_preimage(source_type, target_type, op, literal).unwrap(),
+            Some(CastPredicatePreimage::Exact(expected_source)),
+            "expected Exact preimage for {source_type:?} → {target_type:?} {op:?} {literal:?}"
+        );
+    }
+
+    fn assert_preimage_none(
+        source_type: &DataType,
+        target_type: &DataType,
+        op: Operator,
+        literal: &ScalarValue,
+    ) {
+        assert_eq!(
+            cast_predicate_preimage(source_type, target_type, op, literal).unwrap(),
+            None,
+            "expected no preimage for {source_type:?} → {target_type:?} {op:?} {literal:?}"
+        );
+    }
+
+    fn assert_timestamp_narrowing_range(literal_ms: i64, lower_ns: i64, upper_ns: i64) {
+        let timestamp_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let timestamp_ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert_eq!(
+            cast_predicate_preimage(
+                &timestamp_ns,
+                &timestamp_ms,
+                Operator::Eq,
+                &ScalarValue::TimestampMillisecond(Some(literal_ms), None),
+            )
+            .unwrap(),
+            Some(CastPredicatePreimage::Range(
+                Interval::try_new(
+                    ScalarValue::TimestampNanosecond(Some(lower_ns), None),
+                    ScalarValue::TimestampNanosecond(Some(upper_ns), None),
+                )
+                .unwrap(),
+            ))
         );
     }
 }
