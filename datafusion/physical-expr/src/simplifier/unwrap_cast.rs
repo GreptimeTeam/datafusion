@@ -33,13 +33,23 @@
 
 use std::sync::Arc;
 
+use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Schema};
+use datafusion_common::datatype::DataTypeExt;
+use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::{Result, ScalarValue, tree_node::Transformed};
 use datafusion_expr::Operator;
-use datafusion_expr_common::casts::try_cast_literal_to_type;
+use datafusion_expr_common::casts::{CastPredicatePreimage, cast_predicate_preimage};
 
 use crate::PhysicalExpr;
-use crate::expressions::{BinaryExpr, CastExpr, Literal, TryCastExpr, lit};
+use crate::expressions::{
+    BinaryExpr, CastExpr, Literal, TryCastExpr, is_not_null, is_null, lit,
+};
+
+const DEFAULT_CAST_OPTIONS: CastOptions<'static> = CastOptions {
+    safe: false,
+    format_options: DEFAULT_FORMAT_OPTIONS,
+};
 
 /// Attempts to unwrap casts in comparison expressions.
 pub(crate) fn unwrap_cast_in_comparison(
@@ -60,12 +70,13 @@ fn try_unwrap_cast_binary(
     schema: &Schema,
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
     // Case 1: cast(left_expr) op literal
-    if let (Some((inner_expr, _cast_type)), Some(literal)) = (
+    if let (Some((inner_expr, cast_type)), Some(literal)) = (
         extract_cast_info(binary.left()),
         binary.right().downcast_ref::<Literal>(),
-    ) && binary.op().supports_propagation()
+    ) && is_supported_comparison_operator(*binary.op())
         && let Some(unwrapped) = try_unwrap_cast_comparison(
             Arc::clone(inner_expr),
+            cast_type,
             literal.value(),
             *binary.op(),
             schema,
@@ -75,15 +86,16 @@ fn try_unwrap_cast_binary(
     }
 
     // Case 2: literal op cast(right_expr)
-    if let (Some(literal), Some((inner_expr, _cast_type))) = (
+    if let (Some(literal), Some((inner_expr, cast_type))) = (
         binary.left().downcast_ref::<Literal>(),
         extract_cast_info(binary.right()),
     ) {
         // For literal op cast(expr), we need to swap the operator
         if let Some(swapped_op) = binary.op().swap()
-            && binary.op().supports_propagation()
+            && is_supported_comparison_operator(*binary.op())
             && let Some(unwrapped) = try_unwrap_cast_comparison(
                 Arc::clone(inner_expr),
+                cast_type,
                 literal.value(),
                 swapped_op,
                 schema,
@@ -98,6 +110,23 @@ fn try_unwrap_cast_binary(
     Ok(None)
 }
 
+/// This rewrite has a deliberately closed operator contract. In particular,
+/// `supports_propagation()` also admits operators (such as regex matching) for
+/// which a cast preimage is not defined.
+fn is_supported_comparison_operator(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    )
+}
+
 /// Extract cast information from a physical expression
 ///
 /// If the expression is a CAST(expr, datatype) or TRY_CAST(expr, datatype),
@@ -106,7 +135,12 @@ fn extract_cast_info(
     expr: &Arc<dyn PhysicalExpr>,
 ) -> Option<(&Arc<dyn PhysicalExpr>, &DataType)> {
     if let Some(cast) = expr.downcast_ref::<CastExpr>() {
-        Some((cast.expr(), cast.cast_type()))
+        // CastExpr can carry execution options and field semantics that are
+        // observable even though its data type is unchanged. Only the legacy,
+        // type-only default cast is safe to remove.
+        (cast.cast_options() == &DEFAULT_CAST_OPTIONS
+            && cast.target_field() == &cast.cast_type().clone().into_nullable_field_ref())
+            .then_some((cast.expr(), cast.cast_type()))
     } else if let Some(try_cast) = expr.downcast_ref::<TryCastExpr>() {
         Some((try_cast.expr(), try_cast.cast_type()))
     } else {
@@ -117,6 +151,7 @@ fn extract_cast_info(
 /// Try to unwrap a cast in comparison by moving the cast to the literal
 fn try_unwrap_cast_comparison(
     inner_expr: Arc<dyn PhysicalExpr>,
+    cast_type: &DataType,
     literal_value: &ScalarValue,
     op: Operator,
     schema: &Schema,
@@ -124,14 +159,71 @@ fn try_unwrap_cast_comparison(
     // Get the data type of the inner expression
     let inner_type = inner_expr.data_type(schema)?;
 
-    // Try to cast the literal to the inner expression's type
-    if let Some(casted_literal) = try_cast_literal_to_type(literal_value, &inner_type) {
-        let literal_expr = lit(casted_literal);
-        let binary_expr = BinaryExpr::new(inner_expr, op, literal_expr);
-        return Ok(Some(Arc::new(binary_expr)));
+    match cast_predicate_preimage(&inner_type, cast_type, op, literal_value)? {
+        Some(CastPredicatePreimage::Exact(casted_literal)) => {
+            Ok(Some(binary(inner_expr, op, lit(casted_literal))))
+        }
+        Some(CastPredicatePreimage::Range(interval)) => {
+            Ok(Some(rewrite_with_preimage(interval, op, inner_expr)?))
+        }
+        None => Ok(None),
     }
+}
 
-    Ok(None)
+/// Rewrites a predicate over a half-open source-domain interval `[lower, upper)`.
+fn rewrite_with_preimage(
+    interval: datafusion_expr_common::interval_arithmetic::Interval,
+    op: Operator,
+    expr: Arc<dyn PhysicalExpr>,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let (lower, upper) = interval.into_bounds();
+    let (lower, upper) = (lit(lower), lit(upper));
+
+    Ok(match op {
+        Operator::Lt => binary(Arc::clone(&expr), Operator::Lt, lower),
+        Operator::LtEq => binary(Arc::clone(&expr), Operator::Lt, upper),
+        Operator::Gt => binary(Arc::clone(&expr), Operator::GtEq, upper),
+        Operator::GtEq => binary(Arc::clone(&expr), Operator::GtEq, lower),
+        Operator::Eq => binary(
+            binary(Arc::clone(&expr), Operator::GtEq, lower),
+            Operator::And,
+            binary(expr, Operator::Lt, upper),
+        ),
+        Operator::NotEq => binary(
+            binary(Arc::clone(&expr), Operator::Lt, lower),
+            Operator::Or,
+            binary(expr, Operator::GtEq, upper),
+        ),
+        // The range comparisons are nullable. Distinctness is not, so retain
+        // explicit null semantics around the half-open range.
+        Operator::IsNotDistinctFrom => binary(
+            binary(
+                is_not_null(Arc::clone(&expr))?,
+                Operator::And,
+                binary(Arc::clone(&expr), Operator::GtEq, lower),
+            ),
+            Operator::And,
+            binary(expr, Operator::Lt, upper),
+        ),
+        Operator::IsDistinctFrom => binary(
+            binary(
+                binary(Arc::clone(&expr), Operator::Lt, lower),
+                Operator::Or,
+                binary(Arc::clone(&expr), Operator::GtEq, upper),
+            ),
+            Operator::Or,
+            is_null(expr)?,
+        ),
+        _ => unreachable!("preimage only supports comparison operators"),
+    })
+}
+
+fn binary(
+    left: Arc<dyn PhysicalExpr>,
+    op: Operator,
+    right: Arc<dyn PhysicalExpr>,
+) -> Arc<dyn PhysicalExpr> {
+    Arc::new(BinaryExpr::new(left, op, right))
 }
 
 #[cfg(test)]
@@ -585,10 +677,9 @@ mod tests {
         let left_literal = left_binary.right().downcast_ref::<Literal>().unwrap();
         assert_eq!(left_literal.value(), &ScalarValue::Int32(Some(10)));
 
-        // Right side should be: c2 = INT64(20) (c2 is already INT64, literal cast to match)
+        // Right side remains CAST(c2 AS INT32) = INT32(20): narrowing casts
+        // have no exact source-domain preimage.
         let right_binary = and_binary.right().downcast_ref::<BinaryExpr>().unwrap();
-        assert!(!is_cast_expr(right_binary.left()));
-        let right_literal = right_binary.right().downcast_ref::<Literal>().unwrap();
-        assert_eq!(right_literal.value(), &ScalarValue::Int64(Some(20)));
+        assert!(is_cast_expr(right_binary.left()));
     }
 }
