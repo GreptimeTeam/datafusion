@@ -36,7 +36,7 @@ use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
-use crate::execution_plan::{EvaluationType, SchedulingType};
+use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use log::{debug, trace};
 
 /// Sort preserving merge execution plan
@@ -389,6 +389,14 @@ impl ExecutionPlan for SortPreservingMergeExec {
         self.input
             .partition_statistics(None)?
             .with_fetch(self.fetch, 0, 1)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        if self.fetch.is_none() {
+            CardinalityEffect::Equal
+        } else {
+            CardinalityEffect::LowerEqual
+        }
     }
 
     fn supports_limit_pushdown(&self) -> bool {
