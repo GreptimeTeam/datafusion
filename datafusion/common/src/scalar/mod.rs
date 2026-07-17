@@ -4248,11 +4248,21 @@ impl ScalarValue {
         cast_options: &CastOptions<'static>,
     ) -> Result<Self> {
         let source_type = self.data_type();
+
+        // Temporal casts that increase precision can overflow when the value is
+        // scaled to the target unit. For safe casts, return NULL for the
+        // overflowing scalar; otherwise preserve the regular cast error.
         if let Some(multiplier) = date_to_timestamp_multiplier(&source_type, target_type)
             .or_else(|| timestamp_to_timestamp_multiplier(&source_type, target_type))
             && let Some(value) = self.temporal_scalar_value_as_i64()
         {
-            ensure_timestamp_in_bounds(value, multiplier, &source_type, target_type)?;
+            if cast_options.safe {
+                if multiplier > 1 && value.checked_mul(multiplier).is_none() {
+                    return ScalarValue::try_new_null(target_type);
+                }
+            } else {
+                ensure_timestamp_in_bounds(value, multiplier, &source_type, target_type)?;
+            }
         }
 
         let scalar_array = self.to_array()?;
@@ -9968,6 +9978,45 @@ mod tests {
             err.to_string()
                 .contains("converted value exceeds the representable i64 range"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cast_timestamp_to_finer_unit_safe_overflow_returns_typed_null() {
+        let timezone = Arc::<str>::from("UTC");
+        let scalar = ScalarValue::TimestampMillisecond(
+            Some(i64::MAX),
+            Some(Arc::clone(&timezone)),
+        );
+        let target_type =
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::clone(&timezone)));
+
+        for cast_options in [
+            DEFAULT_CAST_OPTIONS,
+            CastOptions {
+                safe: false,
+                ..DEFAULT_CAST_OPTIONS
+            },
+        ] {
+            let err = scalar
+                .cast_to_with_options(&target_type, &cast_options)
+                .expect_err("unsafe cast should fail");
+            assert!(
+                err.to_string()
+                    .contains("converted value exceeds the representable i64 range"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let cast_options = CastOptions {
+            safe: true,
+            ..DEFAULT_CAST_OPTIONS
+        };
+        assert_eq!(
+            scalar
+                .cast_to_with_options(&target_type, &cast_options)
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(None, Some(timezone))
         );
     }
 
