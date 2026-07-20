@@ -28,6 +28,7 @@ use std::cmp::Ordering;
 use std::mem::size_of_val;
 
 use datafusion::arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use datafusion::common::test_util::format_batches;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, DFSchemaRef, Spans, not_impl_err, plan_err};
 use datafusion::error::Result;
@@ -341,6 +342,24 @@ async fn aggregate_grouping_sets() -> Result<()> {
         "SELECT a, c, d, avg(b) FROM data GROUP BY GROUPING SETS ((a, c), (a), (d), ())",
     )
     .await
+}
+
+#[tokio::test]
+async fn roundtrip_terminal_grouping_sets_root() -> Result<()> {
+    let ctx = create_context().await?;
+    let plan = ctx
+        .sql("SELECT a, c FROM data GROUP BY GROUPING SETS ((a, c), (a))")
+        .await?
+        .into_optimized_plan()?;
+    let plan = match plan {
+        LogicalPlan::Projection(projection) => projection.input.as_ref().clone(),
+        other => {
+            panic!("expected a terminal Aggregate under SQL projection, got {other}")
+        }
+    };
+    assert!(matches!(plan, LogicalPlan::Aggregate(_)), "{plan}");
+    roundtrip_logical_plan_with_ctx(plan, ctx).await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -828,6 +847,95 @@ async fn inner_join() -> Result<()> {
 #[tokio::test]
 async fn roundtrip_left_join() -> Result<()> {
     roundtrip("SELECT data.a FROM data LEFT JOIN data2 ON data.a = data2.a").await
+}
+
+fn assert_constant_false_left_join_was_null_padded(plan: &LogicalPlan) {
+    fn visit(plan: &LogicalPlan, found_typed_null_alias: &mut bool) {
+        assert!(
+            !matches!(plan, LogicalPlan::Join(_)),
+            "constant-false LEFT JOIN was not optimized away: {plan}"
+        );
+        if let LogicalPlan::Projection(projection) = plan {
+            *found_typed_null_alias |= projection.expr.iter().any(|expr| {
+                matches!(
+                    expr,
+                    Expr::Alias(alias)
+                        if matches!(alias.expr.as_ref(), Expr::Cast(_) | Expr::Literal(_, _))
+                )
+            });
+        }
+        for input in plan.inputs() {
+            visit(input, found_typed_null_alias);
+        }
+    }
+
+    let mut found_typed_null_alias = false;
+    visit(plan, &mut found_typed_null_alias);
+    assert!(
+        found_typed_null_alias,
+        "expected a projection typed-null alias for LEFT JOIN padding: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn roundtrip_root_duplicate_names_after_constant_false_left_join() -> Result<()> {
+    let ctx = create_context().await?;
+    let plan = ctx
+        .sql("SELECT data.a, data2.a FROM data LEFT JOIN data2 ON false")
+        .await?
+        .into_optimized_plan()?;
+    assert_constant_false_left_join_was_null_padded(&plan);
+    let proto = to_substrait_plan(&plan, &ctx.state())?;
+
+    let root = match proto.relations[0].rel_type.as_ref() {
+        Some(plan_rel::RelType::Root(root)) => root,
+        other => panic!("expected RelRoot, got {other:?}"),
+    };
+    assert_eq!(root.names, ["a", "a"]);
+
+    let roundtripped = from_substrait_plan(&ctx.state(), &proto).await?;
+    roundtripped.schema().check_names()?;
+    let recomputed = roundtripped.clone().recompute_schema()?;
+    recomputed.schema().check_names()?;
+    assert_eq!(recomputed.schema(), roundtripped.schema());
+
+    let expected_fields = plan.schema().fields();
+    let actual_fields = roundtripped.schema().fields();
+    assert_eq!(actual_fields.len(), expected_fields.len());
+    assert_eq!(
+        actual_fields
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        ["a", "a"]
+    );
+    assert!(
+        actual_fields
+            .iter()
+            .all(|field| !field.name().contains("__substrait_root_"))
+    );
+    for (expected, actual) in expected_fields.iter().zip(actual_fields) {
+        assert_eq!(actual.data_type(), expected.data_type());
+        assert_eq!(actual.is_nullable(), expected.is_nullable());
+    }
+
+    let expected =
+        format_batches(&DataFrame::new(ctx.state(), plan).collect().await?)?.to_string();
+    let actual = format_batches(
+        &DataFrame::new(ctx.state(), roundtripped.clone())
+            .collect()
+            .await?,
+    )?
+    .to_string();
+    assert_eq!(actual, expected);
+
+    let second_proto = to_substrait_plan(&roundtripped, &ctx.state())?;
+    let second_roundtripped = from_substrait_plan(&ctx.state(), &second_proto).await?;
+    second_roundtripped.schema().check_names()?;
+    assert_eq!(second_roundtripped.schema(), roundtripped.schema());
+    assert_eq!(format!("{second_roundtripped}"), format!("{roundtripped}"));
+
+    Ok(())
 }
 
 #[tokio::test]
