@@ -24,7 +24,7 @@ use datafusion::common::{
 use datafusion::logical_expr::expr::Sort;
 use datafusion::logical_expr::{Cast, Expr, ExprSchemable};
 use datafusion::sql::TableReference;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use substrait::proto::SortField;
 use substrait::proto::sort_field::SortDirection;
@@ -231,17 +231,15 @@ pub(super) fn make_renamed_schema(
 ) -> datafusion::common::Result<DFSchema> {
     let mut name_idx = 0;
 
-    let (qualifiers, fields): (_, Vec<Field>) = schema
+    let renamed_fields = schema
         .iter()
         .enumerate()
         .map(|(field_idx, (q, f))| {
             let renamed_f =
                 rename_field(f.as_ref(), dfs_names, field_idx, &mut name_idx)?;
-            Ok((q.cloned(), renamed_f))
+            Ok((q.cloned(), f.name().clone(), renamed_f))
         })
-        .collect::<datafusion::common::Result<Vec<_>>>()?
-        .into_iter()
-        .unzip();
+        .collect::<datafusion::common::Result<Vec<_>>>()?;
 
     if name_idx != dfs_names.len() {
         return substrait_err!(
@@ -251,25 +249,96 @@ pub(super) fn make_renamed_schema(
         );
     }
 
+    let mut name_counts = HashMap::<String, usize>::new();
+    for (_, _, field) in &renamed_fields {
+        *name_counts.entry(field.name().clone()).or_default() += 1;
+    }
+    let (qualifiers, fields): (_, Vec<Field>) = renamed_fields
+        .into_iter()
+        .map(|(qualifier, original_name, field)| {
+            // RelRoot stores only Arrow field names. For a unique renamed field,
+            // retain the existing unqualified alias behavior; duplicate root names
+            // need their original qualifiers as internal schema identity.
+            let qualifier =
+                if name_counts[field.name()] > 1 || original_name == *field.name() {
+                    qualifier
+                } else {
+                    None
+                };
+            (qualifier, field)
+        })
+        .unzip();
+    let qualifiers = normalize_root_qualifiers(qualifiers, &fields);
+
     DFSchema::from_field_specific_qualified_schema(
         qualifiers,
         &Arc::new(Schema::new(fields)),
     )
 }
 
+/// Adds internal qualifiers only where duplicate root field names would make a
+/// DataFusion schema ambiguous. RelRoot names are client-visible Arrow field
+/// names, while qualifiers are internal schema identity.
+fn normalize_root_qualifiers(
+    mut qualifiers: Vec<Option<TableReference>>,
+    fields: &[Field],
+) -> Vec<Option<TableReference>> {
+    let mut fields_by_name = HashMap::<&str, Vec<usize>>::new();
+    for (index, field) in fields.iter().enumerate() {
+        fields_by_name.entry(field.name()).or_default().push(index);
+    }
+
+    let mut used_qualifiers =
+        qualifiers.iter().flatten().cloned().collect::<HashSet<_>>();
+    let mut synthetic_qualifier_index = 0;
+
+    let mut processed_names = HashSet::new();
+    for field in fields {
+        let name = field.name().as_str();
+        if !processed_names.insert(name) {
+            continue;
+        }
+        let indexes = &fields_by_name[name];
+        if indexes.len() == 1 {
+            continue;
+        }
+
+        let mut seen_qualifiers = HashSet::new();
+        for index in indexes {
+            let needs_synthetic_qualifier = qualifiers[*index]
+                .as_ref()
+                .is_none_or(|qualifier| !seen_qualifiers.insert(qualifier.clone()));
+            if needs_synthetic_qualifier {
+                let synthetic_qualifier = loop {
+                    let qualifier = TableReference::bare(format!(
+                        "__substrait_root_{synthetic_qualifier_index}"
+                    ));
+                    synthetic_qualifier_index += 1;
+                    if used_qualifiers.insert(qualifier.clone()) {
+                        break qualifier;
+                    }
+                };
+                qualifiers[*index] = Some(synthetic_qualifier);
+            }
+        }
+    }
+
+    qualifiers
+}
+
 /// Ensure the expressions have the right name(s) according to the new schema.
 /// This includes the top-level (column) name, which will be renamed through aliasing if needed,
 /// as well as nested names (if the expression produces any struct types), which will be renamed
 /// through casting if needed.
-pub(super) fn rename_expressions(
+pub(super) fn rename_expressions<'a>(
     exprs: impl IntoIterator<Item = Expr>,
     input_schema: &DFSchema,
-    new_schema_fields: &[Arc<Field>],
+    new_schema_fields: impl IntoIterator<Item = (Option<&'a TableReference>, &'a Arc<Field>)>,
 ) -> datafusion::common::Result<Vec<Expr>> {
     exprs
         .into_iter()
         .zip(new_schema_fields)
-        .map(|(old_expr, new_field)| {
+        .map(|(old_expr, (new_qualifier, new_field))| {
             // Check if type (i.e. nested struct field names) match, use Cast to rename if needed
             let new_expr = if &old_expr.get_type(input_schema)? != new_field.data_type() {
                 Expr::Cast(Cast::new(
@@ -280,10 +349,11 @@ pub(super) fn rename_expressions(
                 old_expr
             };
             // Alias column if needed to fix the top-level name
-            match &new_expr {
-                // If expr is a column reference, alias_if_changed would cause an aliasing if the old expr has a qualifier
-                Expr::Column(c) if &c.name == new_field.name() => Ok(new_expr),
-                _ => new_expr.alias_if_changed(new_field.name().to_owned()),
+            let (old_qualifier, old_name) = new_expr.qualified_name();
+            if old_qualifier.as_ref() == new_qualifier && old_name == *new_field.name() {
+                Ok(new_expr)
+            } else {
+                Ok(new_expr.alias_qualified(new_qualifier.cloned(), new_field.name()))
             }
         })
         .collect()
@@ -738,6 +808,116 @@ pub(crate) mod tests {
             ))
         );
         Ok(())
+    }
+
+    fn schema_for_root_renaming(qualifiers: &[Option<&str>]) -> Arc<DFSchema> {
+        Arc::new(
+            DFSchema::new_with_metadata(
+                qualifiers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, qualifier)| {
+                        (
+                            qualifier.map(TableReference::bare),
+                            Arc::new(Field::new(
+                                format!("field_{index}"),
+                                DataType::Int32,
+                                true,
+                            )),
+                        )
+                    })
+                    .collect(),
+                HashMap::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_root_renamed_schema(
+        input_qualifiers: &[Option<&str>],
+        names: &[&str],
+        expected_qualifiers: &[Option<&str>],
+    ) -> Result<()> {
+        let schema = schema_for_root_renaming(input_qualifiers);
+        let renamed = make_renamed_schema(
+            &schema,
+            &names.iter().map(|name| (*name).to_string()).collect(),
+        )?;
+
+        renamed.check_names()?;
+        assert_eq!(
+            renamed
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(
+            renamed
+                .iter()
+                .map(|(qualifier, _)| qualifier.map(ToString::to_string))
+                .collect::<Vec<_>>(),
+            expected_qualifiers
+                .iter()
+                .map(|qualifier| qualifier.map(str::to_string))
+                .collect::<Vec<_>>(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn root_renaming_qualifies_unqualified_duplicate() -> Result<()> {
+        assert_root_renamed_schema(
+            &[Some("integers"), None],
+            &["a", "a"],
+            &[Some("integers"), Some("__substrait_root_0")],
+        )
+    }
+
+    #[test]
+    fn root_renaming_qualifies_two_unqualified_duplicates() -> Result<()> {
+        assert_root_renamed_schema(
+            &[None, None],
+            &["a", "a"],
+            &[Some("__substrait_root_0"), Some("__substrait_root_1")],
+        )
+    }
+
+    #[test]
+    fn root_renaming_qualifies_repeated_identical_qualifier() -> Result<()> {
+        assert_root_renamed_schema(
+            &[Some("integers"), Some("integers")],
+            &["a", "a"],
+            &[Some("integers"), Some("__substrait_root_0")],
+        )
+    }
+
+    #[test]
+    fn root_renaming_preserves_distinct_qualifiers() -> Result<()> {
+        assert_root_renamed_schema(
+            &[Some("left"), Some("right")],
+            &["a", "a"],
+            &[Some("left"), Some("right")],
+        )
+    }
+
+    #[test]
+    fn root_renaming_preserves_qualifiers_for_unique_names() -> Result<()> {
+        assert_root_renamed_schema(
+            &[Some("integers"), None],
+            &["field_0", "field_1"],
+            &[Some("integers"), None],
+        )
+    }
+
+    #[test]
+    fn root_renaming_avoids_existing_synthetic_qualifier() -> Result<()> {
+        assert_root_renamed_schema(
+            &[Some("__substrait_root_0"), None],
+            &["a", "a"],
+            &[Some("__substrait_root_0"), Some("__substrait_root_1")],
+        )
     }
 
     #[test]
