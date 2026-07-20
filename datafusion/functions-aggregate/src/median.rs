@@ -52,6 +52,7 @@ use datafusion_expr::{
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumulate::accumulate;
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::filtered_null_mask;
+use datafusion_functions_aggregate_common::noop_accumulator::NoopAccumulator;
 use datafusion_functions_aggregate_common::utils::{GenericDistinctBuffer, Hashable};
 use datafusion_macros::user_doc;
 use std::collections::HashMap;
@@ -137,8 +138,20 @@ impl AggregateUDFImpl for Median {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        let input_type = args.input_fields[0].data_type();
+        if input_type.is_null() {
+            return Ok(vec![
+                Field::new(
+                    format_state_name(args.name, self.name()),
+                    DataType::Null,
+                    true,
+                )
+                .into(),
+            ]);
+        }
+
         //Intermediate state is a list of the elements we have collected so far
-        let field = Field::new_list_field(args.input_fields[0].data_type().clone(), true);
+        let field = Field::new_list_field(input_type.clone(), true);
         let state_name = if args.is_distinct {
             "distinct_median"
         } else {
@@ -173,6 +186,10 @@ impl AggregateUDFImpl for Median {
         }
 
         let dt = acc_args.expr_fields[0].data_type().clone();
+        if dt.is_null() {
+            return Ok(Box::new(NoopAccumulator::default()));
+        }
+
         downcast_integer! {
             dt => (helper, dt),
             DataType::Float16 => helper!(Float16Type, dt),
@@ -191,7 +208,7 @@ impl AggregateUDFImpl for Median {
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
-        !args.is_distinct
+        !args.is_distinct && !args.expr_fields[0].data_type().is_null()
     }
 
     fn create_groups_accumulator(
@@ -551,7 +568,48 @@ impl<T: ArrowNumericType + Send> GroupsAccumulator for MedianGroupsAccumulator<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int8Array;
+    use arrow::array::{Int8Array, NullArray};
+    use arrow::datatypes::Schema;
+    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::expressions::Column;
+
+    #[test]
+    fn null_median_uses_noop_accumulator_and_falls_back_from_groups() -> Result<()> {
+        let median = Median::new();
+        let schema = Schema::new(vec![Field::new("value", DataType::Null, true)]);
+        let input_fields = vec![Field::new("value", DataType::Null, true).into()];
+        let return_field = Field::new("median", DataType::Null, true).into();
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("value", 0))];
+        assert_eq!(median.return_type(&[DataType::Null])?, DataType::Null);
+        let args = AccumulatorArgs {
+            return_field: Arc::clone(&return_field),
+            schema: &schema,
+            expr_fields: &input_fields,
+            ignore_nulls: false,
+            order_bys: &[],
+            name: "median",
+            is_distinct: false,
+            is_reversed: false,
+            exprs: &exprs,
+        };
+
+        let mut accumulator = median.accumulator(args.clone())?;
+        accumulator.update_batch(&[Arc::new(NullArray::new(3))])?;
+        assert_eq!(accumulator.state()?, vec![ScalarValue::Null]);
+        assert_eq!(accumulator.evaluate()?, ScalarValue::Null);
+
+        let state_fields = median.state_fields(StateFieldsArgs {
+            name: "median",
+            input_fields: &input_fields,
+            return_field,
+            ordering_fields: &[],
+            is_distinct: false,
+        })?;
+        assert_eq!(state_fields[0].data_type(), &DataType::Null);
+        assert!(!median.groups_accumulator_supported(args));
+
+        Ok(())
+    }
 
     #[test]
     fn test_groups_accumulator_size_accounts_for_owned_state() -> Result<()> {
