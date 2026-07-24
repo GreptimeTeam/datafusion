@@ -36,6 +36,7 @@ use datafusion_physical_plan::execution_plan::Boundedness;
 use datafusion_physical_plan::projection::{
     ProjectionExec, make_with_child, update_expr, update_ordering_requirement,
 };
+use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{
@@ -341,17 +342,23 @@ fn require_top_ordering(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Executio
     }
 }
 
+/// Returns the child through which output ordering requirements can propagate.
+fn output_requirement_child(plan: &dyn ExecutionPlan) -> Option<usize> {
+    if plan.children().len() == 1 || plan.downcast_ref::<ScalarSubqueryExec>().is_some() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 /// Helper function that adds an ancillary `OutputRequirementExec` to the given plan.
 /// First entry in the tuple is resulting plan, second entry indicates whether any
 /// `OutputRequirementExec` is added to the plan.
 fn require_top_ordering_helper(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<(Arc<dyn ExecutionPlan>, bool)> {
-    let mut children = plan.children();
     // Global ordering defines desired ordering in the final result.
-    if children.len() != 1 {
-        Ok((plan, false))
-    } else if let Some(sort_exec) = plan.downcast_ref::<SortExec>() {
+    if let Some(sort_exec) = plan.downcast_ref::<SortExec>() {
         // In case of constant columns, output ordering of the `SortExec` would
         // be an empty set. Therefore; we check the sort expression field to
         // assign the requirements.
@@ -381,25 +388,27 @@ fn require_top_ordering_helper(
             )) as _,
             true,
         ))
-    } else if plan.maintains_input_order()[0]
-        && (plan.required_input_ordering()[0]
-            .as_ref()
-            .is_none_or(|o| matches!(o, OrderingRequirements::Soft(_))))
-    {
+    } else if let Some(idx) = output_requirement_child(plan.as_ref()) {
         // Keep searching for a `SortExec` as long as ordering is maintained,
         // and on-the-way operators do not themselves require an ordering.
         // When an operator requires an ordering, any `SortExec` below can not
         // be responsible for (i.e. the originator of) the global ordering.
-        let (new_child, is_changed) =
-            require_top_ordering_helper(Arc::clone(children.swap_remove(0)))?;
+        if plan.maintains_input_order()[idx]
+            && (plan.required_input_ordering()[idx]
+                .as_ref()
+                .is_none_or(|o| matches!(o, OrderingRequirements::Soft(_))))
+        {
+            let mut children: Vec<_> = plan.children().into_iter().cloned().collect();
+            let (new_child, is_changed) =
+                require_top_ordering_helper(Arc::clone(&children[idx]))?;
 
-        let plan = if is_changed {
-            plan.with_new_children(vec![new_child])?
-        } else {
-            plan
-        };
+            if is_changed {
+                children[idx] = new_child;
+                return Ok((plan.with_new_children(children)?, true));
+            }
+        }
 
-        Ok((plan, is_changed))
+        Ok((plan, false))
     } else {
         // Stop searching, there is no global ordering desired for the query.
         Ok((plan, false))
