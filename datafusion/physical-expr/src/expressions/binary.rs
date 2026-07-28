@@ -2965,6 +2965,78 @@ mod tests {
     }
 
     #[test]
+    fn regex_scalar_with_dictionary_nulls() -> Result<()> {
+        let dictionary_values = Arc::new(StringArray::from(vec![
+            Some("abc"),
+            None,
+            Some("ABC"),
+            Some("def"),
+        ]));
+        let keys = Int8Array::from(vec![Some(0), None, Some(1), Some(2), Some(3)]);
+        let dictionary =
+            Arc::new(DictionaryArray::try_new(keys, dictionary_values)?) as ArrayRef;
+        let utf8 = cast(&dictionary, &DataType::Utf8)?;
+        let pattern = ScalarValue::Utf8(Some("^abc$".to_string()));
+        let dictionary_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            dictionary.data_type().clone(),
+            true,
+        )]));
+        let utf8_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+
+        let evaluate =
+            |schema: &SchemaRef, array: &ArrayRef, op: Operator| -> Result<ArrayRef> {
+                let expr = BinaryExpr::new(col("a", schema)?, op, lit(pattern.clone()));
+                let batch =
+                    RecordBatch::try_new(Arc::clone(schema), vec![Arc::clone(array)])?;
+                Ok(expr
+                    .evaluate(&batch)?
+                    .into_array(batch.num_rows())
+                    .expect("Failed to convert to array"))
+            };
+
+        for (op, expected) in [
+            (
+                Operator::RegexMatch,
+                BooleanArray::from(vec![
+                    Some(true),
+                    None,
+                    None,
+                    Some(false),
+                    Some(false),
+                ]),
+            ),
+            (
+                Operator::RegexIMatch,
+                BooleanArray::from(vec![Some(true), None, None, Some(true), Some(false)]),
+            ),
+            (
+                Operator::RegexNotMatch,
+                BooleanArray::from(vec![Some(false), None, None, Some(true), Some(true)]),
+            ),
+            (
+                Operator::RegexNotIMatch,
+                BooleanArray::from(vec![
+                    Some(false),
+                    None,
+                    None,
+                    Some(false),
+                    Some(true),
+                ]),
+            ),
+        ] {
+            let dictionary_result = evaluate(&dictionary_schema, &dictionary, op)?;
+            let utf8_result = evaluate(&utf8_schema, &utf8, op)?;
+
+            assert_eq!(dictionary_result.as_ref(), &expected);
+            assert_eq!(&dictionary_result, &utf8_result);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn or_with_nulls_op() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("a", DataType::Boolean, true),
