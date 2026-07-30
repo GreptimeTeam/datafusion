@@ -528,12 +528,47 @@ impl<T: ArrowNumericType + Send> GroupsAccumulator for MedianGroupsAccumulator<T
     }
 
     fn size(&self) -> usize {
-        self.group_values
-            .iter()
-            .map(|values| values.capacity() * size_of::<T>())
+        size_of_val(&self.group_values)
+            + self
+                .group_values
+                .iter()
+            .map(|values| values.capacity() * size_of::<T::Native>())
             .sum::<usize>()
             // account for size of self.grou_values too
-            + self.group_values.capacity() * size_of::<Vec<T>>()
+            + self.group_values.capacity() * size_of::<Vec<T::Native>>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int8Array;
+
+    #[test]
+    fn test_groups_accumulator_size_accounts_for_owned_state() -> Result<()> {
+        let mut accumulator =
+            MedianGroupsAccumulator::<arrow::datatypes::Int8Type>::new(DataType::Int8);
+        let values: ArrayRef = Arc::new(Int8Array::from_iter_values(
+            (0..8).flat_map(|_| (0..128).map(|value| value as i8)),
+        ));
+        let group_indices = (0..8)
+            .flat_map(|group| std::iter::repeat_n(group, 128))
+            .collect::<Vec<_>>();
+
+        assert_eq!(accumulator.size(), size_of_val(&accumulator.group_values));
+
+        accumulator.update_batch(&[values], &group_indices, None, 8)?;
+
+        let expected_size = size_of_val(&accumulator.group_values)
+            + accumulator
+                .group_values
+                .iter()
+                .map(|values| values.capacity() * size_of::<i8>())
+                .sum::<usize>()
+            + accumulator.group_values.capacity() * size_of::<Vec<i8>>();
+
+        assert_eq!(accumulator.size(), expected_size);
+        Ok(())
     }
 }
 
