@@ -37,8 +37,8 @@ use datafusion_common::{Result, ScalarValue};
 /// Source-domain preimage of `CAST(source_expr AS target_type) OP literal`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CastPredicatePreimage {
-    /// A singleton preimage represented by a literal in the source type. This
-    /// can keep the original comparison operator.
+    /// A singleton source bound/literal that can keep the original comparison
+    /// operator.
     Exact(ScalarValue),
     /// A half-open source-domain interval `[lower, upper)`. The caller must
     /// map the comparison operator to range predicates.
@@ -68,7 +68,8 @@ pub fn try_cast_literal_to_type(
 ///
 /// This is the shared semantic core for logical and physical cast-predicate
 /// rewrites. It returns a singleton [`CastPredicatePreimage::Exact`] for casts
-/// where moving the cast to the literal preserves comparison semantics, and a
+/// where moving the cast to the literal preserves comparison semantics, plus
+/// the fork's accepted ordered timestamp-widening overflow policy, and a
 /// [`CastPredicatePreimage::Range`] for many-to-one casts with known preimages
 /// such as timestamp precision narrowing.
 pub fn cast_predicate_preimage(
@@ -87,8 +88,14 @@ pub fn cast_predicate_preimage(
         return Ok(Some(CastPredicatePreimage::Exact(value)));
     }
 
-    Ok(exact_preimage_cast(source_type, target_type, lit_value)
-        .map(CastPredicatePreimage::Exact))
+    if let Some(value) = exact_preimage_cast(source_type, target_type, lit_value) {
+        return Ok(Some(CastPredicatePreimage::Exact(value)));
+    }
+
+    Ok(
+        timestamp_widening_ordered_preimage(source_type, target_type, op, lit_value)
+            .map(CastPredicatePreimage::Exact),
+    )
 }
 
 fn maybe_range_preimage(
@@ -377,6 +384,58 @@ fn timestamp_narrowing_range_preimage(
         timestamp_scalar(source_unit, source_tz.clone(), upper),
     )
     .map(Some)
+}
+
+/// Computes a source-domain bound for an ordered timestamp precision widening
+/// comparison. For source values whose widening is representable, the bound is
+/// equivalent to the original predicate. This fork intentionally also applies
+/// the ordered rewrite outside that domain as accepted policy: regular `CAST`
+/// can error and `TRY_CAST` can return NULL on overflow, so it is not a
+/// full-domain equivalence claim.
+fn timestamp_widening_ordered_preimage(
+    source_type: &DataType,
+    target_type: &DataType,
+    op: Operator,
+    lit_value: &ScalarValue,
+) -> Option<ScalarValue> {
+    let (
+        DataType::Timestamp(source_unit, source_tz),
+        DataType::Timestamp(target_unit, target_tz),
+    ) = (source_type, target_type)
+    else {
+        return None;
+    };
+
+    if source_tz != target_tz
+        || lit_value.is_null()
+        || lit_value.data_type() != *target_type
+        || !matches!(
+            op,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        )
+    {
+        return None;
+    }
+
+    let source_scale = i128::from(timestamp_unit_scale(source_unit));
+    let target_scale = i128::from(timestamp_unit_scale(target_unit));
+    if target_scale <= source_scale {
+        return None;
+    }
+
+    let target_value = i128::from(timestamp_literal_value(lit_value, target_unit)?);
+    let quotient = target_scale / source_scale;
+    let floor = target_value.div_euclid(quotient);
+    let remainder = target_value.rem_euclid(quotient);
+    let ceil = floor + if remainder != 0 { 1 } else { 0 };
+    let bound = match op {
+        Operator::GtEq | Operator::Lt => ceil,
+        Operator::Gt | Operator::LtEq => floor,
+        _ => return None,
+    };
+
+    let bound = i64::try_from(bound).ok()?;
+    Some(timestamp_scalar(source_unit, source_tz.clone(), bound))
 }
 
 /// Returns the half-open source-domain bucket `[lower, upper)` that truncates
@@ -1379,6 +1438,60 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_predicate_preimage_timestamp_widening_ordered() {
+        for (source_unit, target_unit) in [
+            (TimeUnit::Second, TimeUnit::Millisecond),
+            (TimeUnit::Second, TimeUnit::Microsecond),
+            (TimeUnit::Second, TimeUnit::Nanosecond),
+            (TimeUnit::Millisecond, TimeUnit::Microsecond),
+            (TimeUnit::Millisecond, TimeUnit::Nanosecond),
+            (TimeUnit::Microsecond, TimeUnit::Nanosecond),
+        ] {
+            assert_timestamp_widening_ordered(source_unit, target_unit, None);
+        }
+
+        assert_timestamp_widening_ordered(
+            TimeUnit::Millisecond,
+            TimeUnit::Nanosecond,
+            Some(Arc::from("+05:30")),
+        );
+    }
+
+    #[test]
+    fn test_cast_predicate_preimage_timestamp_widening_ordered_rejects_guards() {
+        let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let target_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let literal = ScalarValue::TimestampNanosecond(Some(123_456_789), None);
+
+        for op in [
+            Operator::Eq,
+            Operator::NotEq,
+            Operator::IsDistinctFrom,
+            Operator::IsNotDistinctFrom,
+        ] {
+            assert_preimage_none(&source_type, &target_type, op, &literal);
+        }
+        assert_preimage_none(
+            &source_type,
+            &target_type,
+            Operator::GtEq,
+            &ScalarValue::TimestampNanosecond(None, None),
+        );
+        assert_preimage_none(
+            &source_type,
+            &target_type,
+            Operator::GtEq,
+            &ScalarValue::TimestampMicrosecond(Some(123_456), None),
+        );
+        assert_preimage_none(
+            &source_type,
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            Operator::GtEq,
+            &ScalarValue::TimestampNanosecond(Some(123_456_789), Some("UTC".into())),
+        );
+    }
+
+    #[test]
     fn test_cast_predicate_preimage_narrowing_timestamp_timezone_guards() {
         let source_type =
             DataType::Timestamp(TimeUnit::Nanosecond, Some("+05:30".into()));
@@ -1969,5 +2082,94 @@ mod tests {
                 .unwrap(),
             ))
         );
+    }
+
+    fn assert_timestamp_widening_ordered(
+        source_unit: TimeUnit,
+        target_unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+    ) {
+        let source_type = DataType::Timestamp(source_unit, timezone.clone());
+        let target_type = DataType::Timestamp(target_unit, timezone.clone());
+        let quotient = i128::from(timestamp_unit_scale(&target_unit))
+            / i128::from(timestamp_unit_scale(&source_unit));
+
+        for (target_value, floor, ceil) in [
+            (i64::try_from(quotient + 1).unwrap(), 1, 2),
+            (i64::try_from(1 - quotient).unwrap(), -1, 0),
+        ] {
+            assert_timestamp_widening_bounds(
+                &source_type,
+                &target_type,
+                target_unit,
+                timezone.clone(),
+                target_value,
+                floor,
+                ceil,
+            );
+        }
+
+        for target_value in [123 * quotient, -123 * quotient] {
+            assert_timestamp_widening_bounds(
+                &source_type,
+                &target_type,
+                target_unit,
+                timezone.clone(),
+                i64::try_from(target_value).unwrap(),
+                target_value / quotient,
+                target_value / quotient,
+            );
+        }
+
+        for target_value in [i128::from(i64::MIN), i128::from(i64::MAX)] {
+            let floor = target_value.div_euclid(quotient);
+            let ceil = floor
+                + if target_value.rem_euclid(quotient) != 0 {
+                    1
+                } else {
+                    0
+                };
+            assert_timestamp_widening_bounds(
+                &source_type,
+                &target_type,
+                target_unit,
+                timezone.clone(),
+                i64::try_from(target_value).unwrap(),
+                floor,
+                ceil,
+            );
+        }
+    }
+
+    fn assert_timestamp_widening_bounds(
+        source_type: &DataType,
+        target_type: &DataType,
+        target_unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+        target_value: i64,
+        floor: i128,
+        ceil: i128,
+    ) {
+        for (op, expected) in [
+            (Operator::GtEq, ceil),
+            (Operator::Gt, floor),
+            (Operator::Lt, ceil),
+            (Operator::LtEq, floor),
+        ] {
+            assert_preimage_exact(
+                source_type,
+                target_type,
+                op,
+                &timestamp_scalar(&target_unit, timezone.clone(), target_value),
+                timestamp_scalar(
+                    match source_type {
+                        DataType::Timestamp(unit, _) => unit,
+                        _ => unreachable!(),
+                    },
+                    timezone.clone(),
+                    i64::try_from(expected).unwrap(),
+                ),
+            );
+        }
     }
 }

@@ -230,7 +230,7 @@ fn binary(
 mod tests {
     use super::*;
     use crate::expressions::col;
-    use arrow::datatypes::Field;
+    use arrow::datatypes::{Field, TimeUnit};
     use datafusion_common::tree_node::TreeNode;
 
     /// Check if an expression is a cast expression
@@ -258,6 +258,208 @@ mod tests {
             Field::new("c2", DataType::Int64, false),
             Field::new("c3", DataType::Utf8, false),
         ])
+    }
+
+    fn timestamp_scalar(
+        unit: TimeUnit,
+        value: i64,
+        timezone: Option<Arc<str>>,
+    ) -> ScalarValue {
+        match unit {
+            TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), timezone),
+            TimeUnit::Millisecond => {
+                ScalarValue::TimestampMillisecond(Some(value), timezone)
+            }
+            TimeUnit::Microsecond => {
+                ScalarValue::TimestampMicrosecond(Some(value), timezone)
+            }
+            TimeUnit::Nanosecond => {
+                ScalarValue::TimestampNanosecond(Some(value), timezone)
+            }
+        }
+    }
+
+    fn assert_timestamp_widening_unwrap(
+        source_unit: TimeUnit,
+        target_unit: TimeUnit,
+        timezone: Option<Arc<str>>,
+        op: Operator,
+        target_value: i64,
+        expected_value: i64,
+        try_cast: bool,
+    ) {
+        let source_type = DataType::Timestamp(source_unit, timezone.clone());
+        let target_type = DataType::Timestamp(target_unit, timezone.clone());
+        let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
+        let inner = col("ts", &schema).unwrap();
+        let cast_expr: Arc<dyn PhysicalExpr> = if try_cast {
+            Arc::new(TryCastExpr::new(inner, target_type))
+        } else {
+            Arc::new(CastExpr::new(inner, target_type, None))
+        };
+        let input: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            cast_expr,
+            op,
+            lit(timestamp_scalar(
+                target_unit,
+                target_value,
+                timezone.clone(),
+            )),
+        ));
+
+        let result = unwrap_cast_in_comparison(input, &schema).unwrap();
+        assert!(result.transformed);
+        let binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        assert_eq!(*binary.op(), op);
+        assert!(!is_cast_expr(binary.left()));
+        assert_eq!(
+            binary.right().downcast_ref::<Literal>().unwrap().value(),
+            &timestamp_scalar(source_unit, expected_value, timezone),
+        );
+    }
+
+    #[test]
+    fn test_timestamp_widening_ordered_cast_and_try_cast() {
+        for (source_unit, target_unit, quotient) in [
+            (TimeUnit::Second, TimeUnit::Millisecond, 1_000_i128),
+            (TimeUnit::Second, TimeUnit::Microsecond, 1_000_000),
+            (TimeUnit::Second, TimeUnit::Nanosecond, 1_000_000_000),
+            (TimeUnit::Millisecond, TimeUnit::Microsecond, 1_000),
+            (TimeUnit::Millisecond, TimeUnit::Nanosecond, 1_000_000),
+            (TimeUnit::Microsecond, TimeUnit::Nanosecond, 1_000),
+        ] {
+            for (target_value, floor, ceil) in [
+                (quotient + 1, 1, 2),
+                (1 - quotient, -1, 0),
+                (123 * quotient, 123, 123),
+                (-123 * quotient, -123, -123),
+            ] {
+                for (op, expected) in [
+                    (Operator::GtEq, ceil),
+                    (Operator::Gt, floor),
+                    (Operator::Lt, ceil),
+                    (Operator::LtEq, floor),
+                ] {
+                    for try_cast in [false, true] {
+                        assert_timestamp_widening_unwrap(
+                            source_unit,
+                            target_unit,
+                            None,
+                            op,
+                            i64::try_from(target_value).unwrap(),
+                            expected,
+                            try_cast,
+                        );
+                    }
+                }
+            }
+
+            for target_value in [i128::from(i64::MIN), i128::from(i64::MAX)] {
+                let floor = target_value.div_euclid(quotient);
+                let ceil = floor
+                    + if target_value.rem_euclid(quotient) != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                for (op, expected) in [
+                    (Operator::GtEq, ceil),
+                    (Operator::Gt, floor),
+                    (Operator::Lt, ceil),
+                    (Operator::LtEq, floor),
+                ] {
+                    assert_timestamp_widening_unwrap(
+                        source_unit,
+                        target_unit,
+                        None,
+                        op,
+                        i64::try_from(target_value).unwrap(),
+                        i64::try_from(expected).unwrap(),
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_timestamp_widening_literal_left_and_timezone() {
+        let timezone = Some(Arc::from("+05:30"));
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, timezone.clone()),
+            true,
+        )]);
+        for (op, expected_op, expected_value) in [
+            (Operator::Lt, Operator::Gt, 123),
+            (Operator::LtEq, Operator::GtEq, 124),
+            (Operator::Gt, Operator::Lt, 124),
+            (Operator::GtEq, Operator::LtEq, 123),
+        ] {
+            for try_cast in [false, true] {
+                let inner = col("ts", &schema).unwrap();
+                let target = DataType::Timestamp(TimeUnit::Nanosecond, timezone.clone());
+                let cast_expr: Arc<dyn PhysicalExpr> = if try_cast {
+                    Arc::new(TryCastExpr::new(inner, target))
+                } else {
+                    Arc::new(CastExpr::new(inner, target, None))
+                };
+                let input: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    lit(timestamp_scalar(
+                        TimeUnit::Nanosecond,
+                        123_456_789,
+                        timezone.clone(),
+                    )),
+                    op,
+                    cast_expr,
+                ));
+                let result = unwrap_cast_in_comparison(input, &schema).unwrap();
+                assert!(result.transformed);
+                let binary = result.data.downcast_ref::<BinaryExpr>().unwrap();
+                assert_eq!(*binary.op(), expected_op);
+                assert_eq!(
+                    binary.right().downcast_ref::<Literal>().unwrap().value(),
+                    &timestamp_scalar(
+                        TimeUnit::Millisecond,
+                        expected_value,
+                        timezone.clone()
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_timestamp_widening_equality_and_guards_retain_cast() {
+        let source = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let target = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source, true)]);
+        for (op, literal) in [
+            (
+                Operator::Eq,
+                ScalarValue::TimestampNanosecond(Some(123_000_000), None),
+            ),
+            (Operator::GtEq, ScalarValue::TimestampNanosecond(None, None)),
+            (
+                Operator::GtEq,
+                ScalarValue::TimestampMicrosecond(Some(123_456), None),
+            ),
+        ] {
+            let input: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(CastExpr::new(
+                    col("ts", &schema).unwrap(),
+                    target.clone(),
+                    None,
+                )),
+                op,
+                lit(literal),
+            ));
+            assert!(
+                !unwrap_cast_in_comparison(input, &schema)
+                    .unwrap()
+                    .transformed
+            );
+        }
     }
 
     #[test]
