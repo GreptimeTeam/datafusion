@@ -351,12 +351,17 @@ pub(crate) fn regex_match_dyn_scalar(
                     "Data type {} not supported as a dictionary value type for operation 'regex_match_dyn_scalar' on string array",
                     other
                 ),
-            }.map(
+            }.and_then(
                 // downcast_dictionary_array duplicates code per possible key type, so we aim to do all prep work before
                 |evaluated_values| downcast_dictionary_array! {
                     left => {
-                        let unpacked_dict = evaluated_values.take_iter(left.keys().iter().map(|opt| opt.map(|v| v as _))).collect::<BooleanArray>();
-                        Arc::new(unpacked_dict) as ArrayRef
+                        // `take` combines the validity of dictionary keys and evaluated
+                        // dictionary values, preserving nulls from either source.
+                        Ok(arrow::compute::take(
+                            evaluated_values.as_ref(),
+                            left.keys(),
+                            None,
+                        )?)
                     },
                     _ => unreachable!(),
                 }
