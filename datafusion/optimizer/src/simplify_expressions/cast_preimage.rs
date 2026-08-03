@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn all_timestamp_precision_widening_casts_remain() {
+    fn timestamp_widening_equality_and_in_remain() {
         let schema = expr_test_schema();
         for expr in [
             cast(col("ts_milli"), timestamp_nano_type())
@@ -414,6 +414,61 @@ mod tests {
             .eq(lit_timestamp_nano(0)),
         ] {
             assert_eq!(optimize_test(expr.clone(), &schema), expr);
+        }
+
+        let expr = in_list(
+            cast(col("ts_milli"), timestamp_nano_type()),
+            vec![
+                lit_timestamp_nano(123_000_000),
+                lit_timestamp_nano(123_456_789),
+            ],
+            false,
+        );
+        assert_eq!(optimize_test(expr.clone(), &schema), expr);
+    }
+
+    #[test]
+    fn timestamp_widening_ordered_cast_and_try_cast_rewrite() {
+        let schema = expr_test_schema();
+
+        for (literal, floor, ceil) in
+            [(123_456_789, 123, 124), (-123_456_789, -124, -123)]
+        {
+            for (op, bound) in [
+                (Operator::GtEq, ceil),
+                (Operator::Gt, floor),
+                (Operator::Lt, ceil),
+                (Operator::LtEq, floor),
+            ] {
+                for cast_expr in [
+                    cast(col("ts_milli"), timestamp_nano_type()),
+                    try_cast(col("ts_milli"), timestamp_nano_type()),
+                ] {
+                    let expr = binary_expr(cast_expr, op, lit_timestamp_nano(literal));
+                    let expected =
+                        binary_expr(col("ts_milli"), op, lit_timestamp_millis(bound));
+                    assert_eq!(optimize_test(expr, &schema), expected);
+                }
+            }
+        }
+
+        for (op, expected_op, expected_value) in [
+            (Operator::Lt, Operator::Gt, 123),
+            (Operator::LtEq, Operator::GtEq, 124),
+            (Operator::Gt, Operator::Lt, 124),
+            (Operator::GtEq, Operator::LtEq, 123),
+        ] {
+            let expr = binary_expr(
+                lit_timestamp_nano(123_456_789),
+                op,
+                cast(col("ts_milli"), timestamp_nano_type()),
+            );
+            let expected = binary_expr(
+                col("ts_milli"),
+                expected_op,
+                lit_timestamp_millis(expected_value),
+            );
+            assert_eq!(optimize_test(expr, &schema), expected);
         }
     }
 

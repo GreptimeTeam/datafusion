@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_coarse_to_fine_cast_overflow_retains_cast() {
+    fn timestamp_coarse_to_fine_cast_overflow_equality_retains_cast() {
         let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
         let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
         let batch = RecordBatch::try_new(
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_coarse_to_fine_try_cast_overflow_retains_cast() {
+    fn timestamp_coarse_to_fine_try_cast_overflow_equality_retains_cast() {
         let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
         let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
         let batch = RecordBatch::try_new(
@@ -560,6 +560,59 @@ mod tests {
             original,
         );
         assert!(contains_cast(&simplified));
+    }
+
+    #[test]
+    fn timestamp_coarse_to_fine_ordered_overflow_is_accepted_policy() {
+        let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![Some(
+                9_223_372_036_855,
+            )]))],
+        )
+        .unwrap();
+
+        for try_cast in [false, true] {
+            let cast_expr: Arc<dyn PhysicalExpr> = if try_cast {
+                Arc::new(TryCastExpr::new(
+                    col("ts", &schema).unwrap(),
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ))
+            } else {
+                Arc::new(CastExpr::new(
+                    col("ts", &schema).unwrap(),
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    None,
+                ))
+            };
+            let original: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                cast_expr,
+                Operator::GtEq,
+                lit(ScalarValue::TimestampNanosecond(Some(0), None)),
+            ));
+            let simplified = PhysicalExprSimplifier::new(&schema)
+                .simplify(Arc::clone(&original))
+                .unwrap();
+            let comparison = as_binary(&simplified);
+            assert_eq!(*comparison.op(), Operator::GtEq);
+            assert_eq!(
+                as_literal(comparison.right()).value(),
+                &ScalarValue::TimestampMillisecond(Some(0), None),
+            );
+            assert!(!contains_cast(&simplified));
+
+            if try_cast {
+                assert_eq!(boolean_values(&original, &batch).unwrap(), vec![None]);
+            } else {
+                assert!(boolean_values(&original, &batch).is_err());
+            }
+            assert_eq!(
+                boolean_values(&simplified, &batch).unwrap(),
+                vec![Some(true)]
+            );
+        }
     }
 
     #[test]
