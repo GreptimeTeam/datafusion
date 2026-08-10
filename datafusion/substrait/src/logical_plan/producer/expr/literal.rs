@@ -360,6 +360,20 @@ pub(crate) fn to_substrait_literal(
             }),
             DEFAULT_TYPE_VARIATION_REF,
         ),
+        // Dictionary literals are encoded as their inner value. The dictionary
+        // type information is carried separately by the type layer (as a Map
+        // with DICTIONARY_MAP_TYPE_VARIATION_REF), and the inner value is
+        // guaranteed to be non-null here since null dictionaries are handled by
+        // the `value.is_null()` check at the top of this function.
+        ScalarValue::Dictionary(_, value) => {
+            let literal = to_substrait_literal(producer, value)?;
+            (
+                literal
+                    .literal_type
+                    .expect("to_substrait_literal always sets a literal type"),
+                literal.type_variation_reference,
+            )
+        }
         _ => (
             not_impl_err!("Unsupported literal: {value:?}")?,
             DEFAULT_TYPE_VARIATION_REF,
@@ -556,6 +570,49 @@ mod tests {
         let roundtrip_scalar =
             from_substrait_literal_without_names(&test_consumer(), &substrait_literal)?;
         assert_eq!(scalar, roundtrip_scalar);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dictionary_literal() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        // Dictionary(UInt32, Utf8("a")) is encoded as its inner Utf8 literal.
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(Some("a".to_string()))),
+        );
+        let literal = to_substrait_literal(&mut producer, &dict)?;
+        assert_eq!(
+            literal.literal_type,
+            Some(LiteralType::String("a".to_string()))
+        );
+        assert!(!literal.nullable);
+        assert_eq!(
+            literal.type_variation_reference,
+            DEFAULT_CONTAINER_TYPE_VARIATION_REF
+        );
+
+        // The encoded literal decodes back to the unwrapped Utf8 value.
+        let roundtrip = from_substrait_literal_without_names(&test_consumer(), &literal)?;
+        assert_eq!(roundtrip, ScalarValue::Utf8(Some("a".to_string())));
+        Ok(())
+    }
+
+    #[test]
+    fn test_dictionary_null_literal() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        // A dictionary with a null inner value is encoded as a Null literal.
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(None)),
+        );
+        let literal = to_substrait_literal(&mut producer, &dict)?;
+        assert!(literal.nullable);
+        assert!(matches!(literal.literal_type, Some(LiteralType::Null(_))));
         Ok(())
     }
 }
