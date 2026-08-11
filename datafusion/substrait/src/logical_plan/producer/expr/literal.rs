@@ -24,6 +24,7 @@ use crate::variation_const::{
     VIEW_CONTAINER_TYPE_VARIATION_REF,
 };
 use datafusion::arrow::array::{Array, GenericListArray, OffsetSizeTrait};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::temporal_conversions::NANOSECONDS;
 use datafusion::common::{ScalarValue, exec_err, not_impl_err};
 use substrait::proto::expression::literal::interval_day_to_second::PrecisionMode;
@@ -46,6 +47,30 @@ pub(crate) fn to_substrait_literal_expr(
     producer: &mut impl SubstraitProducer,
     value: &ScalarValue,
 ) -> datafusion::common::Result<Expression> {
+    // Preserve the dictionary type when encoding a dictionary literal as a
+    // standalone expression (e.g. projection or VALUES): there is no separate
+    // type layer carrying the dictionary metadata in those positions, so we
+    // wrap the inner literal in a cast to the dictionary type. This lets the
+    // consumer reconstruct a `Dictionary` typed value instead of silently
+    // degrading to the inner (e.g. Utf8) type.
+    if let ScalarValue::Dictionary(key_type, inner) = value {
+        let inner_expr = to_substrait_literal_expr(producer, inner)?;
+        let cast_type = to_substrait_type(
+            producer,
+            &DataType::Dictionary(key_type.clone(), Box::new(inner.data_type())),
+            value.is_null(),
+        )?;
+        return Ok(Expression {
+            rex_type: Some(RexType::Cast(Box::new(
+                substrait::proto::expression::Cast {
+                    r#type: Some(cast_type),
+                    input: Some(Box::new(inner_expr)),
+                    failure_behavior: substrait::proto::expression::cast::FailureBehavior::ThrowException
+                        .into(),
+                },
+            ))),
+        });
+    }
     let literal = to_substrait_literal(producer, value)?;
     Ok(Expression {
         rex_type: Some(RexType::Literal(literal)),
@@ -360,6 +385,20 @@ pub(crate) fn to_substrait_literal(
             }),
             DEFAULT_TYPE_VARIATION_REF,
         ),
+        // Dictionary literals are encoded as their inner value. The dictionary
+        // type information is carried separately by the type layer (as a Map
+        // with DICTIONARY_MAP_TYPE_VARIATION_REF), and the inner value is
+        // guaranteed to be non-null here since null dictionaries are handled by
+        // the `value.is_null()` check at the top of this function.
+        ScalarValue::Dictionary(_, value) => {
+            let literal = to_substrait_literal(producer, value)?;
+            (
+                literal
+                    .literal_type
+                    .expect("to_substrait_literal always sets a literal type"),
+                literal.type_variation_reference,
+            )
+        }
         _ => (
             not_impl_err!("Unsupported literal: {value:?}")?,
             DEFAULT_TYPE_VARIATION_REF,
@@ -407,14 +446,18 @@ fn convert_array_to_literal_list<T: OffsetSizeTrait>(
 mod tests {
     use super::*;
     use crate::logical_plan::consumer::from_substrait_literal_without_names;
+    use crate::logical_plan::consumer::from_substrait_rex;
+    use crate::logical_plan::consumer::from_substrait_type_without_names;
     use crate::logical_plan::consumer::tests::test_consumer;
     use crate::logical_plan::producer::DefaultSubstraitProducer;
     use datafusion::arrow::array::{Int64Builder, MapBuilder, StringBuilder};
     use datafusion::arrow::datatypes::{
         DataType, Field, IntervalDayTime, IntervalMonthDayNano,
     };
+    use datafusion::common::DFSchema;
     use datafusion::common::Result;
     use datafusion::common::scalar::ScalarStructBuilder;
+    use datafusion::logical_expr::Expr;
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
@@ -556,6 +599,83 @@ mod tests {
         let roundtrip_scalar =
             from_substrait_literal_without_names(&test_consumer(), &substrait_literal)?;
         assert_eq!(scalar, roundtrip_scalar);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_literal() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        // Dictionary(UInt32, Utf8("a")) is encoded as a cast to the dictionary
+        // type wrapping the inner Utf8 literal, so the dictionary type is
+        // preserved in positions without a separate type layer (projection,
+        // VALUES, ...) instead of silently degrading to the inner type.
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(Some("a".to_string()))),
+        );
+        let expr = to_substrait_literal_expr(&mut producer, &dict)?;
+        let cast = match expr.rex_type.as_ref() {
+            Some(RexType::Cast(cast)) => cast,
+            other => panic!("expected Cast rex type, got {other:?}"),
+        };
+
+        // The cast output type is the full dictionary type.
+        let cast_type = cast.r#type.as_ref().expect("cast must have an output type");
+        assert_eq!(
+            from_substrait_type_without_names(&test_consumer(), cast_type)?,
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+        );
+
+        // The cast input is the inner Utf8 literal.
+        match cast.input.as_deref() {
+            Some(Expression {
+                rex_type: Some(RexType::Literal(lit)),
+                ..
+            }) => {
+                assert_eq!(lit.literal_type, Some(LiteralType::String("a".to_string())));
+                assert!(!lit.nullable);
+            }
+            other => panic!("expected inner literal, got {other:?}"),
+        }
+
+        // A full expression round-trip through the consumer preserves the
+        // dictionary type.
+        match from_substrait_rex(&test_consumer(), &expr, &DFSchema::empty()).await? {
+            Expr::Cast(cast) => {
+                assert_eq!(
+                    cast.field.data_type(),
+                    &DataType::Dictionary(
+                        Box::new(DataType::UInt32),
+                        Box::new(DataType::Utf8)
+                    )
+                );
+                match cast.expr.as_ref() {
+                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => {
+                        assert_eq!(s, "a");
+                    }
+                    other => panic!("expected inner Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Cast expr, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_dictionary_null_literal() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        // A dictionary with a null inner value is encoded as a Null literal.
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(None)),
+        );
+        let literal = to_substrait_literal(&mut producer, &dict)?;
+        assert!(literal.nullable);
+        assert!(matches!(literal.literal_type, Some(LiteralType::Null(_))));
         Ok(())
     }
 }
