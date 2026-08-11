@@ -31,6 +31,17 @@ use substrait::proto::read_rel::{NamedTable, ReadType, VirtualTable};
 use substrait::proto::rel::RelType;
 use substrait::proto::{ReadRel, Rel};
 
+/// Returns true if the scalar is a non-null Dictionary literal.
+///
+/// Non-null dictionary literals cannot be losslessly encoded in the plain
+/// `VirtualTable.values` (literal) format because `to_substrait_literal` only
+/// encodes the inner value, dropping the dictionary type. Null dictionaries are
+/// unaffected: they are encoded as typed Null literals carrying the full
+/// dictionary type.
+fn is_non_null_dictionary(sv: &ScalarValue) -> bool {
+    matches!(sv, ScalarValue::Dictionary(_, inner) if !inner.is_null())
+}
+
 /// Converts rows of literal expressions into Substrait literal structs.
 ///
 /// Each row is expected to contain only `Expr::Literal` or `Expr::Alias` wrapping literals.
@@ -213,13 +224,32 @@ pub fn from_values(
     let schema_len = v.schema.fields().len();
     let empty_schema = Arc::new(DFSchema::empty());
 
-    let use_literals = v.values.iter().all(|row| {
-        row.iter().all(|expr| match expr {
-            Expr::Literal(_, _) => true,
-            Expr::Alias(alias) => matches!(alias.expr.as_ref(), Expr::Literal(_, _)),
+    // A non-null `ScalarValue::Dictionary` literal cannot be encoded as a plain
+    // Substrait literal: `to_substrait_literal` only encodes the inner value and
+    // drops the dictionary type. (Null dictionaries are fine - they are encoded
+    // as typed Null literals.) When any row contains such a literal, fall back to
+    // the expression format, where `to_substrait_literal_expr` preserves the
+    // dictionary type by wrapping the inner literal in a cast to the dictionary
+    // type, which the consumer decodes back into a `Dictionary` typed value.
+    let contains_non_null_dictionary = v.values.iter().any(|row| {
+        row.iter().any(|expr| match expr {
+            Expr::Literal(sv, _) => is_non_null_dictionary(sv),
+            Expr::Alias(alias) => match alias.expr.as_ref() {
+                Expr::Literal(sv, _) => is_non_null_dictionary(sv),
+                _ => false,
+            },
             _ => false,
         })
     });
+
+    let use_literals = !contains_non_null_dictionary
+        && v.values.iter().all(|row| {
+            row.iter().all(|expr| match expr {
+                Expr::Literal(_, _) => true,
+                Expr::Alias(alias) => matches!(alias.expr.as_ref(), Expr::Literal(_, _)),
+                _ => false,
+            })
+        });
 
     let (values, expressions) = if use_literals {
         let values = convert_literal_rows(producer, &v.values)?;

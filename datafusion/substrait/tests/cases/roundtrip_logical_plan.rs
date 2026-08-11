@@ -1508,6 +1508,75 @@ async fn roundtrip_values_no_columns() -> Result<()> {
 }
 
 #[tokio::test]
+async fn roundtrip_values_with_dictionary() -> Result<()> {
+    let ctx = create_context().await?;
+    // A non-null Dictionary literal in a VALUES clause must keep its Dictionary
+    // type through the Substrait round-trip. It is encoded in the expression
+    // format (a cast to the dictionary type wrapping the inner literal) because
+    // the plain literal format would silently degrade it to the inner (Utf8)
+    // type, which then fails to materialize against the Dictionary-typed schema
+    // during physical execution (RecordBatch::try_new_with_options rejects the
+    // schema vs array mismatch).
+    let dict = ScalarValue::Dictionary(
+        Box::new(DataType::UInt32),
+        Box::new(ScalarValue::Utf8(Some("a".to_string()))),
+    );
+    let plan =
+        LogicalPlanBuilder::values(vec![vec![Expr::Literal(dict, None)]])?.build()?;
+
+    let proto = to_substrait_plan(&plan, &ctx.state())?;
+    let plan2 = from_substrait_plan(&ctx.state(), &proto).await?;
+
+    // The decoded Values row contains a cast to the dictionary type wrapping the
+    // inner Utf8 literal, not a bare inner literal (which would drop the type).
+    match &plan2 {
+        LogicalPlan::Values(Values { values, .. }) => match &values[0][0] {
+            Expr::Cast(cast) => {
+                assert_eq!(
+                    cast.data_type,
+                    DataType::Dictionary(
+                        Box::new(DataType::UInt32),
+                        Box::new(DataType::Utf8)
+                    )
+                );
+                match cast.expr.as_ref() {
+                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => {
+                        assert_eq!(s, "a");
+                    }
+                    other => panic!("expected inner Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Cast expr, got {other:?}"),
+        },
+        other => panic!("expected Values plan, got {other:?}"),
+    }
+
+    let plan2 = ctx.state().optimize(&plan2)?;
+
+    // The dictionary type must survive the round-trip.
+    assert_eq!(plan.schema(), plan2.schema());
+    assert_eq!(
+        plan2.schema().field(0).data_type(),
+        &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+    );
+
+    // Executing the round-tripped plan must succeed and produce a
+    // Dictionary-typed array matching the schema.
+    let batches = DataFrame::new(ctx.state(), plan2).collect().await?;
+    let batch = &batches[0];
+    assert_eq!(
+        batch.schema().field(0).data_type(),
+        &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+    );
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch.column(0).data_type(),
+        &DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn roundtrip_values_with_scalar_function() -> Result<()> {
     let ctx = create_context().await?;
     //  datafusion::functions_nested::map::map;

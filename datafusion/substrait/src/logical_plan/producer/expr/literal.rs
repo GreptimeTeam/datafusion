@@ -645,8 +645,8 @@ mod tests {
         match from_substrait_rex(&test_consumer(), &expr, &DFSchema::empty()).await? {
             Expr::Cast(cast) => {
                 assert_eq!(
-                    cast.field.data_type(),
-                    &DataType::Dictionary(
+                    cast.data_type,
+                    DataType::Dictionary(
                         Box::new(DataType::UInt32),
                         Box::new(DataType::Utf8)
                     )
