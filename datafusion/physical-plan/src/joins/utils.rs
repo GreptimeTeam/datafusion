@@ -630,12 +630,13 @@ fn estimate_inner_join_cardinality(
     // of the two inputs and normalizing it by the selectivity factor.
     let left_num_rows = left_stats.num_rows.get_value()?;
     let right_num_rows = right_stats.num_rows.get_value()?;
+    let cartesian_product = left_num_rows.checked_mul(*right_num_rows)?;
     match join_selectivity {
         Precision::Exact(value) if value > 0 => {
-            Some(Precision::Exact((left_num_rows * right_num_rows) / value))
+            Some(Precision::Exact(cartesian_product / value))
         }
         Precision::Inexact(value) if value > 0 => {
-            Some(Precision::Inexact((left_num_rows * right_num_rows) / value))
+            Some(Precision::Inexact(cartesian_product / value))
         }
         // Since we don't have any information about the selectivity (which is derived
         // from the number of distinct rows information) we can give up here for now.
@@ -2349,6 +2350,77 @@ mod tests {
                 expected_cardinality.map(|_| [left_col_stats, right_col_stats].concat())
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_inner_join_cardinality_overflow() -> Result<()> {
+        let large = 1usize << (usize::BITS / 2 - 1);
+        let pairwise_cardinality = large * large;
+        let stats = |num_rows, distinct_count| Statistics {
+            num_rows,
+            total_byte_size: Absent,
+            column_statistics: vec![create_column_stats(
+                Absent,
+                Absent,
+                distinct_count,
+                Absent,
+            )],
+        };
+
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                stats(Exact(large), Exact(1)),
+                stats(Exact(large), Exact(1)),
+            ),
+            Some(Exact(pairwise_cardinality))
+        );
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                stats(Inexact(large), Inexact(1)),
+                stats(Inexact(large), Inexact(1)),
+            ),
+            Some(Inexact(pairwise_cardinality))
+        );
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                stats(Inexact(pairwise_cardinality), Exact(1)),
+                stats(Exact(large), Exact(1)),
+            ),
+            None
+        );
+
+        let join_on = vec![(
+            Arc::new(Column::new("a", 0)) as _,
+            Arc::new(Column::new("b", 0)) as _,
+        )];
+        let pairwise_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let pairwise_stats = estimate_join_statistics(
+            stats(Exact(large), Exact(1)),
+            stats(Exact(large), Exact(1)),
+            &join_on,
+            &JoinType::Inner,
+            &pairwise_schema,
+        )?;
+        assert_eq!(pairwise_stats.num_rows, Inexact(pairwise_cardinality));
+
+        let nested_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]);
+        let nested_stats = estimate_join_statistics(
+            pairwise_stats,
+            stats(Exact(large), Exact(1)),
+            &join_on,
+            &JoinType::Inner,
+            &nested_schema,
+        )?;
+        assert_eq!(nested_stats.num_rows, Absent);
+
         Ok(())
     }
 
