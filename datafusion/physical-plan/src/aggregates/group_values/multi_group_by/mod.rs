@@ -20,6 +20,7 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
+mod dictionary;
 pub mod primitive;
 
 use std::mem::{self, size_of};
@@ -27,13 +28,13 @@ use std::mem::{self, size_of};
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
-    bytes_view::ByteViewGroupValueBuilder, primitive::PrimitiveGroupValueBuilder,
+    bytes_view::ByteViewGroupValueBuilder, dictionary::DictionaryGroupValuesColumn,
+    primitive::PrimitiveGroupValueBuilder,
 };
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef};
-use arrow::compute::cast;
 use arrow::datatypes::{
-    BinaryViewType, DataType, Date32Type, Date64Type, Decimal128Type, Float32Type,
+    BinaryViewType, DataType, Date32Type, Date64Type, Decimal128Type, Field, Float32Type,
     Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
     StringViewType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
     Time64NanosecondType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
@@ -41,7 +42,7 @@ use arrow::datatypes::{
     UInt64Type,
 };
 use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
+use datafusion_common::{Result, not_impl_err};
 use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
@@ -888,168 +889,115 @@ macro_rules! instantiate_primitive {
     };
 }
 
+/// Construct the specialized group column for one schema field.
+fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
+    let nullable = field.is_nullable();
+    let data_type = field.data_type();
+    let mut v: Vec<Box<dyn GroupColumn>> = Vec::with_capacity(1);
+    match data_type {
+        DataType::Int8 => instantiate_primitive!(v, nullable, Int8Type, data_type),
+        DataType::Int16 => instantiate_primitive!(v, nullable, Int16Type, data_type),
+        DataType::Int32 => instantiate_primitive!(v, nullable, Int32Type, data_type),
+        DataType::Int64 => instantiate_primitive!(v, nullable, Int64Type, data_type),
+        DataType::UInt8 => instantiate_primitive!(v, nullable, UInt8Type, data_type),
+        DataType::UInt16 => instantiate_primitive!(v, nullable, UInt16Type, data_type),
+        DataType::UInt32 => instantiate_primitive!(v, nullable, UInt32Type, data_type),
+        DataType::UInt64 => instantiate_primitive!(v, nullable, UInt64Type, data_type),
+        DataType::Float32 => instantiate_primitive!(v, nullable, Float32Type, data_type),
+        DataType::Float64 => instantiate_primitive!(v, nullable, Float64Type, data_type),
+        DataType::Date32 => instantiate_primitive!(v, nullable, Date32Type, data_type),
+        DataType::Date64 => instantiate_primitive!(v, nullable, Date64Type, data_type),
+        DataType::Time32(TimeUnit::Second) => {
+            instantiate_primitive!(v, nullable, Time32SecondType, data_type)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            instantiate_primitive!(v, nullable, Time32MillisecondType, data_type)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            instantiate_primitive!(v, nullable, Time64MicrosecondType, data_type)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            instantiate_primitive!(v, nullable, Time64NanosecondType, data_type)
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            instantiate_primitive!(v, nullable, TimestampSecondType, data_type)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            instantiate_primitive!(v, nullable, TimestampMillisecondType, data_type)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            instantiate_primitive!(v, nullable, TimestampMicrosecondType, data_type)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            instantiate_primitive!(v, nullable, TimestampNanosecondType, data_type)
+        }
+        DataType::Decimal128(_, _) => {
+            instantiate_primitive!(v, nullable, Decimal128Type, data_type)
+        }
+        DataType::Utf8 => v.push(Box::new(ByteGroupValueBuilder::<i32>::new(
+            OutputType::Utf8,
+        ))),
+        DataType::LargeUtf8 => v.push(Box::new(ByteGroupValueBuilder::<i64>::new(
+            OutputType::Utf8,
+        ))),
+        DataType::Binary => v.push(Box::new(ByteGroupValueBuilder::<i32>::new(
+            OutputType::Binary,
+        ))),
+        DataType::LargeBinary => v.push(Box::new(ByteGroupValueBuilder::<i64>::new(
+            OutputType::Binary,
+        ))),
+        DataType::Utf8View => {
+            v.push(Box::new(ByteViewGroupValueBuilder::<StringViewType>::new()))
+        }
+        DataType::BinaryView => {
+            v.push(Box::new(ByteViewGroupValueBuilder::<BinaryViewType>::new()))
+        }
+        DataType::Boolean => {
+            if nullable {
+                v.push(Box::new(BooleanGroupValueBuilder::<true>::new()));
+            } else {
+                v.push(Box::new(BooleanGroupValueBuilder::<false>::new()));
+            }
+        }
+        DataType::Dictionary(key_type, value_type) => {
+            let inner_field = Field::new(field.name(), value_type.as_ref().clone(), true);
+            let inner = make_group_column(&inner_field)?;
+            macro_rules! dictionary {
+                ($t:ty) => {
+                    v.push(Box::new(DictionaryGroupValuesColumn::<$t>::new(
+                        inner,
+                        &inner_field,
+                    )))
+                };
+            }
+            match key_type.as_ref() {
+                DataType::Int8 => dictionary!(Int8Type),
+                DataType::Int16 => dictionary!(Int16Type),
+                DataType::Int32 => dictionary!(Int32Type),
+                DataType::Int64 => dictionary!(Int64Type),
+                DataType::UInt8 => dictionary!(UInt8Type),
+                DataType::UInt16 => dictionary!(UInt16Type),
+                DataType::UInt32 => dictionary!(UInt32Type),
+                DataType::UInt64 => dictionary!(UInt64Type),
+                key => {
+                    return not_impl_err!(
+                        "Dictionary key type {key} not supported in GroupValuesColumn"
+                    );
+                }
+            }
+        }
+        dt => return not_impl_err!("{dt} not supported in GroupValuesColumn"),
+    }
+    Ok(v.pop().expect("make_group_column creates one builder"))
+}
+
 impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()> {
         if self.group_values.is_empty() {
             let mut v = Vec::with_capacity(cols.len());
 
             for f in self.schema.fields().iter() {
-                let nullable = f.is_nullable();
-                let data_type = f.data_type();
-                match data_type {
-                    &DataType::Int8 => {
-                        instantiate_primitive!(v, nullable, Int8Type, data_type)
-                    }
-                    &DataType::Int16 => {
-                        instantiate_primitive!(v, nullable, Int16Type, data_type)
-                    }
-                    &DataType::Int32 => {
-                        instantiate_primitive!(v, nullable, Int32Type, data_type)
-                    }
-                    &DataType::Int64 => {
-                        instantiate_primitive!(v, nullable, Int64Type, data_type)
-                    }
-                    &DataType::UInt8 => {
-                        instantiate_primitive!(v, nullable, UInt8Type, data_type)
-                    }
-                    &DataType::UInt16 => {
-                        instantiate_primitive!(v, nullable, UInt16Type, data_type)
-                    }
-                    &DataType::UInt32 => {
-                        instantiate_primitive!(v, nullable, UInt32Type, data_type)
-                    }
-                    &DataType::UInt64 => {
-                        instantiate_primitive!(v, nullable, UInt64Type, data_type)
-                    }
-                    &DataType::Float32 => {
-                        instantiate_primitive!(v, nullable, Float32Type, data_type)
-                    }
-                    &DataType::Float64 => {
-                        instantiate_primitive!(v, nullable, Float64Type, data_type)
-                    }
-                    &DataType::Date32 => {
-                        instantiate_primitive!(v, nullable, Date32Type, data_type)
-                    }
-                    &DataType::Date64 => {
-                        instantiate_primitive!(v, nullable, Date64Type, data_type)
-                    }
-                    &DataType::Time32(t) => match t {
-                        TimeUnit::Second => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                Time32SecondType,
-                                data_type
-                            )
-                        }
-                        TimeUnit::Millisecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                Time32MillisecondType,
-                                data_type
-                            )
-                        }
-                        _ => {}
-                    },
-                    &DataType::Time64(t) => match t {
-                        TimeUnit::Microsecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                Time64MicrosecondType,
-                                data_type
-                            )
-                        }
-                        TimeUnit::Nanosecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                Time64NanosecondType,
-                                data_type
-                            )
-                        }
-                        _ => {}
-                    },
-                    &DataType::Timestamp(t, _) => match t {
-                        TimeUnit::Second => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                TimestampSecondType,
-                                data_type
-                            )
-                        }
-                        TimeUnit::Millisecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                TimestampMillisecondType,
-                                data_type
-                            )
-                        }
-                        TimeUnit::Microsecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                TimestampMicrosecondType,
-                                data_type
-                            )
-                        }
-                        TimeUnit::Nanosecond => {
-                            instantiate_primitive!(
-                                v,
-                                nullable,
-                                TimestampNanosecondType,
-                                data_type
-                            )
-                        }
-                    },
-                    &DataType::Decimal128(_, _) => {
-                        instantiate_primitive! {
-                            v,
-                            nullable,
-                            Decimal128Type,
-                            data_type
-                        }
-                    }
-                    &DataType::Utf8 => {
-                        let b = ByteGroupValueBuilder::<i32>::new(OutputType::Utf8);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::LargeUtf8 => {
-                        let b = ByteGroupValueBuilder::<i64>::new(OutputType::Utf8);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::Binary => {
-                        let b = ByteGroupValueBuilder::<i32>::new(OutputType::Binary);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::LargeBinary => {
-                        let b = ByteGroupValueBuilder::<i64>::new(OutputType::Binary);
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::Utf8View => {
-                        let b = ByteViewGroupValueBuilder::<StringViewType>::new();
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::BinaryView => {
-                        let b = ByteViewGroupValueBuilder::<BinaryViewType>::new();
-                        v.push(Box::new(b) as _)
-                    }
-                    &DataType::Boolean => {
-                        if nullable {
-                            let b = BooleanGroupValueBuilder::<true>::new();
-                            v.push(Box::new(b) as _)
-                        } else {
-                            let b = BooleanGroupValueBuilder::<false>::new();
-                            v.push(Box::new(b) as _)
-                        }
-                    }
-                    dt => {
-                        return not_impl_err!("{dt} not supported in GroupValuesColumn");
-                    }
-                }
+                v.push(make_group_column(f.as_ref())?);
             }
             self.group_values = v;
         }
@@ -1079,7 +1027,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        let mut output = match emit_to {
+        let output = match emit_to {
             EmitTo::All => {
                 let group_values = mem::take(&mut self.group_values);
                 debug_assert!(self.group_values.is_empty());
@@ -1163,20 +1111,6 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             }
         };
 
-        // TODO: Materialize dictionaries in group keys (#7647)
-        for (field, array) in self.schema.fields.iter().zip(&mut output) {
-            let expected = field.data_type();
-            if let DataType::Dictionary(_, v) = expected {
-                let actual = array.data_type();
-                if v.as_ref() != actual {
-                    return Err(internal_datafusion_err!(
-                        "Converted group rows expected dictionary of {v} got {actual}"
-                    ));
-                }
-                *array = cast(array.as_ref(), expected)?;
-            }
-        }
-
         Ok(output)
     }
 
@@ -1211,6 +1145,9 @@ pub fn supported_schema(schema: &Schema) -> bool {
 /// In order to be supported, there must be a specialized implementation of
 /// [`GroupColumn`] for the data type, instantiated in [`GroupValuesColumn::intern`]
 fn supported_type(data_type: &DataType) -> bool {
+    if let DataType::Dictionary(_, value_type) = data_type {
+        return supported_type(value_type);
+    }
     matches!(
         *data_type,
         DataType::Int8
@@ -1263,6 +1200,44 @@ mod tests {
     };
 
     use super::GroupIndexView;
+
+    #[test]
+    fn dictionary_group_column_preserves_schema_in_multi_column_group_by() {
+        use arrow::array::{DictionaryArray, Int32Array, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![Some(0), Some(1), Some(0), Some(1)]),
+            Arc::new(StringArray::from(vec!["alpha", "beta"])),
+        ));
+        let numbers: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("number", DataType::Int64, false),
+        ]));
+        let mut group_values =
+            GroupValuesColumn::<false>::try_new(Arc::clone(&schema)).unwrap();
+        let mut groups = Vec::new();
+        group_values
+            .intern(&[dictionary, numbers], &mut groups)
+            .unwrap();
+        assert_eq!(groups, vec![0, 1, 2, 1]);
+        let output = group_values.emit(EmitTo::All).unwrap();
+        assert_eq!(output[0].data_type(), schema.field(0).data_type());
+        assert_eq!(
+            output[0]
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .unwrap()
+                .values()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn test_intern_for_vectorized_group_values() {
