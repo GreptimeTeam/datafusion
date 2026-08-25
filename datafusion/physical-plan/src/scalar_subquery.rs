@@ -25,15 +25,31 @@
 //! [`ScalarSubqueryExpr`]: datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, ScalarValue, Statistics, exec_err, internal_err};
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, Statistics, exec_err, internal_err,
+};
 use datafusion_execution::TaskContext;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal, lit,
+};
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr_common::physical_expr::{
+    PhysicalExpr, snapshot_physical_expr,
+};
 
-use crate::execution_plan::{CardinalityEffect, ExecutionPlan, PlanProperties};
+use crate::execution_plan::{
+    CardinalityEffect, ExecutionPlan, PlanProperties, plan_contains_expression_id,
+};
+use crate::filter_pushdown::{
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation, PushedDown,
+};
 use crate::joins::utils::{OnceAsync, OnceFut};
 use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::stream::RecordBatchStreamAdapter;
@@ -92,8 +108,23 @@ pub struct ScalarSubqueryExec {
     /// Shared results container; the corresponding `ScalarSubqueryExpr`
     /// nodes in the input plan hold the same underlying container.
     results: ScalarSubqueryResults,
+    /// Dynamic filters associated with predicates in the main input.
+    /// This state is separate from the input so it survives child replacement.
+    bindings: Arc<Mutex<Vec<ScalarSubqueryBinding>>>,
     /// Cached plan properties (copied from input).
     cache: Arc<PlanProperties>,
+}
+
+#[derive(Debug, Clone)]
+struct ScalarSubqueryBinding {
+    /// The predicate produced by this scalar subquery.
+    predicate: Arc<dyn PhysicalExpr>,
+    /// Every concrete dynamic-filter consumer for this binding's ID.
+    ///
+    /// Optimized plans commonly share one filter instance between the
+    /// producer and its consumers. Proto decoding, however, can produce
+    /// multiple independent filter instances with the same expression ID.
+    consumers: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl ScalarSubqueryExec {
@@ -108,6 +139,7 @@ impl ScalarSubqueryExec {
             subqueries,
             subquery_future: Arc::default(),
             results,
+            bindings: Arc::default(),
             cache,
         }
     }
@@ -124,12 +156,86 @@ impl ScalarSubqueryExec {
         &self.results
     }
 
+    /// Returns the dynamic-filter bindings associated with this execution plan.
+    pub fn dynamic_filter_bindings(
+        &self,
+    ) -> Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|binding| {
+                (
+                    Arc::clone(&binding.predicate),
+                    Arc::clone(&binding.consumers[0]),
+                )
+            })
+            .collect()
+    }
+
     /// Returns a per-child bool vec that is `true` for the main input
     /// (child 0) and `false` for every subquery child.
     fn true_for_input_only(&self) -> Vec<bool> {
         std::iter::once(true)
             .chain(std::iter::repeat_n(false, self.subqueries.len()))
             .collect()
+    }
+
+    fn discover_binding(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> Option<ScalarSubqueryBinding> {
+        let binary = predicate.downcast_ref::<BinaryExpr>()?;
+        if *binary.op() != datafusion_expr::Operator::GtEq {
+            return None;
+        }
+        let left = binary.left().downcast_ref::<Column>()?;
+        let subtraction = binary.right().downcast_ref::<BinaryExpr>()?;
+        if *subtraction.op() != datafusion_expr::Operator::Minus
+            || subtraction.right().downcast_ref::<Literal>().is_none()
+        {
+            return None;
+        }
+        let scalar = subtraction.left().downcast_ref::<ScalarSubqueryExpr>()?;
+        if !ScalarSubqueryResults::ptr_eq(scalar.results(), &self.results) {
+            return None;
+        }
+        let children = collect_columns(predicate)
+            .into_iter()
+            .map(|column| Arc::new(column) as Arc<dyn PhysicalExpr>)
+            .collect();
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(children, lit(true)));
+        let _ = left;
+        Some(ScalarSubqueryBinding {
+            predicate: Arc::clone(predicate),
+            consumers: vec![filter as Arc<dyn PhysicalExpr>],
+        })
+    }
+
+    fn discover_bindings(&self) -> Result<()> {
+        let mut discovered = Vec::new();
+        self.input.apply(|plan| {
+            plan.apply_expressions(&mut |root| {
+                root.apply(&mut |expr: &Arc<dyn PhysicalExpr>| {
+                    if let Some(binding) = self.discover_binding(expr) {
+                        discovered.push(binding);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let mut bindings = self.bindings.lock().unwrap();
+        for binding in discovered {
+            if !bindings
+                .iter()
+                .any(|existing| Arc::ptr_eq(&existing.predicate, &binding.predicate))
+            {
+                bindings.push(binding);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -183,11 +289,10 @@ impl ExecutionPlan for ScalarSubqueryExec {
                 index: sq.index,
             })
             .collect();
-        Ok(Arc::new(ScalarSubqueryExec::new(
-            input,
-            subqueries,
-            self.results.clone(),
-        )))
+        let mut new_node =
+            ScalarSubqueryExec::new(input, subqueries, self.results.clone());
+        new_node.bindings = Arc::clone(&self.bindings);
+        Ok(Arc::new(new_node))
     }
 
     fn with_new_children(
@@ -201,14 +306,81 @@ impl ExecutionPlan for ScalarSubqueryExec {
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        // DynamicFilterPhysicalExpr currently has no supported reset operation.
+        // Do not silently reuse a completed filter on a later execution.
+        if !self.bindings.lock().unwrap().is_empty() {
+            return internal_err!(
+                "cannot reset ScalarSubqueryExec with dynamic-filter bindings: DynamicFilterPhysicalExpr has no reset API"
+            );
+        }
         self.results.clear();
         Ok(Arc::new(ScalarSubqueryExec {
             input: Arc::clone(&self.input),
             subqueries: self.subqueries.clone(),
             subquery_future: Arc::default(),
             results: self.results.clone(),
+            bindings: Arc::clone(&self.bindings),
             cache: Arc::clone(&self.cache),
         }))
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        if phase == FilterPushdownPhase::Post {
+            self.discover_bindings()?;
+        }
+        let mut main = ChildFilterDescription::from_child(&parent_filters, self.input())?;
+        if phase == FilterPushdownPhase::Post {
+            for binding in self.bindings.lock().unwrap().iter() {
+                main = main.with_self_filter(Arc::clone(&binding.consumers[0]));
+            }
+        }
+        let mut description = FilterDescription::new().with_child(main);
+        for subquery in &self.subqueries {
+            description = description
+                .with_child(ChildFilterDescription::all_unsupported(&parent_filters));
+            let _ = subquery;
+        }
+        Ok(description)
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
+        if phase == FilterPushdownPhase::Post {
+            let accepted = child_pushdown_result
+                .self_filters
+                .first()
+                .into_iter()
+                .flatten()
+                .filter(|predicate| matches!(predicate.discriminant, PushedDown::Yes))
+                .filter_map(|predicate| predicate.predicate.expression_id())
+                .collect::<std::collections::HashSet<_>>();
+            let mut bindings = self.bindings.lock().unwrap();
+            let mut retained = Vec::with_capacity(bindings.len());
+            for binding in bindings.drain(..) {
+                let keep = match binding.consumers[0].expression_id() {
+                    Some(id) => {
+                        accepted.contains(&id)
+                            || plan_contains_expression_id(&self.input, id)?
+                    }
+                    None => false,
+                };
+                if keep {
+                    retained.push(binding);
+                }
+            }
+            *bindings = retained;
+        }
+        Ok(result)
     }
 
     fn execute(
@@ -218,9 +390,12 @@ impl ExecutionPlan for ScalarSubqueryExec {
     ) -> Result<SendableRecordBatchStream> {
         let subqueries = self.subqueries.clone();
         let results = self.results.clone();
+        let bindings = Arc::clone(&self.bindings);
         let planning_ctx = Arc::clone(&context);
         let mut subquery_future = self.subquery_future.try_once(move || {
-            Ok(async move { execute_subqueries(subqueries, results, planning_ctx).await })
+            Ok(async move {
+                execute_subqueries(subqueries, results, bindings, planning_ctx).await
+            })
         })?;
         let input = Arc::clone(&self.input);
         let schema = self.schema();
@@ -242,9 +417,27 @@ impl ExecutionPlan for ScalarSubqueryExec {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+        let bindings = self.bindings.lock().unwrap();
+        crate::apply_expression_roots(
+            bindings.iter().flat_map(|binding| {
+                [
+                    Arc::clone(&binding.predicate),
+                    Arc::clone(&binding.consumers[0]),
+                ]
+            }),
+            f,
+        )
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|binding| Arc::clone(&binding.consumers[0]))
+            .collect()
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -285,16 +478,43 @@ impl ExecutionPlan for ScalarSubqueryExec {
     ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
         use datafusion_proto_models::protobuf;
 
-        let input = ctx.encode_child(self.input())?;
+        let ScalarSubqueryExec {
+            input: input_plan,
+            subqueries,
+            subquery_future: _,
+            results: _,
+            bindings,
+            cache: _,
+        } = self;
+        let input = ctx.encode_child(input_plan)?;
         // Subquery indices are positional and recovered during decoding.
         let subqueries =
-            ctx.encode_children(self.subqueries().iter().map(|subquery| &subquery.plan))?;
+            ctx.encode_children(subqueries.iter().map(|subquery| &subquery.plan))?;
+        let dynamic_filter_bindings = bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|binding| {
+                Ok(protobuf::ScalarSubqueryDynamicFilterBindingNode {
+                    predicate: Some(ctx.encode_expr(&binding.predicate)?),
+                    dynamic_filter_id: Some(
+                        binding.consumers[0].expression_id().ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "ScalarSubquery dynamic filter is missing expression_id"
+                                    .to_string(),
+                            )
+                        })?,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(
                 protobuf::physical_plan_node::PhysicalPlanType::ScalarSubquery(Box::new(
                     protobuf::ScalarSubqueryExecNode {
                         input: Some(Box::new(input)),
                         subqueries,
+                        dynamic_filter_bindings,
                     },
                 )),
             ),
@@ -318,13 +538,61 @@ impl ScalarSubqueryExec {
         );
         let results = ScalarSubqueryResults::new(scalar_subquery.subqueries.len());
         let input_node = scalar_subquery.input.as_deref().ok_or_else(|| {
-            datafusion_common::internal_datafusion_err!(
-                "ScalarSubqueryExec is missing required field 'input'"
+            DataFusionError::Internal(
+                "ScalarSubqueryExec is missing required field 'input'".to_string(),
             )
         })?;
-        // The input's ScalarSubqueryExpr nodes must share this results container.
         let input =
             ctx.decode_child_with_scalar_subquery_results(input_node, results.clone())?;
+
+        let mut dynamic_filters =
+            std::collections::HashMap::<u64, Vec<Arc<dyn PhysicalExpr>>>::new();
+        input.apply(|plan| {
+            plan.apply_expressions(&mut |root| {
+                root.apply(&mut |expr: &Arc<dyn PhysicalExpr>| {
+                    if let Some(filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>()
+                    {
+                        if let Some(id) = filter.expression_id() {
+                            dynamic_filters
+                                .entry(id)
+                                .or_default()
+                                .push(Arc::clone(expr));
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        let mut bindings =
+            Vec::with_capacity(scalar_subquery.dynamic_filter_bindings.len());
+        for binding in &scalar_subquery.dynamic_filter_bindings {
+            let predicate = ctx.decode_expr_with_scalar_subquery_results(
+                binding.predicate.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "ScalarSubqueryDynamicFilterBindingNode is missing required field 'predicate'".to_string(),
+                    )
+                })?,
+                input.schema().as_ref(),
+                results.clone(),
+            )?;
+            let id = binding.dynamic_filter_id.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "ScalarSubqueryDynamicFilterBindingNode is missing required field 'dynamic_filter_id'".to_string(),
+                )
+            })?;
+            let filters = dynamic_filters.get(&id).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "ScalarSubquery dynamic filter binding references missing expression_id {id}"
+                ))
+            })?;
+            bindings.push(ScalarSubqueryBinding {
+                predicate,
+                consumers: filters.clone(),
+            });
+        }
+
         let subqueries = scalar_subquery
             .subqueries
             .iter()
@@ -336,8 +604,9 @@ impl ScalarSubqueryExec {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-
-        Ok(Arc::new(Self::new(input, subqueries, results)))
+        let exec = Self::new(input, subqueries, results);
+        exec.bindings.lock().unwrap().extend(bindings);
+        Ok(Arc::new(exec))
     }
 }
 
@@ -350,6 +619,7 @@ async fn wait_for_subqueries(fut: &mut OnceFut<()>) -> Result<()> {
 async fn execute_subqueries(
     subqueries: Vec<ScalarSubqueryLink>,
     results: ScalarSubqueryResults,
+    bindings: Arc<Mutex<Vec<ScalarSubqueryBinding>>>,
     context: Arc<TaskContext>,
 ) -> Result<()> {
     // Evaluate subqueries in parallel; wait for them all to finish evaluation
@@ -366,6 +636,32 @@ async fn execute_subqueries(
         }
     });
     futures::future::try_join_all(futures).await?;
+    let bindings = bindings.lock().unwrap();
+    for binding in bindings.iter() {
+        // Snapshot the producer exactly once, then publish it to every
+        // independent runtime state. Derived consumers sharing one state are
+        // updated and completed only once.
+        let snapshot = snapshot_physical_expr(Arc::clone(&binding.predicate))?;
+        let mut updated = Vec::<&DynamicFilterPhysicalExpr>::new();
+        for consumer in &binding.consumers {
+            let filter = consumer
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "ScalarSubquery dynamic-filter binding has an invalid filter"
+                            .to_string(),
+                    )
+                })?;
+            if !updated
+                .iter()
+                .any(|updated_filter| updated_filter.shares_runtime_state(filter))
+            {
+                filter.update(Arc::clone(&snapshot))?;
+                filter.mark_complete();
+                updated.push(filter);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -418,13 +714,99 @@ mod tests {
 
     use crate::test::exec::ErrorExec;
     use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
     use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 
     enum ExpectedSubqueryResult {
         Value(ScalarValue),
         Error(&'static str),
+    }
+
+    #[derive(Debug)]
+    struct ExpressionExec {
+        input: Arc<dyn ExecutionPlan>,
+        expressions: Arc<Mutex<Vec<Arc<dyn PhysicalExpr>>>>,
+    }
+
+    impl ExpressionExec {
+        fn new(
+            input: Arc<dyn ExecutionPlan>,
+            expressions: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Self {
+            Self {
+                input,
+                expressions: Arc::new(Mutex::new(expressions)),
+            }
+        }
+
+        fn add_expression(&self, expression: Arc<dyn PhysicalExpr>) {
+            self.expressions.lock().unwrap().push(expression);
+        }
+    }
+
+    impl DisplayAs for ExpressionExec {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            match t {
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(f, "ExpressionExec")
+                }
+                DisplayFormatType::TreeRender => write!(f, ""),
+            }
+        }
+    }
+
+    impl ExecutionPlan for ExpressionExec {
+        fn name(&self) -> &'static str {
+            "ExpressionExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+            _: ReplaceChildrenOptions,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                input: children.remove(0),
+                expressions: Arc::clone(&self.expressions),
+            }))
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            let expressions = self.expressions.lock().unwrap().clone();
+            crate::apply_expression_roots(expressions, f)
+        }
     }
 
     #[derive(Debug)]
@@ -567,6 +949,293 @@ mod tests {
             .unwrap();
         assert_eq!(values.len(), 1);
         values.value(0)
+    }
+
+    fn timestamp_predicate(results: ScalarSubqueryResults) -> Arc<dyn PhysicalExpr> {
+        let scalar = Arc::new(ScalarSubqueryExpr::new(
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+            SubqueryIndex::new(0),
+            results,
+        ));
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("timestamp_column", 0)),
+            Operator::GtEq,
+            Arc::new(BinaryExpr::new(
+                scalar,
+                Operator::Minus,
+                Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
+                    IntervalMonthDayNano::new(0, 0, 60_000_000_000),
+                )))),
+            )),
+        ))
+    }
+
+    fn dynamic_filter(exec: &ScalarSubqueryExec) -> Arc<DynamicFilterPhysicalExpr> {
+        let filter = Arc::clone(&exec.bindings.lock().unwrap()[0].consumers[0]);
+        Arc::downcast::<DynamicFilterPhysicalExpr>(filter)
+            .expect("expected dynamic filter")
+    }
+
+    #[test]
+    fn test_scalar_subquery_filter_pushdown_no_removes_binding_when_input_lacks_filter()
+    -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(
+            placeholder_input(),
+            vec![Arc::clone(&predicate)],
+        ));
+        let exec = Arc::new(single_subquery_exec(
+            input,
+            make_subquery_plan(vec![int32_batch(vec![1])]),
+            results,
+        ));
+        exec.discover_bindings()?;
+        let filter = dynamic_filter(&exec);
+
+        exec.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            ChildPushdownResult {
+                parent_filters: vec![],
+                self_filters: vec![vec![
+                    PushedDown::No
+                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>),
+                ]],
+            },
+            &ConfigOptions::default(),
+        )?;
+        assert!(exec.dynamic_expressions_produced().is_empty());
+        reset_plan_states(exec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_subquery_filter_pushdown_no_retains_binding_when_input_contains_filter()
+    -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(
+            placeholder_input(),
+            vec![Arc::clone(&predicate)],
+        ));
+        let subquery_plan = make_subquery_plan(vec![int32_batch(vec![1])]);
+        let exec = Arc::new(single_subquery_exec(input, subquery_plan, results));
+        exec.discover_bindings()?;
+        let filter = dynamic_filter(&exec);
+
+        let updated_input = Arc::new(ExpressionExec::new(
+            placeholder_input(),
+            vec![predicate, Arc::clone(&filter) as Arc<dyn PhysicalExpr>],
+        ));
+        let subquery_plan = Arc::clone(&exec.subqueries()[0].plan);
+        let updated_exec = exec.replace_children(
+            vec![updated_input, subquery_plan],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        updated_exec.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            ChildPushdownResult {
+                parent_filters: vec![],
+                self_filters: vec![vec![
+                    PushedDown::No
+                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>),
+                ]],
+            },
+            &ConfigOptions::default(),
+        )?;
+        assert_eq!(updated_exec.dynamic_expressions_produced().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scalar_subquery_filter_pushdown_retains_accepted_binding() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(
+            placeholder_input(),
+            vec![Arc::clone(&predicate)],
+        ));
+        let exec = single_subquery_exec(
+            input,
+            make_subquery_plan(vec![int32_batch(vec![1])]),
+            results,
+        );
+        exec.discover_bindings()?;
+        let filter = dynamic_filter(&exec);
+
+        exec.handle_child_pushdown_result(
+            FilterPushdownPhase::Post,
+            ChildPushdownResult {
+                parent_filters: vec![],
+                self_filters: vec![vec![
+                    PushedDown::Yes
+                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>),
+                ]],
+            },
+            &ConfigOptions::default(),
+        )?;
+
+        let produced = exec.dynamic_expressions_produced();
+        assert_eq!(produced.len(), 1);
+        assert!(Arc::ptr_eq(
+            &produced[0],
+            &(Arc::clone(&filter) as Arc<dyn PhysicalExpr>)
+        ));
+
+        let mut roots = vec![];
+        exec.apply_expressions(&mut |root| {
+            roots.push(Arc::clone(root));
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|root| Arc::ptr_eq(root, &predicate)));
+        assert!(roots.iter().any(|root| Arc::ptr_eq(
+            root,
+            &(Arc::clone(&filter) as Arc<dyn PhysicalExpr>)
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn test_discover_scalar_subquery_bindings_by_results_scope() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(
+            placeholder_input(),
+            vec![Arc::clone(&predicate)],
+        ));
+        let exec = single_subquery_exec(
+            input.clone(),
+            make_subquery_plan(vec![int32_batch(vec![1])]),
+            results,
+        );
+
+        exec.discover_bindings()?;
+        exec.discover_bindings()?;
+        assert_eq!(exec.bindings.lock().unwrap().len(), 1);
+
+        input.add_expression(timestamp_predicate(exec.results().clone()));
+        exec.discover_bindings()?;
+        assert_eq!(exec.bindings.lock().unwrap().len(), 2);
+
+        input.add_expression(timestamp_predicate(ScalarSubqueryResults::new(1)));
+        exec.discover_bindings()?;
+        assert_eq!(exec.bindings.lock().unwrap().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_subqueries_updates_shared_runtime_state_once() -> Result<()> {
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
+        let derived_expr = Arc::clone(&filter).with_new_children(vec![])?;
+        let derived = derived_expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("expected dynamic filter".to_string())
+            })?;
+        assert!(filter.shares_runtime_state(&derived));
+
+        let bindings = Arc::new(Mutex::new(vec![ScalarSubqueryBinding {
+            predicate: lit(false),
+            consumers: vec![
+                Arc::clone(&filter) as Arc<dyn PhysicalExpr>,
+                Arc::clone(&derived_expr),
+            ],
+        }]));
+        execute_subqueries(
+            vec![],
+            ScalarSubqueryResults::new(0),
+            bindings,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+
+        assert_eq!(filter.snapshot_generation(), 2);
+        assert_eq!(derived.snapshot_generation(), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), filter.wait_complete())
+            .await
+            .expect("shared filter should be complete");
+        tokio::time::timeout(std::time::Duration::from_secs(1), derived.wait_complete())
+            .await
+            .expect("derived filter should be complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_scalar_subquery_updates_dynamic_filter_with_timestamp() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(placeholder_input(), vec![predicate]));
+        let exec = single_subquery_exec(
+            input,
+            make_subquery_plan(vec![int32_batch(vec![1])]),
+            results.clone(),
+        );
+        exec.discover_bindings()?;
+        results.set(
+            SubqueryIndex::new(0),
+            ScalarValue::TimestampMillisecond(
+                Some(1_672_574_400_000),
+                Some("UTC".into()),
+            ),
+        )?;
+
+        execute_subqueries(
+            vec![],
+            results,
+            Arc::clone(&exec.bindings),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+
+        let filter = dynamic_filter(&exec);
+        let current = filter.current()?;
+        let predicate = current.downcast_ref::<BinaryExpr>().unwrap();
+        let subtraction = predicate.right().downcast_ref::<BinaryExpr>().unwrap();
+        let timestamp = subtraction.left().downcast_ref::<Literal>().unwrap();
+        assert_eq!(
+            timestamp.value(),
+            &ScalarValue::TimestampMillisecond(
+                Some(1_672_574_400_000),
+                Some("UTC".into())
+            )
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), filter.wait_complete())
+            .await
+            .expect("scalar subquery dynamic filter should be complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_scalar_subquery_does_not_update_dynamic_filter() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = timestamp_predicate(results.clone());
+        let input = Arc::new(ExpressionExec::new(placeholder_input(), vec![predicate]));
+        let exec = single_subquery_exec(input, Arc::new(ErrorExec::new()), results);
+        exec.discover_bindings()?;
+        let filter = dynamic_filter(&exec);
+        let before = filter.current()?;
+        assert!(before.downcast_ref::<Literal>().is_some());
+
+        let result = execute_subqueries(
+            exec.subqueries().to_vec(),
+            exec.results().clone(),
+            Arc::clone(&exec.bindings),
+            Arc::new(TaskContext::default()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(filter.current()?.downcast_ref::<Literal>().is_some());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                filter.wait_complete()
+            )
+            .await
+            .is_err()
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -2094,6 +2094,17 @@ impl ExecutionPlanDecode for ConverterPlanDecoder<'_, '_> {
             .proto_to_physical_expr(node, input_schema, self.ctx)
     }
 
+    fn decode_expr_with_scalar_subquery_results(
+        &self,
+        node: &protobuf::PhysicalExprNode,
+        input_schema: &Schema,
+        results: ScalarSubqueryResults,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let scoped_ctx = self.ctx.with_scalar_subquery_results(results);
+        self.proto_converter
+            .proto_to_physical_expr(node, input_schema, &scoped_ctx)
+    }
+
     fn task_ctx(&self) -> &TaskContext {
         self.ctx.task_ctx()
     }

@@ -2566,11 +2566,22 @@ pub struct BufferExecNode {
     pub capacity: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarSubqueryDynamicFilterBindingNode {
+    #[prost(message, optional, tag = "1")]
+    pub predicate: ::core::option::Option<PhysicalExprNode>,
+    #[prost(uint64, optional, tag = "2")]
+    pub dynamic_filter_id: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ScalarSubqueryExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
     #[prost(message, repeated, tag = "2")]
     pub subqueries: ::prost::alloc::vec::Vec<PhysicalPlanNode>,
+    #[prost(message, repeated, tag = "3")]
+    pub dynamic_filter_bindings: ::prost::alloc::vec::Vec<
+        ScalarSubqueryDynamicFilterBindingNode,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalScalarSubqueryExprNode {

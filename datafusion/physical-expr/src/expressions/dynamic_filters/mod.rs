@@ -183,6 +183,15 @@ impl Display for DynamicFilterPhysicalExpr {
 }
 
 impl DynamicFilterPhysicalExpr {
+    /// Returns `true` if `other` shares this filter's runtime state.
+    ///
+    /// Derived filters can have distinct outer objects while sharing the same
+    /// state. Conversely, filters reconstructed independently (for example by
+    /// decoding) do not share state even when their expression IDs match.
+    pub fn shares_runtime_state(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Create a new [`DynamicFilterPhysicalExpr`]
     /// from an initial expression and a list of children.
     /// The list of children is provided separately because
