@@ -18,11 +18,13 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::{
-    array::{RecordBatch, record_batch},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{RecordBatch, TimestampNanosecondArray, record_batch},
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     util::pretty::pretty_format_batches,
 };
 use arrow_schema::SortOptions;
+use bytes::Bytes;
+use datafusion::datasource::physical_plan::ParquetSource;
 use datafusion::{
     assert_batches_eq,
     logical_expr::Operator,
@@ -36,6 +38,7 @@ use datafusion::{
 use datafusion_catalog::memory::DataSourceExec;
 use datafusion_common::{
     JoinType,
+    arrow::datatypes::IntervalMonthDayNano,
     config::ConfigOptions,
     tree_node::{TreeNode, TreeNodeRecursion},
 };
@@ -44,6 +47,7 @@ use datafusion_datasource::{
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::ScalarUDF;
+use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_functions::math::random::RandomFunc;
 use datafusion_functions_aggregate::{
     count::count_udaf,
@@ -52,6 +56,7 @@ use datafusion_functions_aggregate::{
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr,
     expressions::{DynamicFilterPhysicalExpr, col},
+    scalar_subquery::ScalarSubqueryExpr,
     utils::conjunction,
 };
 use datafusion_physical_expr::{
@@ -61,6 +66,7 @@ use datafusion_physical_expr::{
 use datafusion_physical_optimizer::{
     PhysicalOptimizerRule, filter_pushdown::FilterPushdown,
 };
+use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion_physical_plan::{
     ExecutionPlan,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
@@ -72,6 +78,8 @@ use datafusion_physical_plan::{
     repartition::RepartitionExec,
     sorts::sort::SortExec,
 };
+use object_store::{ObjectStoreExt, path::Path};
+use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
 use super::pushdown_utils::{
     OptimizationTest, TestNode, TestScanBuilder, TestSource, format_plan_for_test,
@@ -3062,6 +3070,174 @@ fn test_hashjoin_dynamic_filter_pushdown_is_used() {
             "probe consumer should be {expected_consumer} when pushdown support is {probe_supports_pushdown}"
         );
     }
+}
+
+/// A completed scalar-subquery filter is retained for Parquet statistics pruning even
+/// when Parquet row-filter pushdown is disabled.
+#[tokio::test]
+async fn scalar_subquery_dynamic_filter_parquet_pruning_with_pushdown_disabled() {
+    let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, None);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        timestamp.clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampNanosecondArray::from([0, 2_000_000_000]))],
+    )
+    .unwrap();
+
+    let mut parquet_bytes = Vec::new();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(&mut parquet_bytes, Arc::clone(&schema), Some(properties))
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let object_store = Arc::new(InMemory::new());
+    let path = Path::from("scalar-subquery.parquet");
+    let file_size = parquet_bytes.len() as u64;
+    object_store
+        .put(&path, Bytes::from(parquet_bytes).into())
+        .await
+        .unwrap();
+    let scan = DataSourceExec::from_data_source(
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test://").unwrap(),
+            Arc::new(ParquetSource::new(Arc::clone(&schema))),
+        )
+        .with_file(PartitionedFile::new("scalar-subquery.parquet", file_size))
+        .build(),
+    ) as Arc<dyn ExecutionPlan>;
+
+    let results = ScalarSubqueryResults::new(1);
+    let producer_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampNanosecondArray::from([1_500_000_000]))],
+    )
+    .unwrap();
+    let producer = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![producer_batch]],
+        Arc::clone(&schema),
+        None,
+    )
+    .unwrap();
+    let scalar = Arc::new(ScalarSubqueryExpr::new(
+        timestamp,
+        false,
+        SubqueryIndex::new(0),
+        results.clone(),
+    ));
+    let predicate = Arc::new(BinaryExpr::new(
+        col("ts", &schema).unwrap(),
+        Operator::GtEq,
+        Arc::new(BinaryExpr::new(
+            scalar,
+            Operator::Minus,
+            Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
+                IntervalMonthDayNano {
+                    months: 0,
+                    days: 0,
+                    nanoseconds: 500_000_000,
+                },
+            )))),
+        )),
+    )) as Arc<dyn PhysicalExpr>;
+    let plan = Arc::new(ScalarSubqueryExec::new(
+        Arc::new(FilterExec::try_new(predicate, scan).unwrap()),
+        vec![ScalarSubqueryLink {
+            plan: producer,
+            index: SubqueryIndex::new(0),
+        }],
+        results,
+    )) as Arc<dyn ExecutionPlan>;
+
+    let mut config = ConfigOptions::default();
+    config.execution.parquet.pushdown_filters = false;
+    config.execution.parquet.pruning = true;
+    config.optimizer.enable_dynamic_filter_pushdown = true;
+    let optimized = FilterPushdown::new_post_optimization()
+        .optimize(plan, &config)
+        .unwrap();
+    let scalar_exec = optimized
+        .downcast_ref::<ScalarSubqueryExec>()
+        .expect("optimized root should retain ScalarSubqueryExec");
+    assert_eq!(scalar_exec.subqueries().len(), 1);
+    let expression_id = scalar_exec
+        .dynamic_expressions_produced()
+        .first()
+        .expect("scalar subquery producer should retain its dynamic filter")
+        .expression_id()
+        .expect("dynamic filter should have an expression ID");
+    assert!(scalar_exec.input().downcast_ref::<FilterExec>().is_some());
+
+    let mut scan_consumer = None;
+    scalar_exec
+        .input()
+        .apply(|node| {
+            if let Some(scan) = node.downcast_ref::<DataSourceExec>()
+                && let Some((_, parquet)) =
+                    scan.downcast_to_file_source::<ParquetSource>()
+                && let Some(predicate) = parquet.filter()
+            {
+                predicate.apply(|expr| {
+                    if expr.expression_id() == Some(expression_id) {
+                        scan_consumer = Some(Arc::clone(expr));
+                        Ok(TreeNodeRecursion::Stop)
+                    } else {
+                        Ok(TreeNodeRecursion::Continue)
+                    }
+                })?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+    let scan_consumer =
+        scan_consumer.expect("Parquet predicate should retain the dynamic filter ID");
+
+    let context = SessionContext::new_with_config(SessionConfig::from(config));
+    context.register_object_store(
+        ObjectStoreUrl::parse("test://").unwrap().as_ref(),
+        object_store,
+    );
+    let batches = collect(optimized.clone(), context.task_ctx())
+        .await
+        .unwrap();
+    assert_batches_eq!(
+        &[
+            "+---------------------+",
+            "| ts                  |",
+            "+---------------------+",
+            "| 1970-01-01T00:00:02 |",
+            "+---------------------+",
+        ],
+        &batches
+    );
+
+    let consumer = scan_consumer
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("scan consumer should be a dynamic filter");
+    assert_ne!(consumer.current().unwrap().to_string(), "true");
+    consumer.wait_complete().await;
+
+    let metrics =
+        datafusion::test_util::parquet::TestParquetFile::parquet_metrics(&optimized)
+            .expect("Parquet scan should have metrics");
+    let pruned = match metrics.sum_by_name("row_groups_pruned_statistics").unwrap() {
+        datafusion::physical_plan::metrics::MetricValue::PruningMetrics {
+            pruning_metrics,
+            ..
+        } => pruning_metrics.pruned(),
+        metric => panic!("unexpected statistics pruning metric: {metric:?}"),
+    };
+    assert!(
+        pruned >= 1,
+        "expected statistics pruning, observed {pruned}"
+    );
 }
 
 /// Regression test for https://github.com/apache/datafusion/issues/20109.

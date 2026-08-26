@@ -24231,6 +24231,119 @@ impl<'de> serde::Deserialize<'de> for RollupNode {
         deserializer.deserialize_struct("datafusion.RollupNode", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for ScalarSubqueryDynamicFilterBindingNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.predicate.is_some() {
+            len += 1;
+        }
+        if self.dynamic_filter_id.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.ScalarSubqueryDynamicFilterBindingNode", len)?;
+        if let Some(v) = self.predicate.as_ref() {
+            struct_ser.serialize_field("predicate", v)?;
+        }
+        if let Some(v) = self.dynamic_filter_id.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("dynamicFilterId", ToString::to_string(&v).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ScalarSubqueryDynamicFilterBindingNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "predicate",
+            "dynamic_filter_id",
+            "dynamicFilterId",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Predicate,
+            DynamicFilterId,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "predicate" => Ok(GeneratedField::Predicate),
+                            "dynamicFilterId" | "dynamic_filter_id" => Ok(GeneratedField::DynamicFilterId),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ScalarSubqueryDynamicFilterBindingNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.ScalarSubqueryDynamicFilterBindingNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ScalarSubqueryDynamicFilterBindingNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut predicate__ = None;
+                let mut dynamic_filter_id__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Predicate => {
+                            if predicate__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("predicate"));
+                            }
+                            predicate__ = map_.next_value()?;
+                        }
+                        GeneratedField::DynamicFilterId => {
+                            if dynamic_filter_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilterId"));
+                            }
+                            dynamic_filter_id__ =
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(ScalarSubqueryDynamicFilterBindingNode {
+                    predicate: predicate__,
+                    dynamic_filter_id: dynamic_filter_id__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.ScalarSubqueryDynamicFilterBindingNode", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for ScalarSubqueryExecNode {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -24245,12 +24358,18 @@ impl serde::Serialize for ScalarSubqueryExecNode {
         if !self.subqueries.is_empty() {
             len += 1;
         }
+        if !self.dynamic_filter_bindings.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.ScalarSubqueryExecNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
         }
         if !self.subqueries.is_empty() {
             struct_ser.serialize_field("subqueries", &self.subqueries)?;
+        }
+        if !self.dynamic_filter_bindings.is_empty() {
+            struct_ser.serialize_field("dynamicFilterBindings", &self.dynamic_filter_bindings)?;
         }
         struct_ser.end()
     }
@@ -24264,12 +24383,15 @@ impl<'de> serde::Deserialize<'de> for ScalarSubqueryExecNode {
         const FIELDS: &[&str] = &[
             "input",
             "subqueries",
+            "dynamic_filter_bindings",
+            "dynamicFilterBindings",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Input,
             Subqueries,
+            DynamicFilterBindings,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -24293,6 +24415,7 @@ impl<'de> serde::Deserialize<'de> for ScalarSubqueryExecNode {
                         match value {
                             "input" => Ok(GeneratedField::Input),
                             "subqueries" => Ok(GeneratedField::Subqueries),
+                            "dynamicFilterBindings" | "dynamic_filter_bindings" => Ok(GeneratedField::DynamicFilterBindings),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -24314,6 +24437,7 @@ impl<'de> serde::Deserialize<'de> for ScalarSubqueryExecNode {
             {
                 let mut input__ = None;
                 let mut subqueries__ = None;
+                let mut dynamic_filter_bindings__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -24328,11 +24452,18 @@ impl<'de> serde::Deserialize<'de> for ScalarSubqueryExecNode {
                             }
                             subqueries__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::DynamicFilterBindings => {
+                            if dynamic_filter_bindings__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilterBindings"));
+                            }
+                            dynamic_filter_bindings__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ScalarSubqueryExecNode {
                     input: input__,
                     subqueries: subqueries__.unwrap_or_default(),
+                    dynamic_filter_bindings: dynamic_filter_bindings__.unwrap_or_default(),
                 })
             }
         }

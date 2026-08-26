@@ -135,6 +135,15 @@ pub trait ExecutionPlanDecode {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>>;
 
+    /// Deserialize a physical expression with `results` active for scalar
+    /// subquery expressions in that expression's subtree.
+    fn decode_expr_with_scalar_subquery_results(
+        &self,
+        node: &PhysicalExprNode,
+        input_schema: &Schema,
+        results: ScalarSubqueryResults,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+
     /// The session task context, used by plans that need the function registry
     /// or session configuration. Never exposes the proto extension codec.
     fn task_ctx(&self) -> &TaskContext;
@@ -292,6 +301,18 @@ impl<'a> ExecutionPlanDecodeCtx<'a> {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.decoder.decode_expr(node, input_schema)
+    }
+
+    /// Deserialize a physical expression with scalar subquery results scoped
+    /// to this ScalarSubqueryExec.
+    pub fn decode_expr_with_scalar_subquery_results(
+        &self,
+        node: &PhysicalExprNode,
+        input_schema: &Schema,
+        results: ScalarSubqueryResults,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.decoder
+            .decode_expr_with_scalar_subquery_results(node, input_schema, results)
     }
 
     /// Deserialize a required physical expression against `input_schema`.

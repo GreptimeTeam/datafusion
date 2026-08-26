@@ -183,6 +183,16 @@ impl Display for DynamicFilterPhysicalExpr {
 }
 
 impl DynamicFilterPhysicalExpr {
+    /// Returns `true` if `other` shares this filter's runtime state.
+    ///
+    /// Derived filters can have distinct outer objects while sharing the same
+    /// state. Conversely, filters reconstructed independently (for example by
+    /// decoding) do not share state even when their expression IDs match.
+    #[doc(hidden)]
+    pub fn shares_runtime_state(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Create a new [`DynamicFilterPhysicalExpr`]
     /// from an initial expression and a list of children.
     /// The list of children is provided separately because
@@ -314,15 +324,7 @@ impl DynamicFilterPhysicalExpr {
     /// - When we've computed the probe side's hash table in a HashJoinExec
     /// - After every batch is processed if we update the TopK heap in a SortExec using a TopK approach.
     pub fn update(&self, new_expr: Arc<dyn PhysicalExpr>) -> Result<()> {
-        // Remap the children of the new expression to match the original children
-        // We still do this again in `current()` but doing it preventively here
-        // reduces the work needed in some cases if `current()` is called multiple times
-        // and the same externally facing `PhysicalExpr` is used for both `with_new_children` and `update()`.`
-        let new_expr = Self::remap_children(
-            &self.children,
-            self.remapped_children.as_ref(),
-            new_expr,
-        )?;
+        // Store the canonical expression; `current()` remaps it for each derived consumer.
 
         // Load the current inner, increment generation, and store the new one
         let mut current = self.inner.write();

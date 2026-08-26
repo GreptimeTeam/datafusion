@@ -1689,9 +1689,15 @@ message BufferExecNode {
   uint64 capacity = 2;
 }
 
+message ScalarSubqueryDynamicFilterBindingNode {
+  PhysicalExprNode predicate = 1;
+  optional uint64 dynamic_filter_id = 2;
+}
+
 message ScalarSubqueryExecNode {
   PhysicalPlanNode input = 1;
   repeated PhysicalPlanNode subqueries = 2;
+  repeated ScalarSubqueryDynamicFilterBindingNode dynamic_filter_bindings = 3;
 }
 
 message PhysicalScalarSubqueryExprNode {

@@ -29,6 +29,8 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
+use crate::expressions::Literal;
+
 /// A physical expression whose value is provided by a scalar subquery.
 ///
 /// Subquery execution is handled by `ScalarSubqueryExec`, which stores the
@@ -131,6 +133,15 @@ impl PhysicalExpr for ScalarSubqueryExpr {
             )
         })?;
         Ok(ColumnarValue::Scalar(value))
+    }
+
+    fn snapshot(&self) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let value = self.results.get(self.index).ok_or_else(|| {
+            internal_datafusion_err!(
+                "ScalarSubqueryExpr snapshotted before the subquery was executed"
+            )
+        })?;
+        Ok(Some(Arc::new(Literal::new(value))))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
@@ -272,6 +283,56 @@ mod tests {
 
         let result = expr.evaluate(&batch);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_snapshot_pending_and_populated_values() -> Result<()> {
+        let pending_results = ScalarSubqueryResults::new(1);
+        let pending = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            true,
+            SubqueryIndex::new(0),
+            pending_results,
+        );
+        assert!(pending.snapshot().is_err());
+
+        let results = ScalarSubqueryResults::new(2);
+        let non_null = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            results.clone(),
+        );
+        let null = ScalarSubqueryExpr::new(
+            DataType::Utf8,
+            true,
+            SubqueryIndex::new(1),
+            results.clone(),
+        );
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(42)))?;
+        results.set(SubqueryIndex::new(1), ScalarValue::Utf8(None))?;
+
+        let non_null_snapshot = non_null
+            .snapshot()?
+            .expect("populated scalar subquery should snapshot");
+        assert_eq!(
+            non_null_snapshot
+                .downcast_ref::<Literal>()
+                .expect("snapshot should be a literal")
+                .value(),
+            &ScalarValue::Int32(Some(42))
+        );
+        let null_snapshot = null
+            .snapshot()?
+            .expect("populated scalar subquery should snapshot");
+        assert_eq!(
+            null_snapshot
+                .downcast_ref::<Literal>()
+                .expect("snapshot should be a literal")
+                .value(),
+            &ScalarValue::Utf8(None)
+        );
+        Ok(())
     }
 
     #[test]
