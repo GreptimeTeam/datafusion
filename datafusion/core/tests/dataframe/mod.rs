@@ -5250,6 +5250,30 @@ async fn consecutive_projection_same_schema() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn nested_projection_subqueries_preserve_all_expressions() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.register_batch(
+        "nested_projection_regression",
+        RecordBatch::try_from_iter(vec![(
+            "i",
+            Arc::new(Int32Array::from(vec![3, 4, 5])) as _,
+        )])?,
+    )?;
+
+    let batches = ctx
+        .sql("SELECT i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM (SELECT i + 1 AS i FROM nested_projection_regression)))")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(
+        batches_to_sort_string(&batches),
+        "+---+\n| i |\n+---+\n| 6 |\n| 7 |\n| 8 |\n+---+"
+    );
+    Ok(())
+}
+
 async fn create_test_table(name: &str) -> Result<DataFrame> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Utf8, false),
