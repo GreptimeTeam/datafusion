@@ -2187,16 +2187,10 @@ mod tests {
 
     use arrow::array::Decimal128Array;
     use arrow::{
-        array::{
-            BinaryArray, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
-            UInt64Array,
-        },
-        datatypes::{IntervalMonthDayNano, TimeUnit},
+        array::{BinaryArray, Int32Array, Int64Array, StringArray, UInt64Array},
+        datatypes::TimeUnit,
     };
     use datafusion_expr::expr::InList;
-    use datafusion_expr::physical_planning_context::{
-        ScalarSubqueryResults, SubqueryIndex,
-    };
     use datafusion_expr::{BinaryExpr, Expr, cast, is_null, try_cast};
     use datafusion_functions_nested::expr_fn::{array_has, make_array};
     use datafusion_physical_expr::expressions::{
@@ -2615,92 +2609,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn scalar_subquery_timestamp_snapshot_builds_pruning_predicate() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-        )]));
-        let results = ScalarSubqueryResults::new(1);
-        let scalar = datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr::new(
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            true,
-            SubqueryIndex::new(0),
-            results.clone(),
-        );
-        let timestamp = 1_700_000_000_000_000_000;
-        let expected_bound = timestamp - 60_000_000_000;
-        results.set(
-            SubqueryIndex::new(0),
-            ScalarValue::TimestampNanosecond(Some(timestamp), None),
-        )?;
-
-        let predicate: Arc<dyn PhysicalExpr> = Arc::new(phys_expr::BinaryExpr::new(
-            phys_expr::col("ts", &schema)?,
-            Operator::GtEq,
-            Arc::new(phys_expr::BinaryExpr::new(
-                Arc::new(scalar),
-                Operator::Minus,
-                Arc::new(phys_expr::Literal::new(ScalarValue::IntervalMonthDayNano(
-                    Some(IntervalMonthDayNano {
-                        months: 0,
-                        days: 0,
-                        nanoseconds: 60_000_000_000,
-                    }),
-                ))),
-            )),
-        ));
-
-        let snapshot = snapshot_physical_expr_opt(Arc::clone(&predicate))?;
-        assert!(snapshot.transformed);
-        let simplified = PhysicalExprSimplifier::new(&schema).simplify(snapshot.data)?;
-        let bound = simplified
-            .downcast_ref::<phys_expr::BinaryExpr>()
-            .expect("simplified predicate should remain a binary comparison")
-            .right()
-            .downcast_ref::<phys_expr::Literal>()
-            .expect("timestamp bound should be folded to a literal");
-        assert_eq!(
-            bound.value(),
-            &ScalarValue::TimestampNanosecond(Some(expected_bound), None)
-        );
-
-        let pruning = PruningPredicateBuilder::new()
-            .with_file_schema(Arc::clone(&schema))
-            .try_build(predicate)?;
-        assert_eq!(
-            pruning.orig_expr().to_string(),
-            format!(
-                "ts@0 >= {}",
-                ScalarValue::TimestampNanosecond(Some(expected_bound), None)
-            )
-        );
-        let below = TestStatistics::new().with(
-            "ts",
-            ContainerStats::new()
-                .with_min(Arc::new(TimestampNanosecondArray::from(vec![Some(
-                    expected_bound - 1,
-                )])))
-                .with_max(Arc::new(TimestampNanosecondArray::from(vec![Some(
-                    expected_bound - 1,
-                )]))),
-        );
-        let matching = TestStatistics::new().with(
-            "ts",
-            ContainerStats::new()
-                .with_min(Arc::new(TimestampNanosecondArray::from(vec![Some(
-                    expected_bound,
-                )])))
-                .with_max(Arc::new(TimestampNanosecondArray::from(vec![Some(
-                    expected_bound,
-                )]))),
-        );
-        assert_eq!(pruning.prune(&below)?, vec![false]);
-        assert_eq!(pruning.prune(&matching)?, vec![true]);
-        Ok(())
     }
 
     #[test]

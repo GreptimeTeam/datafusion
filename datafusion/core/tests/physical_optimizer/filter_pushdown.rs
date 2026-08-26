@@ -43,8 +43,7 @@ use datafusion_common::{
     tree_node::{TreeNode, TreeNodeRecursion},
 };
 use datafusion_datasource::{
-    PartitionedFile, file::FileSource, file_groups::FileGroup,
-    file_scan_config::FileScanConfigBuilder,
+    PartitionedFile, file_groups::FileGroup, file_scan_config::FileScanConfigBuilder,
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::ScalarUDF;
@@ -3073,25 +3072,19 @@ fn test_hashjoin_dynamic_filter_pushdown_is_used() {
     }
 }
 
-/// Regression test for a scalar-subquery dynamic filter on a real Parquet source.
-///
-/// With Parquet row-filter pushdown disabled, the source still retains the
-/// predicate for statistics pruning and reports it as `PushedDown::No`. The
-/// scalar-subquery producer must therefore retain its binding until execution
-/// updates and completes the dynamic filter.
+/// A completed scalar-subquery filter is retained for Parquet statistics pruning even
+/// when Parquet row-filter pushdown is disabled.
 #[tokio::test]
 async fn scalar_subquery_dynamic_filter_parquet_pruning_with_pushdown_disabled() {
+    let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let schema = Arc::new(Schema::new(vec![Field::new(
         "ts",
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        timestamp.clone(),
         false,
     )]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
-        vec![Arc::new(TimestampNanosecondArray::from(vec![
-            0,
-            2_000_000_000,
-        ]))],
+        vec![Arc::new(TimestampNanosecondArray::from([0, 2_000_000_000]))],
     )
     .unwrap();
 
@@ -3123,53 +3116,39 @@ async fn scalar_subquery_dynamic_filter_parquet_pruning_with_pushdown_disabled()
 
     let results = ScalarSubqueryResults::new(1);
     let producer_batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        )])),
-        vec![Arc::new(TimestampNanosecondArray::from(vec![
-            1_500_000_000,
-        ]))],
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampNanosecondArray::from([1_500_000_000]))],
     )
     .unwrap();
     let producer = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
         &[vec![producer_batch]],
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        )])),
+        Arc::clone(&schema),
         None,
     )
     .unwrap();
-
     let scalar = Arc::new(ScalarSubqueryExpr::new(
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        timestamp,
         false,
         SubqueryIndex::new(0),
         results.clone(),
     ));
-    let scalar_minus_interval = Arc::new(BinaryExpr::new(
-        scalar,
-        Operator::Minus,
-        Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
-            IntervalMonthDayNano {
-                months: 0,
-                days: 0,
-                nanoseconds: 500_000_000,
-            },
-        )))),
-    ));
     let predicate = Arc::new(BinaryExpr::new(
         col("ts", &schema).unwrap(),
         Operator::GtEq,
-        scalar_minus_interval,
+        Arc::new(BinaryExpr::new(
+            scalar,
+            Operator::Minus,
+            Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
+                IntervalMonthDayNano {
+                    months: 0,
+                    days: 0,
+                    nanoseconds: 500_000_000,
+                },
+            )))),
+        )),
     )) as Arc<dyn PhysicalExpr>;
-    let main =
-        Arc::new(FilterExec::try_new(predicate, scan).unwrap()) as Arc<dyn ExecutionPlan>;
     let plan = Arc::new(ScalarSubqueryExec::new(
-        main,
+        Arc::new(FilterExec::try_new(predicate, scan).unwrap()),
         vec![ScalarSubqueryLink {
             plan: producer,
             index: SubqueryIndex::new(0),
@@ -3184,57 +3163,50 @@ async fn scalar_subquery_dynamic_filter_parquet_pruning_with_pushdown_disabled()
     let optimized = FilterPushdown::new_post_optimization()
         .optimize(plan, &config)
         .unwrap();
-
     let scalar_exec = optimized
         .downcast_ref::<ScalarSubqueryExec>()
         .expect("optimized root should retain ScalarSubqueryExec");
     assert_eq!(scalar_exec.subqueries().len(), 1);
-    let (binding_predicate, consumer) = scalar_exec
-        .dynamic_filter_bindings()
-        .into_iter()
-        .next()
-        .expect("scalar subquery producer should retain its dynamic filter binding");
-    let expression_id = consumer
+    let expression_id = scalar_exec
+        .dynamic_expressions_produced()
+        .first()
+        .expect("scalar subquery producer should retain its dynamic filter")
         .expression_id()
         .expect("dynamic filter should have an expression ID");
+    assert!(scalar_exec.input().downcast_ref::<FilterExec>().is_some());
 
-    let mut scan_predicate = None;
-    optimized
+    let mut scan_consumer = None;
+    scalar_exec
+        .input()
         .apply(|node| {
             if let Some(scan) = node.downcast_ref::<DataSourceExec>()
                 && let Some((_, parquet)) =
                     scan.downcast_to_file_source::<ParquetSource>()
+                && let Some(predicate) = parquet.filter()
             {
-                scan_predicate = parquet.filter();
+                predicate.apply(|expr| {
+                    if expr.expression_id() == Some(expression_id) {
+                        scan_consumer = Some(Arc::clone(expr));
+                        Ok(TreeNodeRecursion::Stop)
+                    } else {
+                        Ok(TreeNodeRecursion::Continue)
+                    }
+                })?;
             }
             Ok(TreeNodeRecursion::Continue)
         })
         .unwrap();
-    let scan_predicate =
-        scan_predicate.expect("Parquet scan should retain pruning predicate");
-    let mut found_consumer = false;
-    scan_predicate
-        .apply(|expr| {
-            if expr.expression_id() == Some(expression_id) {
-                found_consumer = true;
-                Ok(TreeNodeRecursion::Stop)
-            } else {
-                Ok(TreeNodeRecursion::Continue)
-            }
-        })
-        .unwrap();
-    assert!(
-        found_consumer,
-        "scan predicate should retain the dynamic filter ID"
-    );
-    assert!(format_plan_for_test(&optimized).contains("dynamic_rg_pruning=eligible"));
+    let scan_consumer =
+        scan_consumer.expect("Parquet predicate should retain the dynamic filter ID");
 
     let context = SessionContext::new_with_config(SessionConfig::from(config));
     context.register_object_store(
         ObjectStoreUrl::parse("test://").unwrap().as_ref(),
         object_store,
     );
-    let batches = collect(optimized, context.task_ctx()).await.unwrap();
+    let batches = collect(optimized.clone(), context.task_ctx())
+        .await
+        .unwrap();
     assert_batches_eq!(
         &[
             "+---------------------+",
@@ -3246,21 +3218,25 @@ async fn scalar_subquery_dynamic_filter_parquet_pruning_with_pushdown_disabled()
         &batches
     );
 
-    let current = consumer
+    let consumer = scan_consumer
         .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .expect("binding consumer should be a dynamic filter")
-        .current()
-        .unwrap();
-    assert_ne!(current.to_string(), "true");
-    consumer
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .unwrap()
-        .wait_complete()
-        .await;
+        .expect("scan consumer should be a dynamic filter");
+    assert_ne!(consumer.current().unwrap().to_string(), "true");
+    consumer.wait_complete().await;
+
+    let metrics =
+        datafusion::test_util::parquet::TestParquetFile::parquet_metrics(&optimized)
+            .expect("Parquet scan should have metrics");
+    let pruned = match metrics.sum_by_name("row_groups_pruned_statistics").unwrap() {
+        datafusion::physical_plan::metrics::MetricValue::PruningMetrics {
+            pruning_metrics,
+            ..
+        } => pruning_metrics.pruned(),
+        metric => panic!("unexpected statistics pruning metric: {metric:?}"),
+    };
     assert!(
-        binding_predicate
-            .to_string()
-            .contains("scalar_subquery(1500000000)")
+        pruned >= 1,
+        "expected statistics pruning, observed {pruned}"
     );
 }
 

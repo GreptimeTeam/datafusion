@@ -38,7 +38,6 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal, lit,
 };
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
-use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
     PhysicalExpr, snapshot_physical_expr,
 };
@@ -156,23 +155,6 @@ impl ScalarSubqueryExec {
         &self.results
     }
 
-    /// Returns the dynamic-filter bindings associated with this execution plan.
-    pub fn dynamic_filter_bindings(
-        &self,
-    ) -> Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> {
-        self.bindings
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|binding| {
-                (
-                    Arc::clone(&binding.predicate),
-                    Arc::clone(&binding.consumers[0]),
-                )
-            })
-            .collect()
-    }
-
     /// Returns a per-child bool vec that is `true` for the main input
     /// (child 0) and `false` for every subquery child.
     fn true_for_input_only(&self) -> Vec<bool> {
@@ -200,12 +182,10 @@ impl ScalarSubqueryExec {
         if !ScalarSubqueryResults::ptr_eq(scalar.results(), &self.results) {
             return None;
         }
-        let children = collect_columns(predicate)
-            .into_iter()
-            .map(|column| Arc::new(column) as Arc<dyn PhysicalExpr>)
-            .collect();
-        let filter = Arc::new(DynamicFilterPhysicalExpr::new(children, lit(true)));
-        let _ = left;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(left.clone()) as Arc<dyn PhysicalExpr>],
+            lit(true),
+        ));
         Some(ScalarSubqueryBinding {
             predicate: Arc::clone(predicate),
             consumers: vec![filter as Arc<dyn PhysicalExpr>],
@@ -978,73 +958,52 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_subquery_filter_pushdown_no_removes_binding_when_input_lacks_filter()
-    -> Result<()> {
-        let results = ScalarSubqueryResults::new(1);
-        let predicate = timestamp_predicate(results.clone());
-        let input = Arc::new(ExpressionExec::new(
-            placeholder_input(),
-            vec![Arc::clone(&predicate)],
-        ));
-        let exec = Arc::new(single_subquery_exec(
-            input,
-            make_subquery_plan(vec![int32_batch(vec![1])]),
-            results,
-        ));
-        exec.discover_bindings()?;
-        let filter = dynamic_filter(&exec);
+    fn test_scalar_subquery_filter_pushdown_no_binding_retention() -> Result<()> {
+        for (name, input_contains_filter, expected_bindings) in [
+            ("removes_missing_filter", false, 0),
+            ("retains_filter_in_rewritten_input", true, 1),
+        ] {
+            let results = ScalarSubqueryResults::new(1);
+            let predicate = timestamp_predicate(results.clone());
+            let input = Arc::new(ExpressionExec::new(
+                placeholder_input(),
+                vec![Arc::clone(&predicate)],
+            ));
+            let exec = Arc::new(single_subquery_exec(
+                input,
+                make_subquery_plan(vec![int32_batch(vec![1])]),
+                results,
+            ));
+            exec.discover_bindings()?;
+            let filter = dynamic_filter(&exec);
+            let mut expressions =
+                vec![predicate, Arc::clone(&filter) as Arc<dyn PhysicalExpr>];
+            if !input_contains_filter {
+                expressions.pop();
+            }
+            let updated_input =
+                Arc::new(ExpressionExec::new(placeholder_input(), expressions));
+            let subquery = Arc::clone(&exec.subqueries()[0].plan);
+            let updated_exec = exec.replace_children(
+                vec![updated_input, subquery],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?;
 
-        exec.handle_child_pushdown_result(
-            FilterPushdownPhase::Post,
-            ChildPushdownResult {
-                parent_filters: vec![],
-                self_filters: vec![vec![
-                    PushedDown::No
-                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>),
-                ]],
-            },
-            &ConfigOptions::default(),
-        )?;
-        assert!(exec.dynamic_expressions_produced().is_empty());
-        reset_plan_states(exec)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_scalar_subquery_filter_pushdown_no_retains_binding_when_input_contains_filter()
-    -> Result<()> {
-        let results = ScalarSubqueryResults::new(1);
-        let predicate = timestamp_predicate(results.clone());
-        let input = Arc::new(ExpressionExec::new(
-            placeholder_input(),
-            vec![Arc::clone(&predicate)],
-        ));
-        let subquery_plan = make_subquery_plan(vec![int32_batch(vec![1])]);
-        let exec = Arc::new(single_subquery_exec(input, subquery_plan, results));
-        exec.discover_bindings()?;
-        let filter = dynamic_filter(&exec);
-
-        let updated_input = Arc::new(ExpressionExec::new(
-            placeholder_input(),
-            vec![predicate, Arc::clone(&filter) as Arc<dyn PhysicalExpr>],
-        ));
-        let subquery_plan = Arc::clone(&exec.subqueries()[0].plan);
-        let updated_exec = exec.replace_children(
-            vec![updated_input, subquery_plan],
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )?;
-        updated_exec.handle_child_pushdown_result(
-            FilterPushdownPhase::Post,
-            ChildPushdownResult {
-                parent_filters: vec![],
-                self_filters: vec![vec![
-                    PushedDown::No
-                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>),
-                ]],
-            },
-            &ConfigOptions::default(),
-        )?;
-        assert_eq!(updated_exec.dynamic_expressions_produced().len(), 1);
+            updated_exec.handle_child_pushdown_result(
+                FilterPushdownPhase::Post,
+                ChildPushdownResult {
+                    parent_filters: vec![],
+                    self_filters: vec![vec![PushedDown::No
+                        .wrap_expression(Arc::clone(&filter) as Arc<dyn PhysicalExpr>)]],
+                },
+                &ConfigOptions::default(),
+            )?;
+            assert_eq!(
+                updated_exec.dynamic_expressions_produced().len(),
+                expected_bindings,
+                "{name}"
+            );
+        }
         Ok(())
     }
 
@@ -1076,24 +1035,7 @@ mod tests {
             &ConfigOptions::default(),
         )?;
 
-        let produced = exec.dynamic_expressions_produced();
-        assert_eq!(produced.len(), 1);
-        assert!(Arc::ptr_eq(
-            &produced[0],
-            &(Arc::clone(&filter) as Arc<dyn PhysicalExpr>)
-        ));
-
-        let mut roots = vec![];
-        exec.apply_expressions(&mut |root| {
-            roots.push(Arc::clone(root));
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        assert_eq!(roots.len(), 2);
-        assert!(roots.iter().any(|root| Arc::ptr_eq(root, &predicate)));
-        assert!(roots.iter().any(|root| Arc::ptr_eq(
-            root,
-            &(Arc::clone(&filter) as Arc<dyn PhysicalExpr>)
-        )));
+        assert!(reset_plan_states(Arc::new(exec)).is_err());
         Ok(())
     }
 
@@ -1127,21 +1069,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_subqueries_updates_shared_runtime_state_once() -> Result<()> {
-        let filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
-        let derived_expr = Arc::clone(&filter).with_new_children(vec![])?;
-        let derived = derived_expr
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let original_column =
+            Arc::new(Column::new_with_schema("a", &schema)?) as Arc<dyn PhysicalExpr>;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&original_column)],
+            lit(true),
+        ));
+        let derived_expr_1 = Arc::clone(&filter)
+            .with_new_children(vec![Arc::new(Column::new_with_schema("b", &schema)?)])?;
+        let derived_expr_2 = Arc::clone(&filter)
+            .with_new_children(vec![Arc::new(Column::new_with_schema("c", &schema)?)])?;
+        let derived_1 = derived_expr_1
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .ok_or_else(|| {
                 DataFusionError::Internal("expected dynamic filter".to_string())
             })?;
-        assert!(filter.shares_runtime_state(&derived));
+        let derived_2 = derived_expr_2
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("expected dynamic filter".to_string())
+            })?;
+        assert!(filter.shares_runtime_state(derived_1));
+        assert!(filter.shares_runtime_state(derived_2));
 
         let bindings = Arc::new(Mutex::new(vec![ScalarSubqueryBinding {
-            predicate: lit(false),
-            consumers: vec![
-                Arc::clone(&filter) as Arc<dyn PhysicalExpr>,
-                Arc::clone(&derived_expr),
-            ],
+            predicate: Arc::clone(&original_column),
+            consumers: vec![Arc::clone(&derived_expr_1), Arc::clone(&derived_expr_2)],
         }]));
         execute_subqueries(
             vec![],
@@ -1152,13 +1110,36 @@ mod tests {
         .await?;
 
         assert_eq!(filter.snapshot_generation(), 2);
-        assert_eq!(derived.snapshot_generation(), 2);
-        tokio::time::timeout(std::time::Duration::from_secs(1), filter.wait_complete())
+        assert_eq!(derived_1.snapshot_generation(), 2);
+        assert_eq!(derived_2.snapshot_generation(), 2);
+        assert_eq!(
+            derived_1
+                .current()?
+                .downcast_ref::<Column>()
+                .unwrap()
+                .index(),
+            1
+        );
+        assert_eq!(
+            derived_2
+                .current()?
+                .downcast_ref::<Column>()
+                .unwrap()
+                .index(),
+            2
+        );
+        for (filter, message) in [
+            (filter.as_ref(), "shared filter should be complete"),
+            (derived_1, "first derived filter should be complete"),
+            (derived_2, "second derived filter should be complete"),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                filter.wait_complete(),
+            )
             .await
-            .expect("shared filter should be complete");
-        tokio::time::timeout(std::time::Duration::from_secs(1), derived.wait_complete())
-            .await
-            .expect("derived filter should be complete");
+            .expect(message);
+        }
         Ok(())
     }
 

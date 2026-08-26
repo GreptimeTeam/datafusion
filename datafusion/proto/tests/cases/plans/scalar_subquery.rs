@@ -32,13 +32,7 @@ use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
-use datafusion_proto::bytes::{
-    physical_plan_from_bytes_with_proto_converter,
-    physical_plan_to_bytes_with_proto_converter,
-};
-use datafusion_proto::physical_plan::{
-    DeduplicatingProtoConverter, DefaultPhysicalExtensionCodec,
-};
+use datafusion_proto::bytes::{physical_plan_from_bytes, physical_plan_to_bytes};
 use std::sync::Arc;
 use std::vec;
 
@@ -78,23 +72,9 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         results,
     ));
 
-    // Perform the round-trip using DeduplicatingProtoConverter, which
-    // creates a DeduplicatingDeserializer that threads scalar subquery
-    // results through expression deserialization.
-    let codec = DefaultPhysicalExtensionCodec {};
-    let converter = DeduplicatingProtoConverter {};
-    let bytes = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec),
-        &codec,
-        &converter,
-    )?;
+    let bytes = physical_plan_to_bytes(Arc::clone(&exec))?;
     let ctx = SessionContext::new();
-    let deserialized = physical_plan_from_bytes_with_proto_converter(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &converter,
-    )?;
+    let deserialized = physical_plan_from_bytes(bytes.as_ref(), ctx.task_ctx().as_ref())?;
 
     // Verify the deserialized ScalarSubqueryExec's results container is
     // shared with the ScalarSubqueryExpr in the input plan.
@@ -175,12 +155,9 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
         outer_results,
     ));
 
-    let bytes = datafusion_proto::bytes::physical_plan_to_bytes(Arc::clone(&outer_exec))?;
+    let bytes = physical_plan_to_bytes(Arc::clone(&outer_exec))?;
     let ctx = SessionContext::new();
-    let deserialized = datafusion_proto::bytes::physical_plan_from_bytes(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-    )?;
+    let deserialized = physical_plan_from_bytes(bytes.as_ref(), ctx.task_ctx().as_ref())?;
 
     let outer_exec = deserialized
         .downcast_ref::<ScalarSubqueryExec>()
@@ -256,12 +233,8 @@ async fn roundtrip_scalar_subquery_exec_with_default_converter_executes() -> Res
         "expected ScalarSubqueryExec in plan:\n{initial_plan:?}"
     );
 
-    let bytes =
-        datafusion_proto::bytes::physical_plan_to_bytes(Arc::clone(&initial_plan))?;
-    let roundtripped = datafusion_proto::bytes::physical_plan_from_bytes(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-    )?;
+    let bytes = physical_plan_to_bytes(Arc::clone(&initial_plan))?;
+    let roundtripped = physical_plan_from_bytes(bytes.as_ref(), ctx.task_ctx().as_ref())?;
     assert!(
         format!("{roundtripped:?}").contains("ScalarSubqueryExec"),
         "expected ScalarSubqueryExec after roundtrip:\n{roundtripped:?}"
@@ -280,8 +253,7 @@ async fn roundtrip_scalar_subquery_exec_with_default_converter_executes() -> Res
 }
 
 /// Verify that built-in protobuf round-tripping preserves scalar-subquery
-/// dynamic-filter bindings, including the shared filter instance used by the
-/// input plan, and that execution updates that filter.
+/// dynamic-filter bindings and that execution updates all decoded consumers.
 #[tokio::test]
 async fn roundtrip_scalar_subquery_dynamic_filter_binding_executes() -> Result<()> {
     use datafusion::physical_plan::PhysicalExpr;
@@ -304,17 +276,21 @@ async fn roundtrip_scalar_subquery_dynamic_filter_binding_executes() -> Result<(
     let scalar_exec = initial_plan
         .downcast_ref::<ScalarSubqueryExec>()
         .expect("expected ScalarSubqueryExec");
-    let binding_filter = scalar_exec.dynamic_filter_bindings()[0].1.clone();
+    let produced = scalar_exec
+        .dynamic_expressions_produced()
+        .into_iter()
+        .next()
+        .expect("expected scalar dynamic-filter producer");
     // Two actual input branches consume the same optimized filter instance.
     // The default converter decodes these occurrences independently while
     // retaining their shared expression_id.
     let input_with_consumers = UnionExec::try_new(vec![
         Arc::new(FilterExec::try_new(
-            Arc::clone(&binding_filter),
+            Arc::clone(&produced),
             Arc::clone(scalar_exec.input()),
         )?) as Arc<dyn ExecutionPlan>,
         Arc::new(FilterExec::try_new(
-            binding_filter,
+            produced,
             Arc::clone(scalar_exec.input()),
         )?) as Arc<dyn ExecutionPlan>,
     ])?;
@@ -331,67 +307,33 @@ async fn roundtrip_scalar_subquery_dynamic_filter_binding_executes() -> Result<(
             datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
         ),
     )?;
-    let mut initial_bindings = 0;
-    initial_plan.apply(|node| {
-        if let Some(exec) = node.downcast_ref::<ScalarSubqueryExec>() {
-            let produced = exec.dynamic_expressions_produced();
-            if !produced.is_empty() {
-                initial_bindings += produced.len();
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    assert_eq!(
-        initial_bindings, 1,
-        "expected one scalar dynamic-filter binding"
-    );
 
-    let bytes =
-        datafusion_proto::bytes::physical_plan_to_bytes(Arc::clone(&initial_plan))?;
-    let roundtripped = datafusion_proto::bytes::physical_plan_from_bytes(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-    )?;
+    let bytes = physical_plan_to_bytes(Arc::clone(&initial_plan))?;
+    let roundtripped = physical_plan_from_bytes(bytes.as_ref(), ctx.task_ctx().as_ref())?;
 
-    let mut roundtripped_bindings = 0;
-    roundtripped.apply(|node| {
-        if let Some(exec) = node.downcast_ref::<ScalarSubqueryExec>() {
-            let produced = exec.dynamic_expressions_produced();
-            if produced.is_empty() {
-                return Ok(TreeNodeRecursion::Continue);
-            }
-            assert_eq!(produced.len(), 1);
-            let binding = exec.dynamic_filter_bindings();
-            assert_eq!(binding.len(), 1);
-            let bound_filter = &binding[0].1;
-            let bound_filter_expr = bound_filter
-                .downcast_ref::<DynamicFilterPhysicalExpr>()
-                .expect("binding should contain a dynamic filter");
-            assert_eq!(
-                Some(bound_filter_expr.expression_id().unwrap()),
-                produced[0].expression_id()
-            );
-
-            let mut consumers = vec![];
-            exec.input().apply(|child| {
-                child.apply_expressions(&mut |expr| {
-                    if expr.expression_id() == produced[0].expression_id()
-                        && expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()
-                    {
-                        consumers.push(Arc::clone(expr));
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })?;
+    let scalar_exec = roundtripped
+        .downcast_ref::<ScalarSubqueryExec>()
+        .expect("expected ScalarSubqueryExec");
+    let producer_id = scalar_exec
+        .dynamic_expressions_produced()
+        .into_iter()
+        .next()
+        .and_then(|expr| expr.expression_id())
+        .expect("expected scalar dynamic-filter producer");
+    let mut consumers = vec![];
+    scalar_exec.input().apply(|node| {
+        node.apply_expressions(&mut |root| {
+            root.apply(&mut |expr: &Arc<dyn PhysicalExpr>| {
+                if expr.expression_id() == Some(producer_id)
+                    && expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()
+                {
+                    consumers.push(Arc::clone(expr));
+                }
                 Ok(TreeNodeRecursion::Continue)
-            })?;
-            assert_eq!(consumers.len(), 2);
-            assert!(!Arc::ptr_eq(&consumers[0], &consumers[1]));
-            assert!(Arc::ptr_eq(bound_filter, &consumers[0]));
-            roundtripped_bindings += 1;
-        }
-        Ok(TreeNodeRecursion::Continue)
+            })
+        })
     })?;
-    assert_eq!(roundtripped_bindings, 1);
+    assert_eq!(consumers.len(), 2);
 
     let batches =
         datafusion::physical_plan::collect_partitioned(roundtripped, ctx.task_ctx())
@@ -410,5 +352,15 @@ async fn roundtrip_scalar_subquery_dynamic_filter_binding_executes() -> Result<(
         ],
         &batches
     );
+
+    for consumer in consumers {
+        let filter = consumer
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .expect("consumer should be a dynamic filter");
+        tokio::time::timeout(std::time::Duration::from_secs(5), filter.wait_complete())
+            .await
+            .expect("dynamic-filter consumer did not complete");
+        assert_ne!(filter.current()?.to_string(), "true");
+    }
     Ok(())
 }

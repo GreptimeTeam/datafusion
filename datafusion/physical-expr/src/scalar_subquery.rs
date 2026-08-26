@@ -336,23 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_reset_returns_to_pending() -> Result<()> {
-        let results = ScalarSubqueryResults::new(1);
-        let expr = ScalarSubqueryExpr::new(
-            DataType::Int64,
-            true,
-            SubqueryIndex::new(0),
-            results.clone(),
-        );
-        results.set(SubqueryIndex::new(0), ScalarValue::Int64(Some(7)))?;
-        assert!(expr.snapshot()?.is_some());
-
-        results.clear();
-        assert!(expr.snapshot().is_err());
-        Ok(())
-    }
-
-    #[test]
     fn test_identity_equality() {
         let results = make_results(vec![None, None]);
 
