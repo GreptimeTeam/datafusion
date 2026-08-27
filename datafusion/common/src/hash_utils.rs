@@ -191,8 +191,13 @@ where
 /// Creates hashes for the given arrays using a thread-local buffer and a custom
 /// hash builder, then calls the provided callback with the computed hashes.
 ///
-/// Hash compatibility with [`with_hashes`] follows the rules documented on
-/// [`create_hashes_with_hasher`].
+/// Hashing is representation-sensitive for floating-point signed zeros: `+0.0`
+/// and `-0.0` produce different hashes, including when the values are nested in
+/// arrays such as lists, structs, or dictionaries. This differs from
+/// [`with_hashes`], whose optimized [`create_hashes`] implementation
+/// canonicalizes signed zeros so values equal under floating-point equality
+/// produce equal hashes. Hash compatibility otherwise follows the rules
+/// documented on [`create_hashes_with_hasher`].
 pub fn with_hashes_with_hasher<I, T, F, R, S>(
     arrays: I,
     hash_builder: &S,
@@ -1264,8 +1269,13 @@ where
 /// [`create_hashes`], even when `hash_builder` also implements [`HashState`].
 /// The optimized [`HashState`] path seeds the hasher from the previous hash
 /// when rehashing some primitive and byte-view values, whereas this function
-/// combines independently computed hashes. Use one API consistently if hashes
-/// are persisted or exchanged.
+/// combines independently computed hashes. In addition, this function is
+/// representation-sensitive for floating-point signed zeros: `+0.0` and
+/// `-0.0` produce different hashes, including when the values are nested in
+/// arrays such as lists, structs, or dictionaries. The optimized
+/// [`create_hashes`] path canonicalizes signed zeros: `+0.0` and `-0.0`
+/// compare equal and therefore produce equal hashes. Use one API consistently if
+/// hashes are persisted or exchanged.
 pub fn create_hashes_with_hasher<'a, I, T, S>(
     arrays: I,
     hash_builder: &S,
@@ -1562,16 +1572,82 @@ mod tests {
         assert_ne!(custom_hashes, default_hashes);
     }
 
-    #[test]
     #[cfg(not(feature = "force_hash_collisions"))]
-    fn test_create_hashes_with_custom_hasher_normalizes_negative_zero() {
-        let array: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0]));
+    fn assert_custom_hasher_distinguishes_signed_zero(array: ArrayRef) {
         let hash_builder = BuildHasherDefault::<TestHasher>::default();
         let mut hashes = vec![0; array.len()];
 
         create_hashes_with_hasher([&array], &hash_builder, &mut hashes).unwrap();
 
-        assert_eq!(hashes[0], hashes[1]);
+        let random_state = RandomState::with_seed(0);
+        let mut optimized_hashes = vec![0; array.len()];
+        create_hashes([&array], &random_state, &mut optimized_hashes).unwrap();
+
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!(optimized_hashes[0], optimized_hashes[1]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_float16_signed_zero() {
+        let array: ArrayRef = Arc::new(Float16Array::from(vec![
+            half::f16::from_bits(0),
+            half::f16::from_bits(1 << 15),
+        ]));
+        assert_custom_hasher_distinguishes_signed_zero(array);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_float32_signed_zero() {
+        let array: ArrayRef = Arc::new(Float32Array::from(vec![
+            f32::from_bits(0),
+            f32::from_bits(1 << 31),
+        ]));
+        assert_custom_hasher_distinguishes_signed_zero(array);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_float64_signed_zero() {
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            f64::from_bits(0),
+            f64::from_bits(1 << 63),
+        ]));
+        assert_custom_hasher_distinguishes_signed_zero(array);
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_list_float64_signed_zero() {
+        let array = ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(f64::from_bits(0))]),
+            Some(vec![Some(f64::from_bits(1 << 63))]),
+        ]);
+        assert_custom_hasher_distinguishes_signed_zero(Arc::new(array));
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_struct_float64_signed_zero() {
+        let array = StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Float64, false)),
+            Arc::new(Float64Array::from(vec![
+                f64::from_bits(0),
+                f64::from_bits(1 << 63),
+            ])) as ArrayRef,
+        )]);
+        assert_custom_hasher_distinguishes_signed_zero(Arc::new(array));
+    }
+
+    #[test]
+    #[cfg(not(feature = "force_hash_collisions"))]
+    fn test_create_hashes_with_custom_hasher_dictionary_float64_signed_zero() {
+        let mut builder = PrimitiveDictionaryBuilder::<Int8Type, Float64Type>::new();
+        builder.append(0.0).unwrap();
+        builder.append(-0.0).unwrap();
+        let array = builder.finish();
+        assert_custom_hasher_distinguishes_signed_zero(Arc::new(array));
     }
 
     #[test]
@@ -1688,7 +1764,6 @@ mod tests {
     fn test_single_column_leaf_hashes_match_with_same_hasher() {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from(vec![Some(1), None, Some(-1)])),
-            Arc::new(Float64Array::from(vec![Some(0.0), Some(-0.0), None])),
             Arc::new(StringArray::from(vec![Some("foo"), None, Some("bar")])),
             Arc::new(BinaryArray::from(vec![
                 Some(&b"short"[..]),
