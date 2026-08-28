@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::physical_optimizer::test_utils::{
     check_integrity, coalesce_partitions_exec, parquet_exec_with_sort,
     parquet_exec_with_stats, repartition_exec, schema, sort_exec,
-    sort_exec_with_preserve_partitioning, sort_merge_join_exec,
+    sort_exec_with_preserve_partitioning, sort_expr, sort_merge_join_exec,
     sort_preserving_merge_exec, union_exec,
 };
 
@@ -3626,6 +3626,43 @@ fn get_schema() -> SchemaRef {
         Field::new("bank_account", DataType::UInt64, true),
     ]))
 }
+#[test]
+fn keep_fetch_carrying_dist_changing_operators() -> Result<()> {
+    let config = ConfigOptions::new();
+
+    // A CoalescePartitionsExec carrying a fetch is not a pure
+    // distribution-changing operator: it also provides the global limit, so
+    // EnforceDistribution must not strip it. This can be hit when the
+    // physical optimizer pipeline runs on an already-optimized plan.
+    let coalesce =
+        Arc::new(CoalescePartitionsExec::new(parquet_exec()).with_fetch(Some(1)))
+            as Arc<dyn ExecutionPlan>;
+    let optimized = EnforceDistribution::new().optimize(coalesce, &config)?;
+    let coalesce = optimized
+        .as_any()
+        .downcast_ref::<CoalescePartitionsExec>()
+        .expect("fetch-carrying CoalescePartitionsExec should be preserved");
+    assert_eq!(coalesce.fetch(), Some(1));
+
+    // Same for SortPreservingMergeExec with a fetch.
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema())]).unwrap();
+    let spm = Arc::new(
+        SortPreservingMergeExec::new(
+            ordering.clone(),
+            parquet_exec_with_sort(schema(), vec![ordering]),
+        )
+        .with_fetch(Some(1)),
+    ) as Arc<dyn ExecutionPlan>;
+    let optimized = EnforceDistribution::new().optimize(spm, &config)?;
+    let spm = optimized
+        .as_any()
+        .downcast_ref::<SortPreservingMergeExec>()
+        .expect("fetch-carrying SortPreservingMergeExec should be preserved");
+    assert_eq!(spm.fetch(), Some(1));
+
+    Ok(())
+}
+
 #[test]
 fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
     // Create a base plan

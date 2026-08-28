@@ -25,18 +25,23 @@ use crate::physical_optimizer::test_utils::{
     schema,
 };
 
+use arrow::array::{BooleanArray, Int32Array, Int64Array};
 use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use arrow::{compute::SortOptions, util::pretty::pretty_format_batches};
+use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
+use datafusion_common::config::ConfigOptions;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{self, cast, col};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::{
     ExecutionPlan,
     aggregates::{AggregateExec, AggregateMode},
-    collect,
+    collect, displayable,
     limit::{GlobalLimitExec, LocalLimitExec},
 };
 
@@ -251,6 +256,54 @@ async fn test_distinct_cols_different_than_group_by_cols() -> Result<()> {
     +---+
     "
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_global_limit_survives_second_optimizer_pass() -> Result<()> {
+    // Regression: EnforceDistribution::remove_dist_changing_operators must not
+    // strip a fetch-carrying CoalescePartitionsExec when the physical
+    // optimizer pipeline runs on an already-optimized plan (e.g. a nested
+    // subplan that was planned and optimized separately).
+    let cfg = SessionConfig::new().with_target_partitions(4);
+    let ctx = SessionContext::new_with_config(cfg);
+    let schema = schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![4, 5, 6])),
+            Arc::new(Int64Array::from(vec![7, 8, 9])),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(BooleanArray::from(vec![true, false, true])),
+        ],
+    )?;
+    let table = MemTable::try_new(schema, vec![vec![batch]])?;
+    ctx.register_table("t", Arc::new(table))?;
+
+    let plan = ctx
+        .sql("SELECT DISTINCT a FROM t LIMIT 1")
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    // Run the physical optimizer pipeline a second time over the
+    // already-optimized plan.
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 4;
+    let optimizer = PhysicalOptimizer::new();
+    let mut optimized: Arc<dyn ExecutionPlan> = plan;
+    for rule in &optimizer.rules {
+        optimized = rule.optimize(optimized, &config)?;
+    }
+
+    let display = displayable(optimized.as_ref()).indent(true).to_string();
+    assert!(
+        display.contains("CoalescePartitionsExec: fetch=1")
+            || display.contains("GlobalLimitExec: skip=0, fetch=1"),
+        "global limit must survive a second optimizer pass:\n{display}"
+    );
+
     Ok(())
 }
 
