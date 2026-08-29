@@ -32,12 +32,10 @@ use arrow::{compute::SortOptions, util::pretty::pretty_format_batches};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
-use datafusion_common::config::ConfigOptions;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{self, cast, col};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
-use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::{
     ExecutionPlan,
     aggregates::{AggregateExec, AggregateMode},
@@ -288,13 +286,11 @@ async fn test_global_limit_survives_second_optimizer_pass() -> Result<()> {
         .await?;
 
     // Run the physical optimizer pipeline a second time over the
-    // already-optimized plan.
-    let mut config = ConfigOptions::new();
-    config.execution.target_partitions = 4;
-    let optimizer = PhysicalOptimizer::new();
+    // already-optimized plan, using the session's own rules and config.
+    let state = ctx.state();
     let mut optimized: Arc<dyn ExecutionPlan> = plan;
-    for rule in &optimizer.rules {
-        optimized = rule.optimize(optimized, &config)?;
+    for rule in state.physical_optimizers() {
+        optimized = rule.optimize(optimized, state.config_options())?;
     }
 
     let display = displayable(optimized.as_ref()).indent(true).to_string();
