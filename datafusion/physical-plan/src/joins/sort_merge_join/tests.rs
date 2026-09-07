@@ -48,7 +48,7 @@ use datafusion_common::{
     test_util::{batches_to_sort_string, batches_to_string},
 };
 use datafusion_common::{
-    JoinType, NullEquality, Result, assert_batches_eq, assert_contains,
+    JoinType, NullEquality, Result, ScalarValue, assert_batches_eq, assert_contains,
 };
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::config::SessionConfig;
@@ -56,7 +56,7 @@ use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::BinaryExpr;
+use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
 use futures::StreamExt;
 use insta::{allow_duplicates, assert_snapshot};
 use itertools::Itertools;
@@ -2036,6 +2036,86 @@ async fn join_full_multiple_batches() -> Result<()> {
     | 5  | 7  | 9  |    |    |    |
     | 6  | 9  | 9  |    |    |    |
     +----+----+----+----+----+----+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_full_null_filter_result() -> Result<()> {
+    let left = build_table_two_cols(
+        ("a1", &vec![1, 1, 2, 2, 3, 3]),
+        ("b1", &vec![1, 2, 1, 2, 1, 2]),
+    );
+    let right = build_table_from_batches(vec![RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("a2", DataType::Int32, false),
+            Field::new("b2", DataType::Int32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![None, Some(2)])),
+        ],
+    )?]);
+    let on = vec![(
+        Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+        Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+    )];
+    let filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("b1", 0)),
+                Operator::Lt,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b2", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                )),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("b1", 0)),
+                Operator::Lt,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a2", 2)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                )),
+            )),
+        )),
+        vec![
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+        ],
+        Arc::new(Schema::new(vec![
+            Field::new("b1", DataType::Int32, true),
+            Field::new("b2", DataType::Int32, true),
+            Field::new("a2", DataType::Int32, true),
+        ])),
+    );
+
+    let (_, batches) = join_collect_with_filter(left, right, on, filter, Full).await?;
+    assert_snapshot!(batches_to_sort_string(&batches), @r"
+    +----+----+----+----+
+    | a1 | b1 | a2 | b2 |
+    +----+----+----+----+
+    |    |    | 1  |    |
+    | 1  | 1  |    |    |
+    | 1  | 2  |    |    |
+    | 2  | 1  | 2  | 2  |
+    | 2  | 2  | 2  | 2  |
+    | 3  | 1  |    |    |
+    | 3  | 2  |    |    |
+    +----+----+----+----+
     ");
     Ok(())
 }
