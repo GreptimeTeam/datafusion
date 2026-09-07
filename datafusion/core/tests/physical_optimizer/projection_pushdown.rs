@@ -15,18 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, fs, sync::Arc};
 
+use arrow::array::Float64Array;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::CsvSource;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::physical_plan::collect;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::test::object_store::local_unpartitioned_file;
 use datafusion_common::config::{ConfigOptions, CsvOptions};
 use datafusion_common::{JoinSide, JoinType, NullEquality, Result, ScalarValue};
 use datafusion_datasource::TableSchema;
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -34,9 +38,11 @@ use datafusion_expr::{
     Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion_expr_common::columnar_value::ColumnarValue;
+use datafusion_functions::math::random::RandomFunc;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, Literal, NegativeExpr, binary, cast, col,
 };
+use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{Distribution, Partitioning, ScalarFunctionExpr};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{
@@ -63,6 +69,7 @@ use datafusion_physical_plan::{ExecutionPlan, displayable};
 
 use insta::assert_snapshot;
 use itertools::Itertools;
+use tempfile::NamedTempFile;
 
 /// Mocked UDF
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -443,6 +450,63 @@ fn create_projecting_memory_exec() -> Arc<dyn ExecutionPlan> {
     ]));
 
     MemorySourceConfig::try_new_exec(&[], schema, Some(vec![2, 0, 3, 4])).unwrap()
+}
+
+#[tokio::test]
+async fn test_volatile_projection_pushdown_does_not_duplicate_evaluation() -> Result<()> {
+    let file = NamedTempFile::new()?;
+    fs::write(file.path(), "1\n2\n3\n")?;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let random = Arc::new(ScalarFunctionExpr::try_new(
+        Arc::new(ScalarUDF::from(RandomFunc::new())),
+        vec![],
+        schema.as_ref(),
+        Arc::new(ConfigOptions::default()),
+    )?);
+    let projection = ProjectionExprs::new(vec![ProjectionExpr::new(random, "r")]);
+    let source: Arc<dyn FileSource> =
+        Arc::new(CsvSource::new(schema).with_csv_options(CsvOptions {
+            has_header: Some(false),
+            ..Default::default()
+        }));
+    let source = source.try_pushdown_projection(&projection)?.unwrap();
+    let source = DataSourceExec::from_data_source(
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file(local_unpartitioned_file(file.path()).into())
+            .build(),
+    );
+
+    let outer: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        vec![
+            ProjectionExpr::new(Arc::new(Column::new("r", 0)), "left"),
+            ProjectionExpr::new(Arc::new(Column::new("r", 0)), "right"),
+        ],
+        source,
+    )?);
+
+    let mut options = ConfigOptions::new();
+    options.execution.target_partitions = 1;
+    let optimized = ProjectionPushdown::new().optimize(outer, &options)?;
+    let context =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let batches = collect(optimized, context.task_ctx()).await?;
+
+    for batch in batches {
+        let left = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let right = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(left, right);
+    }
+
+    Ok(())
 }
 
 #[test]
