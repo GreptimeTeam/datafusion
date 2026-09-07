@@ -16,6 +16,7 @@
 // under the License.
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use datafusion::common::test_util::batches_to_string;
 use std::sync::Arc;
 
@@ -26,9 +27,11 @@ use datafusion::logical_expr::Operator;
 use datafusion::prelude::*;
 use datafusion::sql::sqlparser::ast::BinaryOperator;
 use datafusion_common::ScalarValue;
-use datafusion_expr::BinaryExpr;
 use datafusion_expr::expr::Alias;
-use datafusion_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
+use datafusion_expr::planner::{
+    ExprPlanner, PlannerResult, RawBinaryExpr, RawScalarExpr,
+};
+use datafusion_expr::{BinaryExpr, ColumnarValue, Volatility};
 
 #[derive(Debug)]
 struct MyCustomPlanner;
@@ -66,12 +69,48 @@ impl ExprPlanner for MyCustomPlanner {
     }
 }
 
+#[derive(Debug)]
+struct ScalarUdfArgPlanner;
+
+impl ExprPlanner for ScalarUdfArgPlanner {
+    fn plan_scalar(
+        &self,
+        mut expr: RawScalarExpr,
+    ) -> Result<PlannerResult<RawScalarExpr>> {
+        expr.args = vec![lit(2_i64)];
+        Ok(PlannerResult::Original(expr))
+    }
+}
+
 async fn plan_and_collect(sql: &str) -> Result<Vec<RecordBatch>> {
     let config =
         SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres");
     let mut ctx = SessionContext::new_with_config(config);
     ctx.register_expr_planner(Arc::new(MyCustomPlanner))?;
     ctx.sql(sql).await?.collect().await
+}
+
+#[tokio::test]
+async fn test_scalar_udf_args_are_planned() -> Result<()> {
+    let mut ctx = SessionContext::new();
+    ctx.register_udf(create_udf(
+        "replace_scalar_arg",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    ));
+
+    ctx.register_expr_planner(Arc::new(ScalarUdfArgPlanner))?;
+
+    let dataframe = ctx.sql("SELECT replace_scalar_arg(1)").await?;
+
+    assert_eq!(
+        format!("{}", dataframe.logical_plan()),
+        "Projection: replace_scalar_arg(Int64(2))\n  EmptyRelation: rows=1"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
