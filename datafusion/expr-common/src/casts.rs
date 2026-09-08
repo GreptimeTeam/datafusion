@@ -428,8 +428,8 @@ fn timestamp_widening_ordered_preimage(
         return None;
     }
 
-    let source_scale = i128::from(timestamp_unit_scale(source_unit));
-    let target_scale = i128::from(timestamp_unit_scale(target_unit));
+    let source_scale = timestamp_unit_scale(source_unit);
+    let target_scale = timestamp_unit_scale(target_unit);
     if target_scale <= source_scale {
         return None;
     }
@@ -2406,8 +2406,8 @@ mod tests {
     ) {
         let source_type = DataType::Timestamp(source_unit, timezone.clone());
         let target_type = DataType::Timestamp(target_unit, timezone.clone());
-        let quotient = i128::from(timestamp_unit_scale(&target_unit))
-            / i128::from(timestamp_unit_scale(&source_unit));
+        let quotient =
+            timestamp_unit_scale(&target_unit) / timestamp_unit_scale(&source_unit);
 
         for (target_value, floor, ceil) in [
             (i64::try_from(quotient + 1).unwrap(), 1, 2),
