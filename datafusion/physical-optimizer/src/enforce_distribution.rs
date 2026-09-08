@@ -981,6 +981,10 @@ fn remove_dist_changing_operators(
         || is_coalesce_partitions(&distribution_context.plan)
         || is_sort_preserving_merge(&distribution_context.plan)
     {
+        // A fetch-bearing merge also enforces a global limit, not just distribution.
+        if distribution_context.plan.fetch().is_some() {
+            break;
+        }
         // All of above operators have a single child. First child is only child.
         // Remove any distribution changing operators at the beginning:
         distribution_context = distribution_context.children.swap_remove(0);
@@ -1011,6 +1015,11 @@ fn remove_dist_changing_operators(
 pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
 ) -> Result<DistributionContext> {
+    // Ordering determines which rows survive the fetch, even under an unordered parent.
+    if is_sort_preserving_merge(&context.plan) && context.plan.fetch().is_some() {
+        return Ok(context);
+    }
+
     context.children = context
         .children
         .into_iter()
