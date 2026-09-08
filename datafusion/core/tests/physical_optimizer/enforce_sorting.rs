@@ -2849,3 +2849,80 @@ async fn test_sort_with_streaming_table() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fetched_coalesce_is_not_a_sort_parallelization_bottleneck() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for inner_fetch in [0, 1] {
+        for outer_fetch in [None, Some(2)] {
+            let inner = Arc::new(
+                CoalescePartitionsExec::new(input.clone()).with_fetch(Some(inner_fetch)),
+            );
+            let mut plan =
+                Arc::new(CoalescePartitionsExec::new(inner).with_fetch(outer_fetch))
+                    as Arc<dyn ExecutionPlan>;
+            for pass in 0..=2 {
+                if pass > 0 {
+                    plan = EnforceSorting::new().optimize(plan, &ConfigOptions::new())?;
+                }
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    inner_fetch,
+                    "inner_fetch={inner_fetch}, outer_fetch={outer_fetch:?}, pass={pass}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_is_preserved_in_a_connected_union_branch() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+    use datafusion_physical_plan::union::UnionExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for fetch in [0, 1] {
+        let union = UnionExec::try_new(vec![
+            Arc::new(CoalescePartitionsExec::new(input.clone()).with_fetch(Some(fetch))),
+            Arc::new(CoalescePartitionsExec::new(input.clone())),
+        ])?;
+        let mut plan =
+            Arc::new(CoalescePartitionsExec::new(union)) as Arc<dyn ExecutionPlan>;
+        for pass in 0..=2 {
+            if pass > 0 {
+                plan = EnforceSorting::new().optimize(plan, &ConfigOptions::new())?;
+            }
+            let batches = datafusion_physical_plan::collect(
+                plan.clone(),
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                fetch + 9,
+                "fetch={fetch}, pass={pass}"
+            );
+        }
+    }
+    Ok(())
+}
