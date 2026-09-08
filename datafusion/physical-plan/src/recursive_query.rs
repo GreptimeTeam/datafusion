@@ -521,9 +521,14 @@ fn new_groups_mask(
 mod tests {
     use super::*;
     use crate::empty::EmptyExec;
+    use crate::execution_plan::collect;
     use crate::projection::ProjectionExec;
+    use crate::test::TestMemoryExec;
 
+    use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::assert_batches_eq;
+    use std::collections::HashMap;
 
     fn empty_exec(fields: Vec<Field>) -> Arc<dyn ExecutionPlan> {
         Arc::new(EmptyExec::new(Arc::new(Schema::new(fields))))
@@ -551,6 +556,75 @@ mod tests {
         assert!(Arc::ptr_eq(projection.input(), &recursive_term));
         assert!(!projection.schema().field(0).is_nullable());
         assert_eq!(projection.expr()[0].alias, "value");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recursive_query_exec_reconciles_schema_metadata_through_execution_and_reset()
+    -> Result<()> {
+        let expected_schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("value", DataType::Int32, false)],
+            HashMap::from([("greptime:version".to_string(), "0".to_string())]),
+        ));
+        let static_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let static_term = TestMemoryExec::try_new_exec(
+            &[vec![static_batch]],
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                false,
+            )])),
+            None,
+        )?;
+        let recursive_term: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::new(Schema::new_with_metadata(
+                vec![Field::new("value", DataType::Int32, false)],
+                HashMap::from([("branch".to_string(), "recursive".to_string())]),
+            ))));
+
+        let exec = Arc::new(RecursiveQueryExec::try_new(
+            "numbers".to_string(),
+            Arc::clone(&expected_schema),
+            static_term,
+            recursive_term,
+            false,
+        )?);
+
+        assert_eq!(exec.schema(), expected_schema);
+        assert_eq!(exec.static_term().schema(), expected_schema);
+        assert_eq!(exec.recursive_term().schema(), expected_schema);
+        let batches = collect(
+            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        assert_eq!(batches[0].schema(), expected_schema);
+        assert_batches_eq!(
+            [
+                "+-------+",
+                "| value |",
+                "+-------+",
+                "| 1     |",
+                "+-------+",
+            ],
+            &batches
+        );
+
+        let recursive_reset = reset_plan_states(Arc::clone(exec.recursive_term()))?;
+        assert_eq!(recursive_reset.schema(), expected_schema);
+
+        let reset = reset_plan_states(exec)?;
+        assert_eq!(reset.schema(), expected_schema);
+        for child in reset.children() {
+            assert_eq!(child.schema(), expected_schema);
+        }
         Ok(())
     }
 

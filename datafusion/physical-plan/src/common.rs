@@ -100,8 +100,8 @@ fn build_file_list_recurse(
 ///
 /// [`ProjectionExec`] can rename fields. When the expected field is nullable and the input
 /// field is not, this helper also widens nullability with a same-type [`CastExpr`]. It rejects
-/// differences that projection cannot safely normalize exactly, such as data type, metadata,
-/// schema metadata, and nullability narrowing.
+/// differences that projection cannot safely normalize exactly, such as data type, field
+/// metadata, and nullability narrowing. Schema metadata is reconciled to `expected_schema`.
 pub fn project_plan_to_schema(
     input: Arc<dyn ExecutionPlan>,
     expected_schema: &SchemaRef,
@@ -116,12 +116,6 @@ pub fn project_plan_to_schema(
             "Cannot project plan to expected schema: expected {} column(s), got {}",
             expected_schema.fields().len(),
             input_schema.fields().len()
-        );
-    }
-
-    if input_schema.metadata() != expected_schema.metadata() {
-        return plan_err!(
-            "Cannot project plan to expected schema: schema metadata differ"
         );
     }
 
@@ -175,7 +169,11 @@ pub fn project_plan_to_schema(
         })
         .collect::<Vec<_>>();
 
-    let projection = ProjectionExec::try_new(projection_exprs, input)?;
+    let projection = ProjectionExec::try_new_with_schema_metadata(
+        projection_exprs,
+        input,
+        expected_schema.as_ref(),
+    )?;
     debug_assert_eq!(projection.schema().as_ref(), expected_schema.as_ref());
     Ok(Arc::new(projection))
 }
@@ -462,24 +460,20 @@ mod tests {
     }
 
     #[test]
-    fn project_plan_to_schema_preserves_matching_metadata_while_renaming() -> Result<()> {
-        let field_metadata = HashMap::from([("key".to_string(), "value".to_string())]);
-        let schema_metadata =
-            HashMap::from([("schema-key".to_string(), "schema-value".to_string())]);
-        let input_schema = Arc::new(Schema::new_with_metadata(
-            vec![
+    fn project_plan_to_schema_reconciles_to_nonempty_schema_metadata() -> Result<()> {
+        let field_metadata =
+            HashMap::from([("field-key".to_string(), "field-value".to_string())]);
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
                 Field::new("input", DataType::Int32, false)
                     .with_metadata(field_metadata.clone()),
-            ],
-            schema_metadata.clone(),
-        ));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+            ]))));
         let expected_schema = Arc::new(Schema::new_with_metadata(
             vec![
                 Field::new("expected", DataType::Int32, false)
                     .with_metadata(field_metadata),
             ],
-            schema_metadata,
+            HashMap::from([("schema-key".to_string(), "expected".to_string())]),
         ));
 
         let result = project_plan_to_schema(input, &expected_schema)?;
@@ -555,19 +549,22 @@ mod tests {
     }
 
     #[test]
-    fn project_plan_to_schema_errors_on_schema_metadata_mismatch() {
+    fn project_plan_to_schema_reconciles_to_empty_schema_metadata() -> Result<()> {
         let input_schema = Arc::new(Schema::new_with_metadata(
             vec![Field::new("a", DataType::Int32, false)],
             HashMap::from([("source".to_string(), "input".to_string())]),
         ));
         let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
-        let expected_schema = Arc::new(Schema::new_with_metadata(
-            vec![Field::new("renamed", DataType::Int32, false)],
-            HashMap::from([("source".to_string(), "expected".to_string())]),
-        ));
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
+            "renamed",
+            DataType::Int32,
+            false,
+        )]));
 
-        let err = project_plan_to_schema(input, &expected_schema).unwrap_err();
-        assert!(err.to_string().contains("schema metadata differ"));
+        let result = project_plan_to_schema(input, &expected_schema)?;
+
+        assert_eq!(result.schema(), expected_schema);
+        Ok(())
     }
 
     /// Verifies that `spawn_buffered` holds exactly `buffer` record batches in memory
