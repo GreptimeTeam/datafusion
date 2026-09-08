@@ -216,6 +216,7 @@ fn is_exact_cast_safe(source_type: &DataType, target_type: &DataType) -> bool {
             | (DataType::Int32, DataType::Date32)
             | (DataType::Date64, DataType::Int64)
             | (DataType::Int64, DataType::Date64)
+            | (DataType::Date32, DataType::Date64)
     ) {
         return true;
     }
@@ -1698,6 +1699,45 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_predicate_preimage_date_widening() {
+        const DAY_MS: i64 = 86_400_000;
+        for days in [i32::MIN, -1, 0, 1, i32::MAX] {
+            let literal = ScalarValue::Date64(Some(i64::from(days) * DAY_MS));
+            for op in [Operator::Eq, Operator::Lt, Operator::GtEq] {
+                assert_preimage_exact(
+                    &DataType::Date32,
+                    &DataType::Date64,
+                    op,
+                    &literal,
+                    ScalarValue::Date32(Some(days)),
+                );
+            }
+            assert!(
+                exact_preimage_cast(
+                    &DataType::Date64,
+                    &DataType::Date32,
+                    &ScalarValue::Date32(Some(days))
+                )
+                .is_none()
+            );
+        }
+        for millis in [
+            -1,
+            1,
+            -DAY_MS / 2,
+            (i64::from(i32::MIN) - 1) * DAY_MS,
+            (i64::from(i32::MAX) + 1) * DAY_MS,
+        ] {
+            assert_preimage_none(
+                &DataType::Date32,
+                &DataType::Date64,
+                Operator::Eq,
+                &ScalarValue::Date64(Some(millis)),
+            );
+        }
+    }
+
+    #[test]
     fn test_cast_predicate_preimage_timestamp_narrowing_range() {
         for (literal_ms, lower_ns, upper_ns) in [
             (1000, 1_000_000_000, 1_001_000_000),
@@ -1895,7 +1935,7 @@ mod tests {
             &DataType::Date32,
             &DataType::Date64,
             Operator::Eq,
-            &ScalarValue::Date64(Some(1_641_600_000)),
+            &ScalarValue::Date64(Some(1_641_600_001)),
         );
     }
 
