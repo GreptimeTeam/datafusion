@@ -561,7 +561,7 @@ fn get_valid_types_with_udf<F: UDFCoercionExt>(
 
             // Every signature failed, return the joined error
             if res.is_empty() {
-                return internal_err!(
+                return exec_err!(
                     "Function '{}' failed to match any signature, errors: {}",
                     func.name(),
                     errors.join(",")
@@ -1479,6 +1479,29 @@ mod tests {
         assert_eq!(valid_types[0], args);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_get_valid_types_with_udf_one_of_returns_execution_error() {
+        let udf = MockUdf(Signature::new(
+            TypeSignature::OneOf(vec![
+                TypeSignature::Numeric(1),
+                TypeSignature::Numeric(2),
+            ]),
+            Volatility::Immutable,
+        ));
+
+        let err = get_valid_types_with_udf(
+            &udf.signature().type_signature,
+            &[DataType::Utf8],
+            &udf,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            datafusion_common::DataFusionError::Execution(_)
+        ));
     }
 
     #[test]
