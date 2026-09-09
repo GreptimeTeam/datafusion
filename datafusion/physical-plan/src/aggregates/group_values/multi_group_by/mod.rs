@@ -20,6 +20,7 @@
 mod boolean;
 mod bytes;
 pub mod bytes_view;
+mod dictionary;
 mod fixed_size_binary;
 pub mod primitive;
 pub mod row_backed;
@@ -29,7 +30,7 @@ use std::mem::{self, size_of};
 use crate::aggregates::group_values::GroupValues;
 use crate::aggregates::group_values::multi_group_by::{
     boolean::BooleanGroupValueBuilder, bytes::ByteGroupValueBuilder,
-    bytes_view::ByteViewGroupValueBuilder,
+    bytes_view::ByteViewGroupValueBuilder, dictionary::DictionaryGroupValuesColumn,
     fixed_size_binary::FixedSizeBinaryGroupValueBuilder,
     primitive::PrimitiveGroupValueBuilder, row_backed::RowsGroupColumn,
 };
@@ -939,6 +940,21 @@ fn group_column_supported_type(data_type: &DataType) -> bool {
     if data_type.is_nested() {
         return RowsGroupColumn::supports_type(data_type);
     }
+    if let DataType::Dictionary(key_type, value_type) = data_type {
+        return matches!(
+            key_type.as_ref(),
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        ) && !value_type.is_nested()
+            && !matches!(value_type.as_ref(), DataType::Dictionary(_, _))
+            && group_column_supported_type(value_type);
+    }
     matches!(
         *data_type,
         DataType::Int8
@@ -1123,6 +1139,36 @@ fn make_group_column(field: &Field) -> Result<Box<dyn GroupColumn>> {
         DataType::BinaryView => {
             v.push(Box::new(ByteViewGroupValueBuilder::<BinaryViewType>::new()));
         }
+        DataType::Dictionary(ref key_type, ref value_type)
+            if !value_type.is_nested()
+                && !matches!(value_type.as_ref(), DataType::Dictionary(_, _)) =>
+        {
+            let inner_field = Field::new(field.name(), value_type.as_ref().clone(), true);
+            let inner = make_group_column(&inner_field)?;
+            macro_rules! dictionary {
+                ($t:ty) => {
+                    v.push(Box::new(DictionaryGroupValuesColumn::<$t>::new(
+                        inner,
+                        &inner_field,
+                    )))
+                };
+            }
+            match key_type.as_ref() {
+                DataType::Int8 => dictionary!(Int8Type),
+                DataType::Int16 => dictionary!(Int16Type),
+                DataType::Int32 => dictionary!(Int32Type),
+                DataType::Int64 => dictionary!(Int64Type),
+                DataType::UInt8 => dictionary!(UInt8Type),
+                DataType::UInt16 => dictionary!(UInt16Type),
+                DataType::UInt32 => dictionary!(UInt32Type),
+                DataType::UInt64 => dictionary!(UInt64Type),
+                key => {
+                    return not_impl_err!(
+                        "Dictionary key type {key} not supported in GroupValuesColumn"
+                    );
+                }
+            }
+        }
         DataType::Boolean => {
             if nullable {
                 v.push(Box::new(BooleanGroupValueBuilder::<true>::new()));
@@ -1188,7 +1234,12 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 // a real Result rather than panicking.
                 let fresh = Self::build_group_columns(&self.schema)?;
                 let group_values = mem::replace(&mut self.group_values, fresh);
-
+                self.map.clear();
+                if !STREAMING {
+                    self.group_index_lists.clear();
+                    self.emit_group_index_list_buffer.clear();
+                    self.vectorized_operation_buffers.clear();
+                }
                 group_values
                     .into_iter()
                     .map(|v| v.build())
@@ -1273,12 +1324,14 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             let expected = field.data_type();
             if let DataType::Dictionary(_, v) = expected {
                 let actual = array.data_type();
-                if v.as_ref() != actual {
+                if actual != expected && v.as_ref() != actual {
                     return Err(internal_datafusion_err!(
                         "Converted group rows expected dictionary of {v} got {actual}"
                     ));
                 }
-                *array = cast(array.as_ref(), expected)?;
+                if actual != expected {
+                    *array = cast(array.as_ref(), expected)?;
+                }
             }
         }
 
@@ -1645,6 +1698,7 @@ mod tests {
             DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
             DataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
             DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
         ];
 
         for dt in &supported_cases {
@@ -1902,6 +1956,124 @@ mod tests {
                     "expected NotImpl error from dispatcher, got: {msg}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn new_group_values_uses_dictionary_group_column_for_uint32_keys() {
+        use crate::aggregates::group_values::new_group_values;
+        use crate::aggregates::order::{GroupOrdering, GroupOrderingFull};
+        use arrow::array::{DictionaryArray, Int64Array, StringArray, UInt32Array};
+        use arrow::datatypes::UInt32Type;
+
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![Some(0), Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ));
+        assert!(supported_schema(&Schema::new(vec![Field::new(
+            "tag",
+            dictionary.data_type().clone(),
+            false,
+        )])));
+        for (schema, columns, ordering, expected_groups, expected_values) in [
+            (
+                Arc::new(Schema::new(vec![Field::new(
+                    "tag",
+                    dictionary.data_type().clone(),
+                    false,
+                )])),
+                vec![Arc::clone(&dictionary)],
+                GroupOrdering::None,
+                vec![0, 1, 0],
+                vec!["a", "b"],
+            ),
+            (
+                Arc::new(Schema::new(vec![
+                    Field::new("tag", dictionary.data_type().clone(), false),
+                    Field::new("n", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::clone(&dictionary),
+                    Arc::new(Int64Array::from(vec![1, 1, 2])),
+                ],
+                GroupOrdering::Full(GroupOrderingFull::new()),
+                vec![0, 1, 2],
+                vec!["a", "b", "a"],
+            ),
+        ] {
+            let mut values = new_group_values(schema, &ordering).unwrap();
+            let mut groups = Vec::new();
+            values.intern(&columns, &mut groups).unwrap();
+            assert_eq!(groups, expected_groups);
+            let output = values.emit(EmitTo::All).unwrap();
+            assert_eq!(output[0].data_type(), dictionary.data_type());
+            assert!(output[0].as_any().is::<DictionaryArray<UInt32Type>>());
+            let decoded =
+                arrow::compute::cast(output[0].as_ref(), &DataType::Utf8).unwrap();
+            assert_eq!(
+                decoded.as_any().downcast_ref::<StringArray>().unwrap(),
+                &StringArray::from(expected_values)
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_group_values_are_reusable_after_emit() {
+        use crate::aggregates::group_values::new_group_values;
+        use crate::aggregates::order::{GroupOrdering, GroupOrderingFull};
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::datatypes::UInt32Type;
+
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![Some(0), Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tag",
+            dictionary.data_type().clone(),
+            false,
+        )]));
+
+        for ordering in [
+            GroupOrdering::None,
+            GroupOrdering::Full(GroupOrderingFull::new()),
+        ] {
+            let mut values = new_group_values(Arc::clone(&schema), &ordering).unwrap();
+            let mut groups = Vec::new();
+            values
+                .intern(std::slice::from_ref(&dictionary), &mut groups)
+                .unwrap();
+            assert_eq!(groups, vec![0, 1, 0]);
+            values.emit(EmitTo::All).unwrap();
+
+            groups.clear();
+            values
+                .intern(std::slice::from_ref(&dictionary), &mut groups)
+                .unwrap();
+            assert_eq!(groups, vec![0, 1, 0]);
+            values.emit(EmitTo::First(0)).unwrap();
+            values.emit(EmitTo::First(1)).unwrap();
+
+            groups.clear();
+            values
+                .intern(std::slice::from_ref(&dictionary), &mut groups)
+                .unwrap();
+            assert_eq!(groups, vec![1, 0, 1]);
+            values.emit(EmitTo::First(2)).unwrap();
+
+            groups.clear();
+            values
+                .intern(std::slice::from_ref(&dictionary), &mut groups)
+                .unwrap();
+            assert_eq!(groups, vec![0, 1, 0]);
+            values.emit(EmitTo::All).unwrap();
+            values.clear_shrink(0);
+
+            groups.clear();
+            values
+                .intern(std::slice::from_ref(&dictionary), &mut groups)
+                .unwrap();
+            assert_eq!(groups, vec![0, 1, 0]);
         }
     }
 
