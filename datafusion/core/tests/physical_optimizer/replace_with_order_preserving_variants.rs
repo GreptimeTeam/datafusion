@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
     check_integrity, coalesce_partitions_exec, create_test_schema3,
-    parquet_exec_with_sort, sort_exec, sort_exec_with_preserve_partitioning,
-    sort_preserving_merge_exec, sort_preserving_merge_exec_with_fetch,
-    stream_exec_ordered_with_projection,
+    parquet_exec_with_sort, sort_exec, sort_exec_with_fetch,
+    sort_exec_with_preserve_partitioning, sort_preserving_merge_exec,
+    sort_preserving_merge_exec_with_fetch, stream_exec_ordered_with_projection,
 };
 
 use datafusion::prelude::SessionContext;
@@ -31,7 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use insta::{allow_duplicates, assert_snapshot};
 use datafusion_common::tree_node::{TransformedResult, TreeNode};
-use datafusion_common::{assert_contains, NullEquality, Result};
+use datafusion_common::{NullEquality, Result};
 use datafusion_common::config::ConfigOptions;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::TaskContext;
@@ -41,10 +41,13 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_optimizer::enforce_sorting::replace_with_order_preserving_variants::{
     plan_with_order_breaking_variants, plan_with_order_preserving_variants, replace_with_order_preserving_variants, OrderPreservationContext
 };
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{
     collect, displayable, ExecutionPlan, Partitioning,
 };
@@ -1191,51 +1194,111 @@ fn memory_exec_sorted(
 
 #[test]
 fn test_plan_with_order_preserving_variants_preserves_fetch() -> Result<()> {
-    // Create a schema
-    let schema = create_test_schema3()?;
-    let parquet_sort_exprs = vec![[sort_expr("a", &schema)].into()];
-    let parquet_exec = parquet_exec_with_sort(schema, parquet_sort_exprs);
-    let coalesced = coalesce_partitions_exec(parquet_exec.clone())
-        .with_fetch(Some(10))
-        .unwrap();
+    let schema = create_test_schema()?;
+    let ordering: LexOrdering = [sort_expr("a", &schema)].into();
+    let input = memory_exec_sorted(&schema, ordering);
+    let ordered_repartition = Arc::new(
+        RepartitionExec::try_new(input.clone(), Partitioning::RoundRobinBatch(2))
+            .unwrap()
+            .with_preserve_order(),
+    ) as Arc<dyn ExecutionPlan>;
+    let repartition = Arc::new(
+        RepartitionExec::try_new(
+            ordered_repartition.clone(),
+            Partitioning::RoundRobinBatch(2),
+        )
+        .unwrap(),
+    ) as Arc<dyn ExecutionPlan>;
 
-    // Test sort's fetch is greater than coalesce fetch, return error because it's not reasonable
-    let requirements = OrderPreservationContext::new(
-        coalesced.clone(),
-        false,
-        vec![OrderPreservationContext::new(
-            parquet_exec.clone(),
-            false,
-            vec![],
-        )],
-    );
-    let res = plan_with_order_preserving_variants(requirements, false, true, Some(15));
-    assert_contains!(
-        res.unwrap_err().to_string(),
-        "CoalescePartitionsExec fetch [10] should be greater than or equal to SortExec fetch [15]"
-    );
+    for coalesce_fetch in [0, 10] {
+        for sort_fetch in [None, Some(5), Some(15)] {
+            let coalesced = coalesce_partitions_exec(repartition.clone())
+                .with_fetch(Some(coalesce_fetch))
+                .unwrap();
+            let requirements = OrderPreservationContext::new(
+                coalesced.clone(),
+                false,
+                vec![OrderPreservationContext::new(
+                    repartition.clone(),
+                    true,
+                    vec![OrderPreservationContext::new(
+                        ordered_repartition.clone(),
+                        false,
+                        vec![OrderPreservationContext::new(input.clone(), false, vec![])],
+                    )],
+                )],
+            );
 
-    // Test sort is without fetch, expected to get the fetch value from the coalesced
-    let requirements = OrderPreservationContext::new(
-        coalesced.clone(),
-        false,
-        vec![OrderPreservationContext::new(
-            parquet_exec.clone(),
-            false,
-            vec![],
-        )],
-    );
-    let res = plan_with_order_preserving_variants(requirements, false, true, None)?;
-    assert_eq!(res.plan.fetch(), Some(10),);
+            let res = plan_with_order_preserving_variants(
+                requirements,
+                true,
+                true,
+                sort_fetch,
+            )?;
+            assert!(res.plan.as_any().is::<CoalescePartitionsExec>());
+            assert!(Arc::ptr_eq(&res.plan, &coalesced));
+            assert!(Arc::ptr_eq(&res.children[0].plan, &repartition));
+            assert_eq!(res.plan.fetch(), Some(coalesce_fetch));
+            assert!(!res.data);
+        }
+    }
 
-    // Test sort's fetch is less than coalesces fetch, expected to get the fetch value from the sort
+    let coalesced = coalesce_partitions_exec(input.clone());
     let requirements = OrderPreservationContext::new(
         coalesced,
         false,
-        vec![OrderPreservationContext::new(parquet_exec, false, vec![])],
+        vec![OrderPreservationContext::new(input, false, vec![])],
     );
     let res = plan_with_order_preserving_variants(requirements, false, true, Some(5))?;
-    assert_eq!(res.plan.fetch(), Some(5),);
+    assert!(res.plan.as_any().is::<SortPreservingMergeExec>());
+    assert_eq!(res.plan.fetch(), Some(5));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_replace_with_order_preserving_variants_retains_constant_topk() -> Result<()>
+{
+    let schema = create_test_schema()?;
+    let input_ordering: LexOrdering = [sort_expr("a", &schema)].into();
+    let sort_ordering: LexOrdering = [PhysicalSortExpr {
+        expr: expressions::lit(1i32),
+        options: SortOptions::default(),
+    }]
+    .into();
+    let input = memory_exec_sorted(&schema, input_ordering);
+    let coalesced = coalesce_partitions_exec(input.clone())
+        .with_fetch(Some(2))
+        .unwrap();
+    let sort = sort_exec_with_fetch(sort_ordering, Some(1), coalesced.clone());
+    let initial_batches = collect(sort.clone(), Arc::new(TaskContext::default())).await?;
+    assert_eq!(
+        initial_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    let requirements = OrderPreservationContext::new(
+        sort,
+        false,
+        vec![OrderPreservationContext::new(
+            coalesced,
+            true,
+            vec![OrderPreservationContext::new(input, false, vec![])],
+        )],
+    );
+
+    let res = replace_with_order_preserving_variants(
+        requirements,
+        false,
+        true,
+        &ConfigOptions::new(),
+    )?
+    .data;
+    assert!(res.plan.as_any().is::<SortExec>());
+    assert_eq!(res.plan.fetch(), Some(1));
+    let batches = collect(res.plan, Arc::new(TaskContext::default())).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     Ok(())
 }
 

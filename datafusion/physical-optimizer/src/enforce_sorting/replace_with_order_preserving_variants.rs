@@ -27,7 +27,7 @@ use crate::utils::{
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Result, assert_or_internal_err};
+use datafusion_common::Result;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
@@ -51,6 +51,11 @@ pub fn update_order_preservation_ctx_children_data(opc: &mut OrderPreservationCo
         data,
     } in opc.children.iter_mut()
     {
+        // A fetched coalesce selects rows before the parent sort.
+        if is_coalesce_partitions(plan) && plan.fetch().is_some() {
+            *data = false;
+            continue;
+        }
         let maintains_input_order = plan.maintains_input_order();
         let inspect_child = |idx| {
             maintains_input_order[idx]
@@ -102,6 +107,11 @@ pub fn plan_with_order_preserving_variants(
     is_spm_better: bool,
     fetch: Option<usize>,
 ) -> Result<OrderPreservationContext> {
+    // Preserve the selected rows and the subtree below their fetch.
+    if is_coalesce_partitions(&sort_input.plan) && sort_input.plan.fetch().is_some() {
+        sort_input.data = false;
+        return Ok(sort_input);
+    }
     sort_input.children = sort_input
         .children
         .into_iter()
@@ -137,24 +147,6 @@ pub fn plan_with_order_preserving_variants(
     } else if is_coalesce_partitions(&sort_input.plan) && is_spm_better {
         let child = &sort_input.children[0].plan;
         if let Some(ordering) = child.output_ordering() {
-            let mut fetch = fetch;
-            if let Some(coalesce_fetch) = sort_input.plan.fetch() {
-                fetch = match fetch {
-                    Some(sort_fetch) => {
-                        assert_or_internal_err!(
-                            coalesce_fetch >= sort_fetch,
-                            "CoalescePartitionsExec fetch [{:?}] should be greater than or equal to SortExec fetch [{:?}]",
-                            coalesce_fetch,
-                            sort_fetch
-                        );
-                        Some(sort_fetch)
-                    }
-                    None => {
-                        // If the sort node does not have a fetch, we need to keep the coalesce node's fetch.
-                        Some(coalesce_fetch)
-                    }
-                };
-            };
             // When the input of a `CoalescePartitionsExec` has an ordering,
             // replace it with a `SortPreservingMergeExec` if appropriate:
             let spm = SortPreservingMergeExec::new(ordering.clone(), Arc::clone(child))
