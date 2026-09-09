@@ -24,6 +24,7 @@ use crate::variation_const::{
     VIEW_CONTAINER_TYPE_VARIATION_REF,
 };
 use datafusion::arrow::array::{Array, GenericListArray, OffsetSizeTrait};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::temporal_conversions::NANOSECONDS;
 use datafusion::common::{ScalarValue, exec_err, not_impl_err};
 use substrait::proto::expression::literal::interval_day_to_second::PrecisionMode;
@@ -46,6 +47,24 @@ pub(crate) fn to_substrait_literal_expr(
     producer: &mut impl SubstraitProducer,
     value: &ScalarValue,
 ) -> datafusion::common::Result<Expression> {
+    if let ScalarValue::Dictionary(key_type, inner) = value {
+        let inner_expr = to_substrait_literal_expr(producer, inner)?;
+        let cast_type = to_substrait_type(
+            producer,
+            &DataType::Dictionary(key_type.clone(), Box::new(inner.data_type())),
+            value.is_null(),
+        )?;
+        return Ok(Expression {
+            rex_type: Some(RexType::Cast(Box::new(
+                substrait::proto::expression::Cast {
+                    r#type: Some(cast_type),
+                    input: Some(Box::new(inner_expr)),
+                    failure_behavior: substrait::proto::expression::cast::FailureBehavior::ThrowException
+                        .into(),
+                },
+            ))),
+        });
+    }
     let literal = to_substrait_literal(producer, value)?;
     Ok(Expression {
         rex_type: Some(RexType::Literal(literal)),
@@ -360,6 +379,15 @@ pub(crate) fn to_substrait_literal(
             }),
             DEFAULT_TYPE_VARIATION_REF,
         ),
+        ScalarValue::Dictionary(_, value) => {
+            let literal = to_substrait_literal(producer, value)?;
+            (
+                literal
+                    .literal_type
+                    .expect("to_substrait_literal always sets a literal type"),
+                literal.type_variation_reference,
+            )
+        }
         _ => (
             not_impl_err!("Unsupported literal: {value:?}")?,
             DEFAULT_TYPE_VARIATION_REF,
@@ -407,14 +435,18 @@ fn convert_array_to_literal_list<T: OffsetSizeTrait>(
 mod tests {
     use super::*;
     use crate::logical_plan::consumer::from_substrait_literal_without_names;
+    use crate::logical_plan::consumer::from_substrait_rex;
+    use crate::logical_plan::consumer::from_substrait_type_without_names;
     use crate::logical_plan::consumer::tests::test_consumer;
     use crate::logical_plan::producer::DefaultSubstraitProducer;
     use datafusion::arrow::array::{Int64Builder, MapBuilder, StringBuilder};
     use datafusion::arrow::datatypes::{
         DataType, Field, IntervalDayTime, IntervalMonthDayNano,
     };
+    use datafusion::common::DFSchema;
     use datafusion::common::Result;
     use datafusion::common::scalar::ScalarStructBuilder;
+    use datafusion::logical_expr::Expr;
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
@@ -556,6 +588,69 @@ mod tests {
         let roundtrip_scalar =
             from_substrait_literal_without_names(&test_consumer(), &substrait_literal)?;
         assert_eq!(scalar, roundtrip_scalar);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dictionary_literal_expression_preserves_type() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
+        let dictionary = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(Some("a".to_string()))),
+        );
+
+        let expr = to_substrait_literal_expr(&mut producer, &dictionary)?;
+        let cast = match expr.rex_type.as_ref() {
+            Some(RexType::Cast(cast)) => cast,
+            other => panic!("expected Cast rex type, got {other:?}"),
+        };
+        let cast_type = cast.r#type.as_ref().expect("cast must have an output type");
+        assert_eq!(
+            from_substrait_type_without_names(&test_consumer(), cast_type)?,
+            dictionary_type
+        );
+        match cast.input.as_deref() {
+            Some(Expression {
+                rex_type: Some(RexType::Literal(literal)),
+                ..
+            }) => {
+                assert_eq!(
+                    literal.literal_type,
+                    Some(LiteralType::String("a".to_string()))
+                );
+                assert!(!literal.nullable);
+            }
+            other => panic!("expected inner literal, got {other:?}"),
+        }
+
+        match from_substrait_rex(&test_consumer(), &expr, &DFSchema::empty()).await? {
+            Expr::Cast(cast) => {
+                assert_eq!(cast.field.data_type(), &dictionary_type);
+                assert!(matches!(
+                    cast.expr.as_ref(),
+                    Expr::Literal(ScalarValue::Utf8(Some(value)), _) if value == "a"
+                ));
+            }
+            other => panic!("expected Cast expr, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_null_literal_encodes_as_null() -> Result<()> {
+        let state = SessionContext::default().state();
+        let mut producer = DefaultSubstraitProducer::new(&state);
+        let dictionary = ScalarValue::Dictionary(
+            Box::new(DataType::UInt32),
+            Box::new(ScalarValue::Utf8(None)),
+        );
+
+        let literal = to_substrait_literal(&mut producer, &dictionary)?;
+        assert!(literal.nullable);
+        assert!(matches!(literal.literal_type, Some(LiteralType::Null(_))));
         Ok(())
     }
 }
