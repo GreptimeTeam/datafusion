@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::physical_optimizer::test_utils::{
     TestScan, coalesce_partitions_exec, global_limit_exec, hash_join_exec,
     local_limit_exec, sort_exec, sort_preserving_merge_exec, stream_exec,
+    stream_exec_ordered,
 };
 
 use arrow::compute::SortOptions;
@@ -41,6 +42,7 @@ use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::NestedLoopJoinExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::union::UnionExec;
@@ -842,6 +844,69 @@ fn upgrades_pending_local_limit_before_noop_global_wrapper() -> Result<()> {
           TestScan: fetch=5
           TestScan: fetch=5
       TestScan: fetch=5
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserves_order_for_required_inner_local_limit_under_outer_global_limit() -> Result<()>
+{
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let streaming_table = stream_exec_ordered(&schema, ordering.clone());
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(Arc::clone(&schema), repartition)?;
+    let mut local_limit = LocalLimitExec::new(filter, 5);
+    local_limit.set_required_ordering(Some(ordering));
+    let global_limit = global_limit_exec(Arc::new(local_limit), 0, Some(100));
+
+    let optimized = LimitPushdown::new().optimize(global_limit, &ConfigOptions::new())?;
+    assert!(optimized.is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>());
+
+    insta::assert_snapshot!(
+        format_plan(&optimized),
+        @r"
+    SortPreservingMergeExec: [c1@0 ASC], fetch=100
+      FilterExec: c3@2 > 0, fetch=5
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
+    "
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserves_order_for_carried_limit_across_noop_global_limit() -> Result<()> {
+    let schema = create_schema();
+    let ordering: LexOrdering = [PhysicalSortExpr {
+        expr: col("c1", &schema)?,
+        options: SortOptions::default(),
+    }]
+    .into();
+    let streaming_table = stream_exec_ordered(&schema, ordering.clone());
+    let repartition = repartition_exec(streaming_table)?;
+    let filter = filter_exec(Arc::clone(&schema), repartition)?;
+    let mut noop = GlobalLimitExec::new(filter, 0, None);
+    noop.set_required_ordering(Some(ordering));
+    let outer = global_limit_exec(Arc::new(noop), 0, Some(100));
+
+    let optimized = LimitPushdown::new().optimize(outer, &ConfigOptions::new())?;
+    assert!(optimized.is::<datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec>());
+
+    insta::assert_snapshot!(
+        format_plan(&optimized),
+        @r"
+    SortPreservingMergeExec: [c1@0 ASC], fetch=100
+      FilterExec: c3@2 > 0, fetch=100
+        RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1, maintains_sort_order=true
+          StreamingTableExec: partition_sizes=1, projection=[c1, c2, c3], infinite_source=true, output_ordering=[c1@0 ASC]
     "
     );
 

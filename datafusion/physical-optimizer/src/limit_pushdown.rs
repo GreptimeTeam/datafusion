@@ -165,6 +165,15 @@ pub fn pushdown_limit_helper(
         global_state.pending = Some(LimitScope::Global);
     }
 
+    // Preserve ordering from an encountered limit before an early branch can
+    // remove or materialize that limit.
+    if let Some(global_limit) = pushdown_plan.downcast_ref::<GlobalLimitExec>() {
+        global_state.preserve_order |= global_limit.required_ordering().is_some();
+    }
+    if let Some(local_limit) = pushdown_plan.downcast_ref::<LocalLimitExec>() {
+        global_state.preserve_order |= local_limit.required_ordering().is_some();
+    }
+
     if let Some(global_limit) = pushdown_plan.downcast_ref::<GlobalLimitExec>()
         && global_limit.skip() == 0
         && global_limit.fetch().is_none()
@@ -220,7 +229,6 @@ pub fn pushdown_limit_helper(
 
         (global_state.skip, global_state.fetch) =
             combine_limit(global_state.skip, global_state.fetch, skip, fetch);
-        global_state.preserve_order |= global_limit.required_ordering().is_some();
         global_state.pending = Some(LimitScope::Global);
         if let Some(fetch) = global_state.fetch
             && limit_satisfied_by_input(&input, global_state.skip, fetch)?
@@ -245,7 +253,6 @@ pub fn pushdown_limit_helper(
             0,
             Some(local_limit.fetch()),
         );
-        global_state.preserve_order |= local_limit.required_ordering().is_some();
         global_state.pending = if input.output_partitioning().partition_count() == 1 {
             Some(LimitScope::Global)
         } else {
