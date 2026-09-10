@@ -555,8 +555,8 @@ struct AggrDynFilter {
     ///
     /// Each vector element is for the accumulators that support dynamic filter.
     /// e.g. This `AggregateExec` has accumulator:
-    /// min(a), avg(a), max(b)
-    /// And this field stores [PerAccumulatorDynFilter(min(a)), PerAccumulatorDynFilter(min(b))]
+    /// min(a), max(b)
+    /// And this field stores [PerAccumulatorDynFilter(min(a)), PerAccumulatorDynFilter(max(b))]
     supported_accumulators_info: Vec<PerAccumulatorDynFilter>,
 }
 
