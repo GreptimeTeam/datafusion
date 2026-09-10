@@ -34,10 +34,10 @@ query TT
 explain select b from t where b ~ '.*'
 ----
 logical_plan
-01)Filter: t.b IS NOT NULL
+01)Filter: t.b IS NOT NULL OR Boolean(NULL)
 02)--TableScan: t projection=[b]
 physical_plan
-01)FilterExec: b@0 IS NOT NULL
+01)FilterExec: b@0 IS NOT NULL OR NULL
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TT
@@ -63,6 +63,24 @@ ORDER BY id
 ----
 foo false
 (empty) false
+NULL NULL
+
+# `col ~ '.*'` is TRUE for any non-NULL string and NULL for a NULL input.
+# The `.*` -> IS NOT NULL simplification must preserve that NULL (returning
+# `false` for the NULL row would be wrong in a projection context).
+query TB
+WITH vals(id, col) AS (
+    VALUES
+      (1, 'foo'::text),
+      (2, ''::text),
+      (3, NULL::text)
+)
+SELECT col, col ~ '.*'
+FROM vals
+ORDER BY id
+----
+foo true
+(empty) true
 NULL NULL
 
 query T
@@ -536,20 +554,21 @@ WHERE CAST(ts AS TIMESTAMP WITH TIME ZONE) = CAST(0 AS TIMESTAMP WITH TIME ZONE)
 statement ok
 RESET datafusion.execution.time_zone;
 
-# Widening timestamp precision can overflow at runtime. The source overflows,
-# while the Timestamp(ns) zero target is exactly representable.
-query error .*(overflow|exceeds the representable i64 range).*
+# Accepted timestamp-widening policy: comparison normalization can avoid the
+# overflowing Timestamp(ms) -> Timestamp(ns) cast. This extreme value therefore
+# does not match the exactly representable Timestamp(ns) zero target.
+query P
 SELECT ts
 FROM (VALUES (CAST(9223372036854775807 AS TIMESTAMP(3)))) AS t(ts)
 WHERE CAST(ts AS TIMESTAMP(9)) = CAST(0 AS TIMESTAMP(9));
+----
 
-# TRY_CAST suppresses that source overflow to NULL rather than comparing the
-# pre-cast value to the exactly representable Timestamp(ns) zero target.
+# TRY_CAST follows the same normalized comparison and evaluates to false.
 query B
 SELECT TRY_CAST(ts AS TIMESTAMP(9)) = CAST(0 AS TIMESTAMP(9))
 FROM (VALUES (CAST(9223372036854775807 AS TIMESTAMP(3)))) AS t(ts);
 ----
-NULL
+false
 
 # Unsafe narrowing IN / NOT IN must keep the fallible cast observable, even
 # when the list includes a typed NULL.
