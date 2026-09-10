@@ -530,9 +530,9 @@ impl From<StreamType> for SendableRecordBatchStream {
 ///
 /// ## Enable Condition
 /// - No grouping (no `GROUP BY` clause in the sql, only a single global group to aggregate)
-/// - The aggregate expression must be `min`/`max`, and evaluate directly on columns.
+/// - Every aggregate expression must be `min`/`max`, and evaluate directly on a column.
 ///   Note multiple aggregate expressions that satisfy this requirement are allowed,
-///   and a dynamic filter will be constructed combining all applicable expr's
+///   and a dynamic filter will be constructed combining all aggregate expressions'
 ///   states. See more in the following example with dynamic filter on multiple columns.
 ///
 /// ## Filter Construction
@@ -1150,17 +1150,23 @@ impl AggregateExec {
                 return;
             };
 
-            // 2. arg should be only 1 column reference
-            if let [arg] = aggr_expr.expressions().as_slice()
-                && arg.as_any().is::<Column>()
-            {
-                all_cols.push(Arc::clone(arg));
-                aggr_dyn_filters.push(PerAccumulatorDynFilter {
-                    aggr_type,
-                    aggr_index: i,
-                    shared_bound: Arc::new(Mutex::new(ScalarValue::Null)),
-                });
+            // 2. Every aggregate argument must be exactly one column reference.
+            // A filter for only a subset of aggregates can discard rows needed by
+            // unsupported aggregates.
+            let args = aggr_expr.expressions();
+            let [arg] = args.as_slice() else {
+                return;
+            };
+            if !arg.as_any().is::<Column>() {
+                return;
             }
+
+            all_cols.push(Arc::clone(arg));
+            aggr_dyn_filters.push(PerAccumulatorDynFilter {
+                aggr_type,
+                aggr_index: i,
+                shared_bound: Arc::new(Mutex::new(ScalarValue::Null)),
+            });
         }
 
         if !aggr_dyn_filters.is_empty() {
