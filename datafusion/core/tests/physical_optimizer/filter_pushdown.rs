@@ -40,7 +40,7 @@ use datafusion_datasource::{
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::ScalarUDF;
-use datafusion_functions::math::random::RandomFunc;
+use datafusion_functions::math::{abs::AbsFunc, random::RandomFunc};
 use datafusion_functions_aggregate::{
     count::count_udaf,
     min_max::{max_udaf, min_udaf},
@@ -2501,7 +2501,7 @@ async fn run_aggregate_dyn_filter_case(case: AggregateDynFilterCase<'_>) {
 // 1. `min(a)` and `max(a)` baseline.
 // 2. Unsupported expression input (`min(a+1)`).
 // 3. Multiple supported columns (same column vs different columns).
-// 4. Mixed supported + unsupported aggregates.
+// 4. Mixed column and expression aggregates disable dynamic filtering.
 // 5. Entirely NULL input to surface current bound behavior.
 // 6. End-to-end tests on parquet files
 
@@ -2648,59 +2648,55 @@ async fn test_aggregate_dynamic_filter_min_max_different_columns() {
     .await;
 }
 
-/// Mix of supported/unsupported aggregates retains only the valid ones.
-/// `MIN(a), MAX(a), MAX(b), MIN(c+1)`: Pushdown dynamic filter like `(a<1) or (a>8) OR (b>12)`
+/// A dynamic filter is unsafe if any aggregate cannot participate in it.
+/// Test both aggregate orders to ensure no incomplete filter is created.
 #[tokio::test]
-async fn test_aggregate_dynamic_filter_multiple_mixed_expressions() {
+async fn test_aggregate_dynamic_filter_mixed_column_and_expression_not_supported() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Int32, true),
-        Field::new("c", DataType::Int32, true),
     ]));
     let batches = vec![
-        record_batch!(
-            ("a", Int32, [5, 1, 3, 8]),
-            ("b", Int32, [10, 4, 6, 12]),
-            ("c", Int32, [100, 70, 90, 110])
-        )
-        .unwrap(),
+        record_batch!(("a", Int32, [5, 1, 3, 8]), ("b", Int32, [-10, 4, 6, 12])).unwrap(),
     ];
 
-    let min_a = AggregateExprBuilder::new(min_udaf(), vec![col("a", &schema).unwrap()])
-        .schema(Arc::clone(&schema))
-        .alias("min_a")
-        .build()
-        .unwrap();
-    let max_a = AggregateExprBuilder::new(max_udaf(), vec![col("a", &schema).unwrap()])
-        .schema(Arc::clone(&schema))
-        .alias("max_a")
-        .build()
-        .unwrap();
-    let max_b = AggregateExprBuilder::new(max_udaf(), vec![col("b", &schema).unwrap()])
-        .schema(Arc::clone(&schema))
-        .alias("max_b")
-        .build()
-        .unwrap();
-    let expr_c: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-        col("c", &schema).unwrap(),
-        Operator::Plus,
-        Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
-    ));
-    let min_c_expr = AggregateExprBuilder::new(min_udaf(), vec![expr_c])
-        .schema(Arc::clone(&schema))
-        .alias("min_c_plus_one")
-        .build()
-        .unwrap();
+    for expression_first in [false, true] {
+        let max_a =
+            AggregateExprBuilder::new(max_udaf(), vec![col("a", &schema).unwrap()])
+                .schema(Arc::clone(&schema))
+                .alias("max_a")
+                .build()
+                .unwrap();
+        let abs_b: Arc<dyn PhysicalExpr> = Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(AbsFunc::new().into()),
+                vec![col("b", &schema).unwrap()],
+                &schema,
+                Arc::new(ConfigOptions::default()),
+            )
+            .unwrap(),
+        );
+        let max_abs_b = AggregateExprBuilder::new(max_udaf(), vec![abs_b])
+            .schema(Arc::clone(&schema))
+            .alias("max_abs_b")
+            .build()
+            .unwrap();
 
-    run_aggregate_dyn_filter_case(AggregateDynFilterCase {
-        schema,
-        batches,
-        aggr_exprs: vec![min_a, max_a, max_b, min_c_expr],
-        expected_before: Some("DynamicFilter [ empty ]"),
-        expected_after: Some("DynamicFilter [ a@0 < 1 OR a@0 > 8 OR b@1 > 12 ]"),
-        scan_support: true,
-    })
-    .await;
+        let aggr_exprs = if expression_first {
+            vec![max_abs_b, max_a]
+        } else {
+            vec![max_a, max_abs_b]
+        };
+        run_aggregate_dyn_filter_case(AggregateDynFilterCase {
+            schema: Arc::clone(&schema),
+            batches: batches.clone(),
+            aggr_exprs,
+            expected_before: None,
+            expected_after: None,
+            scan_support: true,
+        })
+        .await;
+    }
 }
 
 /// Don't tighten the dynamic filter if all inputs are null
