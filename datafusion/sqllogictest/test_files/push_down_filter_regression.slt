@@ -193,6 +193,57 @@ physical_plan
 statement ok
 drop table agg_dyn_test;
 
+# MIN(c + 1) has no dynamic-filter predicate. A filter derived only from
+# MIN(a), MAX(a), and MAX(b) could discard rows that improve MIN(c + 1).
+# Both files have two row groups: the first establishes the supported bounds
+# and the second contains the minimum c. Two target partitions make each file
+# run in a separate partial aggregate stream.
+statement ok
+set datafusion.execution.batch_size = 2;
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES (1, 12, 100), (8, 4, 100), (1, 6, 70), (8, 12, 110)) AS v(a, b, c)
+) TO 'test_files/scratch/push_down_filter_regression/agg_dyn_mixed/file_0.parquet'
+STORED AS PARQUET
+OPTIONS ('format.max_row_group_size' '2');
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES (1, 12, 100), (8, 4, 100), (1, 6, 70), (8, 12, 110)) AS v(a, b, c)
+) TO 'test_files/scratch/push_down_filter_regression/agg_dyn_mixed/file_1.parquet'
+STORED AS PARQUET
+OPTIONS ('format.max_row_group_size' '2');
+
+statement ok
+CREATE EXTERNAL TABLE agg_dyn_mixed (a INT, b INT, c INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/push_down_filter_regression/agg_dyn_mixed/';
+
+# Without the guard, the dynamic filter derived from the supported aggregates
+# can prune the second row group and incorrectly return MIN(c + 1) = 101.
+query IIII
+SELECT MIN(a), MAX(a), MAX(b), MIN(c + 1) FROM agg_dyn_mixed;
+----
+1 8 12 71
+
+# The unsupported expression aggregate disables the partial aggregate's
+# dynamic filter rather than creating an incomplete predicate.
+query TT
+EXPLAIN SELECT MIN(a), MAX(a), MAX(b), MIN(c + 1) FROM agg_dyn_mixed;
+----
+physical_plan
+01)AggregateExec: mode=Final, gby=[], aggr=[min(agg_dyn_mixed.a), max(agg_dyn_mixed.a), max(agg_dyn_mixed.b), min(agg_dyn_mixed.c + Int64(1))]
+02)--CoalescePartitionsExec
+03)----AggregateExec: mode=Partial, gby=[], aggr=[min(agg_dyn_mixed.a), max(agg_dyn_mixed.a), max(agg_dyn_mixed.b), min(agg_dyn_mixed.c + Int64(1))]
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_mixed/file_0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_mixed/file_1.parquet]]}, projection=[a, b, c], file_type=parquet
+
+statement ok
+drop table agg_dyn_mixed;
+
+statement ok
+reset datafusion.execution.batch_size;
+
 statement ok
 drop table t1;
 
