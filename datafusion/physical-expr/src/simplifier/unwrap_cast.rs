@@ -430,14 +430,14 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_widening_equality_and_guards_retain_cast() {
+    fn test_timestamp_widening_unaligned_equality_and_guards_retain_cast() {
         let source = DataType::Timestamp(TimeUnit::Millisecond, None);
         let target = DataType::Timestamp(TimeUnit::Nanosecond, None);
         let schema = Schema::new(vec![Field::new("ts", source, true)]);
         for (op, literal) in [
             (
                 Operator::Eq,
-                ScalarValue::TimestampNanosecond(Some(123_000_000), None),
+                ScalarValue::TimestampNanosecond(Some(123_000_001), None),
             ),
             (Operator::GtEq, ScalarValue::TimestampNanosecond(None, None)),
             (
@@ -897,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_not_unwrap_timestamp_precision_widening_equality() {
+    fn test_unwrap_timestamp_precision_widening_equality() {
         let schema = Schema::new(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -916,9 +916,14 @@ mod tests {
 
         let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
 
-        assert!(!result.transformed);
-        let unchanged = result.data.downcast_ref::<BinaryExpr>().unwrap();
-        assert!(is_cast_expr(unchanged.left()));
+        assert!(result.transformed);
+        let unwrapped = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        assert_eq!(*unwrapped.op(), Operator::Eq);
+        assert_eq!(
+            unwrapped.right().downcast_ref::<Literal>().unwrap().value(),
+            &ScalarValue::TimestampMillisecond(Some(1), None),
+        );
+        assert!(!is_cast_expr(unwrapped.left()));
     }
 
     #[test]

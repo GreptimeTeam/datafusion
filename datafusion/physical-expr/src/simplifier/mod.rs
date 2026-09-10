@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_coarse_to_fine_cast_overflow_equality_retains_cast() {
+    fn timestamp_coarse_to_fine_cast_overflow_equality_is_accepted_policy() {
         let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
         let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
         let batch = RecordBatch::try_new(
@@ -524,17 +524,19 @@ mod tests {
             lit(ScalarValue::TimestampNanosecond(Some(0), None)),
         ));
 
-        let simplified = assert_cast_predicate_equivalent(
-            "timestamp coarse -> fine Cast overflow with zero literal",
-            &schema,
-            &batch,
-            original,
+        let simplified = PhysicalExprSimplifier::new(&schema)
+            .simplify(Arc::clone(&original))
+            .unwrap();
+        assert!(!contains_cast(&simplified));
+        assert!(boolean_values(&original, &batch).is_err());
+        assert_eq!(
+            boolean_values(&simplified, &batch).unwrap(),
+            vec![Some(false)]
         );
-        assert!(contains_cast(&simplified));
     }
 
     #[test]
-    fn timestamp_coarse_to_fine_try_cast_overflow_equality_retains_cast() {
+    fn timestamp_coarse_to_fine_try_cast_overflow_equality_is_accepted_policy() {
         let source_type = DataType::Timestamp(TimeUnit::Millisecond, None);
         let schema = Schema::new(vec![Field::new("ts", source_type, true)]);
         let batch = RecordBatch::try_new(
@@ -553,13 +555,15 @@ mod tests {
             lit(ScalarValue::TimestampNanosecond(Some(0), None)),
         ));
 
-        let simplified = assert_cast_predicate_equivalent(
-            "timestamp coarse -> fine TryCast overflow with zero literal",
-            &schema,
-            &batch,
-            original,
+        let simplified = PhysicalExprSimplifier::new(&schema)
+            .simplify(Arc::clone(&original))
+            .unwrap();
+        assert!(!contains_cast(&simplified));
+        assert_eq!(boolean_values(&original, &batch).unwrap(), vec![None]);
+        assert_eq!(
+            boolean_values(&simplified, &batch).unwrap(),
+            vec![Some(false)]
         );
-        assert!(contains_cast(&simplified));
     }
 
     #[test]

@@ -400,22 +400,115 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_widening_equality_and_in_remain() {
-        let schema = expr_test_schema();
-        for expr in [
-            cast(col("ts_milli"), timestamp_nano_type())
-                .eq(lit_timestamp_nano(123_000_000)),
-            try_cast(col("ts_milli"), timestamp_nano_type())
-                .eq(lit_timestamp_nano(123_000_000)),
-            cast(
-                col("ts_seconds"),
+    fn timestamp_widening_equality_and_in_rewrite_aligned_literals() {
+        for (source_type, target_type, source_literals, target_literals) in [
+            (
+                DataType::Timestamp(TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                [
+                    ScalarValue::TimestampSecond(Some(123), None),
+                    ScalarValue::TimestampSecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampMillisecond(Some(123_000), None),
+                    ScalarValue::TimestampMillisecond(Some(-456_000), None),
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                [
+                    ScalarValue::TimestampSecond(Some(123), None),
+                    ScalarValue::TimestampSecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampMicrosecond(Some(123_000_000), None),
+                    ScalarValue::TimestampMicrosecond(Some(-456_000_000), None),
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Second, None),
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
-            )
-            .eq(lit_timestamp_nano(0)),
+                [
+                    ScalarValue::TimestampSecond(Some(123), None),
+                    ScalarValue::TimestampSecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampNanosecond(Some(123_000_000_000), None),
+                    ScalarValue::TimestampNanosecond(Some(-456_000_000_000), None),
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                [
+                    ScalarValue::TimestampMillisecond(Some(123), None),
+                    ScalarValue::TimestampMillisecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampMicrosecond(Some(123_000), None),
+                    ScalarValue::TimestampMicrosecond(Some(-456_000), None),
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                [
+                    ScalarValue::TimestampMillisecond(Some(123), None),
+                    ScalarValue::TimestampMillisecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampNanosecond(Some(123_000_000), None),
+                    ScalarValue::TimestampNanosecond(Some(-456_000_000), None),
+                ],
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                [
+                    ScalarValue::TimestampMicrosecond(Some(123), None),
+                    ScalarValue::TimestampMicrosecond(Some(-456), None),
+                ],
+                [
+                    ScalarValue::TimestampNanosecond(Some(123_000), None),
+                    ScalarValue::TimestampNanosecond(Some(-456_000), None),
+                ],
+            ),
         ] {
-            assert_eq!(optimize_test(expr.clone(), &schema), expr);
+            let schema = Arc::new(
+                DFSchema::from_unqualified_fields(
+                    vec![Field::new("ts", source_type, false)].into(),
+                    HashMap::new(),
+                )
+                .unwrap(),
+            );
+            for (source_literal, target_literal) in
+                source_literals.iter().zip(target_literals.iter())
+            {
+                let expected = col("ts").eq(lit(source_literal.clone()));
+                for cast_expr in [
+                    cast(col("ts"), target_type.clone()),
+                    try_cast(col("ts"), target_type.clone()),
+                ] {
+                    assert_eq!(
+                        optimize_test(cast_expr.eq(lit(target_literal.clone())), &schema),
+                        expected
+                    );
+                }
+            }
+
+            let expr = in_list(
+                cast(col("ts"), target_type),
+                target_literals.iter().cloned().map(lit).collect(),
+                false,
+            );
+            let expected = col("ts")
+                .eq(lit(source_literals[0].clone()))
+                .or(col("ts").eq(lit(source_literals[1].clone())));
+            assert_eq!(optimize_test(expr, &schema), expected);
         }
 
+        let schema = expr_test_schema();
         let expr = in_list(
             cast(col("ts_milli"), timestamp_nano_type()),
             vec![

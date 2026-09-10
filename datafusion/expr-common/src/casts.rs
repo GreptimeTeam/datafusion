@@ -95,7 +95,7 @@ pub fn try_cast_literal_to_type(
 /// This is the shared semantic core for logical and physical cast-predicate
 /// rewrites. It returns a singleton [`CastPredicatePreimage::Exact`] for casts
 /// where moving the cast to the literal preserves comparison semantics, plus
-/// the fork's accepted ordered timestamp-widening overflow policy, and a
+/// the fork's accepted timestamp-widening overflow policy, and a
 /// [`CastPredicatePreimage::Range`] for many-to-one casts with known preimages
 /// such as timestamp precision narrowing.
 pub fn cast_predicate_preimage(
@@ -142,13 +142,23 @@ fn maybe_range_preimage(
 /// Computes a singleton source-domain literal for exact cast-predicate rewrites.
 ///
 /// This intentionally returns `None` for timestamp precision narrowing: those
-/// casts are many-to-one and need range preimages instead.
+/// casts are many-to-one and need range preimages instead. Timestamp precision
+/// widening with the same timezone is also accepted for equality and `IN`
+/// rewrites. As with the ordered timestamp-widening policy, this accepts that
+/// a widening `CAST` can error and a `TRY_CAST` can return NULL on overflow;
+/// it is not a full-domain equivalence claim.
 pub fn exact_preimage_cast(
     source_type: &DataType,
     target_type: &DataType,
     lit_value: &ScalarValue,
 ) -> Option<ScalarValue> {
     if !is_exact_cast_safe(source_type, target_type) {
+        return None;
+    }
+    if source_type != target_type
+        && is_timestamp_cast(source_type, target_type)
+        && lit_value.is_null()
+    {
         return None;
     }
 
@@ -202,9 +212,11 @@ fn is_exact_cast_safe(source_type: &DataType, target_type: &DataType) -> bool {
         DataType::Timestamp(target_unit, target_tz),
     ) = (source_type, target_type)
     {
-        // Timestamp widening is not exact-safe: #4 makes overflow observable
-        // for source rows. Exact timestamp casts are only identity metadata.
-        return source_unit == target_unit && source_tz == target_tz;
+        // Timestamp precision widening with the same timezone is accepted for
+        // equality and IN rewrites despite observable CAST/TRY_CAST overflow.
+        // Timestamp narrowing remains many-to-one.
+        return source_tz == target_tz
+            && timestamp_unit_scale(source_unit) <= timestamp_unit_scale(target_unit);
     }
 
     if is_integer_type(source_type) && is_integer_type(target_type) {
@@ -1778,17 +1790,30 @@ mod tests {
             &ScalarValue::TimestampMillisecond(Some(123), Some("+05:30".into())),
             ScalarValue::TimestampMillisecond(Some(123), Some("+05:30".into())),
         );
-        assert_preimage_none(
+        assert_preimage_exact(
             &timestamp_ms,
             &timestamp_ns,
             Operator::Eq,
             &ScalarValue::TimestampNanosecond(Some(123_000_000), Some("+05:30".into())),
+            ScalarValue::TimestampMillisecond(Some(123), Some("+05:30".into())),
+        );
+        assert_preimage_none(
+            &timestamp_ms,
+            &timestamp_ns,
+            Operator::Eq,
+            &ScalarValue::TimestampNanosecond(Some(123_000_001), Some("+05:30".into())),
         );
         assert_preimage_none(
             &timestamp_ms,
             &timestamp_ms_utc,
             Operator::Eq,
             &ScalarValue::TimestampMillisecond(Some(123), Some("UTC".into())),
+        );
+        assert_preimage_none(
+            &timestamp_ms,
+            &timestamp_ns,
+            Operator::Eq,
+            &ScalarValue::TimestampNanosecond(None, Some("+05:30".into())),
         );
     }
 
@@ -1831,6 +1856,12 @@ mod tests {
             &target_type,
             Operator::GtEq,
             &ScalarValue::TimestampNanosecond(None, None),
+        );
+        assert_preimage_none(
+            &source_type,
+            &target_type,
+            Operator::Eq,
+            &ScalarValue::TimestampMicrosecond(Some(123_456), None),
         );
         assert_preimage_none(
             &source_type,
