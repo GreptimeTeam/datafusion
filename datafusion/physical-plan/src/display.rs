@@ -24,6 +24,9 @@ use std::fmt::Formatter;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
+use indexmap::IndexMap;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 
 use datafusion_common::display::{GraphvizBuilder, PlanType, StringifiedPlan};
 use datafusion_expr::display_schema;
@@ -439,24 +442,15 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     metric_types: &self.metric_types,
                     metric_categories: self.metric_categories.as_deref(),
                     metric_names: self.metric_names.as_deref(),
-                    objects: HashMap::new(),
-                    parent_ids: Vec::new(),
-                    next_id: 0,
+                    nodes: Vec::new(),
                     root: None,
                 };
                 accept(self.plan, &mut visitor).map_err(|_| fmt::Error)?;
                 let root = visitor.root.ok_or(fmt::Error)?;
-                let mut root_entry = serde_json::json!({ "Plan": root });
-                if let Some(summary) = self.summary {
-                    if let Some(total_rows) = summary.total_rows {
-                        root_entry["Total Rows"] = serde_json::Value::from(total_rows);
-                    }
-                    if let Some(duration) = summary.duration {
-                        root_entry["Duration"] =
-                            serde_json::Value::from(format!("{duration:?}"));
-                    }
-                }
-                let doc = serde_json::Value::Array(vec![root_entry]);
+                let doc = vec![PgJsonRoot {
+                    plan: root,
+                    summary: self.summary,
+                }];
                 write!(
                     f,
                     "{}",
@@ -766,9 +760,8 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
 /// per-operator metrics.
 ///
 /// This visitor mirrors the logical-plan `PgJsonVisitor` in
-/// `datafusion-expr`: during `pre_visit` it assembles a JSON object for the
-/// current node; during `post_visit` it attaches that object into its
-/// parent's `"Plans"` array (or stores it as the root).
+/// `datafusion-expr`. It keeps a stack of serializable nodes, attaching a
+/// completed node to its parent during `post_visit`.
 struct PgJsonExecutionPlanVisitor<'a> {
     verbose: bool,
     show_metrics: ShowMetrics,
@@ -776,10 +769,80 @@ struct PgJsonExecutionPlanVisitor<'a> {
     metric_types: &'a [MetricType],
     metric_categories: Option<&'a [MetricCategory]>,
     metric_names: Option<&'a [String]>,
-    objects: HashMap<u32, serde_json::Value>,
-    parent_ids: Vec<u32>,
-    next_id: u32,
-    root: Option<serde_json::Value>,
+    nodes: Vec<PgJsonNode>,
+    root: Option<PgJsonNode>,
+}
+
+/// A pgjson node whose manual serialization fixes field order independently of
+/// `serde_json` map implementation details.
+struct PgJsonNode {
+    node_type: String,
+    details: String,
+    output: Option<Vec<String>>,
+    canonical_metrics: IndexMap<&'static str, serde_json::Value>,
+    extras: IndexMap<String, serde_json::Value>,
+    plans: Vec<PgJsonNode>,
+}
+
+impl Serialize for PgJsonNode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("Node Type", &self.node_type)?;
+        map.serialize_entry("Details", &self.details)?;
+        if let Some(output) = &self.output {
+            map.serialize_entry("Output", output)?;
+        }
+        for (name, value) in &self.canonical_metrics {
+            map.serialize_entry(name, value)?;
+        }
+        if !self.extras.is_empty() {
+            map.serialize_entry("Extras", &PgJsonExtras(&self.extras))?;
+        }
+        map.serialize_entry("Plans", &self.plans)?;
+        map.end()
+    }
+}
+
+struct PgJsonExtras<'a>(&'a IndexMap<String, serde_json::Value>);
+
+impl Serialize for PgJsonExtras<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+struct PgJsonRoot {
+    plan: PgJsonNode,
+    summary: Option<AnalyzeSummary>,
+}
+
+impl Serialize for PgJsonRoot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("Plan", &self.plan)?;
+        if let Some(summary) = self.summary {
+            if let Some(total_rows) = summary.total_rows {
+                map.serialize_entry("Total Rows", &total_rows)?;
+            }
+            if let Some(duration) = summary.duration {
+                map.serialize_entry("Duration", &format!("{duration:?}"))?;
+            }
+        }
+        map.end()
+    }
 }
 
 impl PgJsonExecutionPlanVisitor<'_> {
@@ -799,9 +862,7 @@ impl PgJsonExecutionPlanVisitor<'_> {
             .to_string()
     }
 
-    /// Render the given `MetricValue` into the most natural `serde_json::Value`
-    /// we can produce: a number for simple counts/gauges/times, a float-ms for
-    /// `ElapsedCompute`, and a string fallback for anything else.
+    /// Render the given `MetricValue` into its existing pgjson scalar form.
     fn metric_value_to_json(value: &MetricValue) -> serde_json::Value {
         match value {
             MetricValue::OutputRows(c) => serde_json::Value::from(c.value()),
@@ -813,12 +874,7 @@ impl PgJsonExecutionPlanVisitor<'_> {
             }
             MetricValue::CurrentMemoryUsage(g) => serde_json::Value::from(g.value()),
             MetricValue::ElapsedCompute(t) => {
-                // Emit as float milliseconds to align with PG's
-                // `"Actual Total Time"` convention. DataFusion tracks compute
-                // time (summed across partitions), not wall time — visualizers
-                // should be read with that caveat in mind.
-                let ms = (t.value() as f64) / 1_000_000.0;
-                serde_json::Value::from(ms)
+                serde_json::Value::from((t.value() as f64) / 1_000_000.0)
             }
             MetricValue::Count { count, .. } => serde_json::Value::from(count.value()),
             MetricValue::Gauge { gauge, .. } => serde_json::Value::from(gauge.value()),
@@ -826,18 +882,16 @@ impl PgJsonExecutionPlanVisitor<'_> {
                 serde_json::Value::from(gauge.value())
             }
             MetricValue::Time { time, .. } => {
-                let ms = (time.value() as f64) / 1_000_000.0;
-                serde_json::Value::from(ms)
+                serde_json::Value::from((time.value() as f64) / 1_000_000.0)
             }
             // Timestamps, PruningMetrics, Ratio, Custom: fall back to Display.
             other => serde_json::Value::String(format!("{other}")),
         }
     }
 
-    /// Populate `"Actual Rows"`, `"Actual Total Time"`, and `"Extras"` for
-    /// the given node from its aggregated `MetricsSet`, honoring the same
-    /// filtering pipeline used by `IndentVisitor`.
-    fn attach_metrics(&self, plan: &dyn ExecutionPlan, object: &mut serde_json::Value) {
+    /// Populate PG-canonical metrics and extras, honoring the same filtering
+    /// pipeline used by `IndentVisitor`.
+    fn attach_metrics(&self, plan: &dyn ExecutionPlan, node: &mut PgJsonNode) {
         if matches!(self.show_metrics, ShowMetrics::None) {
             return;
         }
@@ -859,36 +913,32 @@ impl PgJsonExecutionPlanVisitor<'_> {
         } else {
             metrics
         };
-
         let metrics = if let Some(names) = self.metric_names {
             metrics.filter_by_names(names)
         } else {
             metrics
         };
 
-        // Build the Extras bucket, while extracting PG-canonical keys to the
-        // top level.
-        let mut extras = serde_json::Map::new();
         for metric in metrics.iter() {
             let value = metric.value();
             match value {
                 MetricValue::OutputRows(c) => {
-                    object["Actual Rows"] = serde_json::Value::from(c.value());
+                    node.canonical_metrics
+                        .insert("Actual Rows", serde_json::Value::from(c.value()));
                 }
                 MetricValue::ElapsedCompute(t) => {
-                    let ms = (t.value() as f64) / 1_000_000.0;
-                    object["Actual Total Time"] = serde_json::Value::from(ms);
+                    node.canonical_metrics.insert(
+                        "Actual Total Time",
+                        serde_json::Value::from((t.value() as f64) / 1_000_000.0),
+                    );
                 }
                 _ => {
-                    extras.insert(
+                    node.extras.insert(
                         value.name().to_string(),
                         Self::metric_value_to_json(value),
                     );
                 }
             }
-        }
-        if !extras.is_empty() {
-            object["Extras"] = serde_json::Value::Object(extras);
         }
     }
 }
@@ -897,52 +947,31 @@ impl ExecutionPlanVisitor for PgJsonExecutionPlanVisitor<'_> {
     type Error = fmt::Error;
 
     fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        // Build fields in reading order: Node Type, Details, (schema),
-        // (metrics), Plans last — so the JSON output reads top-down like a
-        // PostgreSQL plan.
-        let mut object = serde_json::json!({
-            "Node Type": plan.name(),
-            "Details": Self::one_line_details(plan),
-        });
-
-        if self.show_schema || self.verbose {
-            // Always include output columns when a caller asked for schema;
-            // also include them in verbose mode so the pgjson output mirrors
-            // the extra context shown by indent's verbose flag.
-            let columns: Vec<serde_json::Value> = plan
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| serde_json::Value::String(f.name().to_string()))
-                .collect();
-            object["Output"] = serde_json::Value::Array(columns);
-        }
-
-        self.attach_metrics(plan, &mut object);
-
-        object["Plans"] = serde_json::Value::Array(vec![]);
-
-        self.objects.insert(id, object);
-        self.parent_ids.push(id);
+        let mut node = PgJsonNode {
+            node_type: plan.name().to_string(),
+            details: Self::one_line_details(plan),
+            output: (self.show_schema || self.verbose).then(|| {
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_string())
+                    .collect()
+            }),
+            canonical_metrics: IndexMap::new(),
+            extras: IndexMap::new(),
+            plans: Vec::new(),
+        };
+        self.attach_metrics(plan, &mut node);
+        self.nodes.push(node);
         Ok(true)
     }
 
     fn post_visit(&mut self, _plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
-        let id = self.parent_ids.pop().ok_or(fmt::Error)?;
-        let current = self.objects.remove(&id).ok_or(fmt::Error)?;
-
-        if let Some(parent_id) = self.parent_ids.last() {
-            let parent = self.objects.get_mut(parent_id).ok_or(fmt::Error)?;
-            let plans = parent
-                .get_mut("Plans")
-                .and_then(|p| p.as_array_mut())
-                .ok_or(fmt::Error)?;
-            plans.push(current);
+        let node = self.nodes.pop().ok_or(fmt::Error)?;
+        if let Some(parent) = self.nodes.last_mut() {
+            parent.plans.push(node);
         } else {
-            self.root = Some(current);
+            self.root = Some(node);
         }
         Ok(true)
     }
@@ -1790,7 +1819,7 @@ mod tests {
 
             let plan: Arc<dyn ExecutionPlan> = Arc::new(WithMetrics {
                 inner: sample_plan(),
-                metrics,
+                metrics: metrics.clone(),
             });
 
             let out = DisplayableExecutionPlan::with_metrics(plan.as_ref())
@@ -1801,6 +1830,118 @@ mod tests {
             assert_eq!(root["Actual Rows"].as_u64(), Some(42));
             assert_eq!(root["Actual Total Time"].as_f64(), Some(5.0));
             assert_eq!(root["Extras"]["output_batches"].as_u64(), Some(7));
+
+            // Canonical keys retain encounter order and duplicate values
+            // overwrite their first insertion position.
+            let mut canonical_metrics = MetricsSet::new();
+            let elapsed_first = Time::new();
+            elapsed_first.add_duration(Duration::from_millis(1));
+            canonical_metrics.push(Arc::new(Metric::new(
+                MetricValue::ElapsedCompute(elapsed_first),
+                None,
+            )));
+            let rows_first = Count::new();
+            rows_first.add(10);
+            canonical_metrics.push(Arc::new(Metric::new(
+                MetricValue::OutputRows(rows_first),
+                None,
+            )));
+            let elapsed_last = Time::new();
+            elapsed_last.add_duration(Duration::from_millis(3));
+            canonical_metrics.push(Arc::new(Metric::new(
+                MetricValue::ElapsedCompute(elapsed_last),
+                None,
+            )));
+            let rows_last = Count::new();
+            rows_last.add(20);
+            canonical_metrics.push(Arc::new(Metric::new(
+                MetricValue::OutputRows(rows_last),
+                None,
+            )));
+            let canonical_plan: Arc<dyn ExecutionPlan> = Arc::new(WithMetrics {
+                inner: sample_plan(),
+                metrics: canonical_metrics,
+            });
+            let canonical_out =
+                DisplayableExecutionPlan::with_full_metrics(canonical_plan.as_ref())
+                    .pgjson(false)
+                    .to_string();
+            let details = canonical_out.find("\"Details\": \"WithMetrics\"").unwrap();
+            let elapsed = canonical_out.find("\"Actual Total Time\": 3.0").unwrap();
+            let rows = canonical_out.find("\"Actual Rows\": 20").unwrap();
+            let plans = canonical_out[rows..].find("\"Plans\":").unwrap() + rows;
+            assert!(details < elapsed && elapsed < rows && rows < plans);
+            let canonical_value: serde_json::Value =
+                serde_json::from_str(&canonical_out).unwrap();
+            let canonical_root = canonical_value[0].get("Plan").expect("plan");
+            assert_eq!(canonical_root["Actual Total Time"].as_f64(), Some(3.0));
+            assert_eq!(canonical_root["Actual Rows"].as_u64(), Some(20));
+
+            // Full metrics retain their encounter order in Extras, while a
+            // duplicate name overwrites its value without moving its key.
+            use crate::metrics::Timestamp;
+            use std::borrow::Cow;
+            let zeta_first = Count::new();
+            zeta_first.add(1);
+            metrics.push(Arc::new(Metric::new(
+                MetricValue::Count {
+                    name: Cow::Borrowed("zeta"),
+                    count: zeta_first,
+                },
+                None,
+            )));
+            let alpha = Count::new();
+            alpha.add(2);
+            metrics.push(Arc::new(Metric::new(
+                MetricValue::Count {
+                    name: Cow::Borrowed("alpha"),
+                    count: alpha,
+                },
+                None,
+            )));
+            let zeta_last = Count::new();
+            zeta_last.add(3);
+            metrics.push(Arc::new(Metric::new(
+                MetricValue::Count {
+                    name: Cow::Borrowed("zeta"),
+                    count: zeta_last,
+                },
+                None,
+            )));
+            metrics.push(Arc::new(Metric::new(
+                MetricValue::StartTimestamp(Timestamp::new()),
+                None,
+            )));
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(WithMetrics {
+                inner: sample_plan(),
+                metrics,
+            });
+            let out = DisplayableExecutionPlan::with_full_metrics(plan.as_ref())
+                .pgjson(false)
+                .to_string();
+            let extras = out.split("\"Extras\": {").nth(1).expect("Extras");
+            assert!(
+                extras.find("\"output_batches\"").unwrap()
+                    < extras.find("\"zeta\"").unwrap()
+            );
+            assert!(extras.find("\"zeta\"").unwrap() < extras.find("\"alpha\"").unwrap());
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let root = value[0].get("Plan").expect("plan");
+            assert_eq!(root["Extras"]["zeta"].as_u64(), Some(3));
+            assert_eq!(root["Extras"]["alpha"].as_u64(), Some(2));
+            assert_eq!(root["Extras"]["output_batches"].as_u64(), Some(7));
+            assert_eq!(root["Extras"]["start_timestamp"].as_str(), Some("NONE"));
+
+            let filtered = DisplayableExecutionPlan::with_full_metrics(plan.as_ref())
+                .set_metric_names(vec!["zeta".to_string(), "start_timestamp".to_string()])
+                .pgjson(false)
+                .to_string();
+            let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+            let extras = &filtered[0]["Plan"]["Extras"];
+            assert_eq!(extras["zeta"].as_u64(), Some(3));
+            assert_eq!(extras["start_timestamp"].as_str(), Some("NONE"));
+            assert!(extras.get("alpha").is_none());
+            assert!(filtered[0]["Plan"].get("Actual Rows").is_none());
 
             let metric_names = vec!["output_rows".to_string()];
             for rendered in [
@@ -1851,13 +1992,57 @@ mod tests {
         }
 
         #[test]
+        fn pgjson_preserves_nested_schema_and_summary_order() {
+            let plan = sample_plan();
+            let out = DisplayableExecutionPlan::new(plan.as_ref())
+                .set_show_schema(true)
+                .set_summary(Some(42), Some(Duration::from_millis(7)))
+                .pgjson(false)
+                .to_string();
+            assert_snapshot!(out, @r#"
+            [
+              {
+                "Plan": {
+                  "Node Type": "ProjectionExec",
+                  "Details": "ProjectionExec: expr=[a@0 as a]",
+                  "Output": [
+                    "a"
+                  ],
+                  "Plans": [
+                    {
+                      "Node Type": "FilterExec",
+                      "Details": "FilterExec: a@0 > 5",
+                      "Output": [
+                        "a",
+                        "b"
+                      ],
+                      "Plans": [
+                        {
+                          "Node Type": "EmptyExec",
+                          "Details": "EmptyExec",
+                          "Output": [
+                            "a",
+                            "b"
+                          ],
+                          "Plans": []
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "Total Rows": 42,
+                "Duration": "7ms"
+              }
+            ]
+            "#);
+        }
+
+        #[test]
         fn pgjson_snapshot_of_sample_plan() {
             let plan = sample_plan();
             let out = DisplayableExecutionPlan::new(plan.as_ref())
                 .pgjson(false)
                 .to_string();
-            // This snapshot assumes `serde_json` is built with the
-            // `preserve_order` feature (enabled via this crate's dev-deps).
             assert_snapshot!(out, @r#"
             [
               {
