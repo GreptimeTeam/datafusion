@@ -5390,6 +5390,27 @@ select cardinality(arrow_cast([[1, 2], [3, 4], [5, 6]], 'FixedSizeList(3, List(I
 ----
 6
 
+# cardinality counts actual leaf elements in ragged nested arrays
+query III
+select cardinality([[1], [2, 3]]),
+       cardinality([[1, 2, 3], []]),
+       cardinality([[], [1, 2]]);
+----
+3 3 2
+
+query IIII
+select cardinality(arrow_cast([[[1]], [[2, 3], []]], 'List(ListView(List(Int64)))')),
+       cardinality(arrow_cast([[[1]], [[2, 3], []]], 'LargeList(LargeListView(List(Int64)))')),
+       cardinality(arrow_cast([[[1, 2]], [[3, 4]]], 'List(List(FixedSizeList(2, Int64)))')),
+       cardinality(arrow_cast([[[1]], [[2, 3], []]], 'LargeList(LargeList(List(Int64)))'));
+----
+3 3 4 3
+
+query II
+select cardinality([[NULL], [1, 2]]), cardinality(make_array(NULL::int[], [1, 2]));
+----
+3 2
+
 # cardinality scalar function #3
 query II
 select cardinality(make_array()), cardinality(make_array(make_array()))
