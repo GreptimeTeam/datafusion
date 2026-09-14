@@ -981,6 +981,11 @@ fn remove_dist_changing_operators(
         || is_coalesce_partitions(&distribution_context.plan)
         || is_sort_preserving_merge(&distribution_context.plan)
     {
+        // A fetch carries global limit semantics, not just a distribution
+        // change, so fetch-carrying operators must be kept.
+        if distribution_context.plan.fetch().is_some() {
+            break;
+        }
         // All of above operators have a single child. First child is only child.
         // Remove any distribution changing operators at the beginning:
         distribution_context = distribution_context.children.swap_remove(0);
