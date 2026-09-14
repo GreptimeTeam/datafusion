@@ -176,8 +176,8 @@ fn update_coalesce_ctx_children(
         // Plan has no children, it cannot be a `CoalescePartitionsExec`.
         false
     } else if is_coalesce_partitions(&coalesce_context.plan) {
-        // Initiate a connection:
-        true
+        // A fetched coalesce enforces a limit, not a removable bottleneck.
+        coalesce_context.plan.fetch().is_none()
     } else {
         children.iter().enumerate().any(|(idx, node)| {
             // Only consider operators that don't require a single partition,
@@ -681,7 +681,7 @@ fn remove_bottleneck_in_subplan(
 ) -> Result<PlanWithCorrespondingCoalescePartitions> {
     let plan = &requirements.plan;
     let children = &mut requirements.children;
-    if is_coalesce_partitions(&children[0].plan) {
+    if children[0].data && is_coalesce_partitions(&children[0].plan) {
         // We can safely use the 0th index since we have a `CoalescePartitionsExec`.
         let mut new_child_node = children[0].children.swap_remove(0);
         while new_child_node.plan.output_partitioning() == plan.output_partitioning()

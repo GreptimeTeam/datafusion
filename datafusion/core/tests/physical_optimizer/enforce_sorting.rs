@@ -2849,3 +2849,190 @@ async fn test_sort_with_streaming_table() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fetched_coalesce_is_not_a_sort_parallelization_bottleneck() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for inner_fetch in [0, 1] {
+        for outer_fetch in [None, Some(2)] {
+            let inner = Arc::new(
+                CoalescePartitionsExec::new(input.clone()).with_fetch(Some(inner_fetch)),
+            );
+            let mut plan =
+                Arc::new(CoalescePartitionsExec::new(inner).with_fetch(outer_fetch))
+                    as Arc<dyn ExecutionPlan>;
+            for pass in 0..=2 {
+                if pass > 0 {
+                    plan = EnforceSorting::new().optimize(plan, &ConfigOptions::new())?;
+                }
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    inner_fetch,
+                    "inner_fetch={inner_fetch}, outer_fetch={outer_fetch:?}, pass={pass}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_is_preserved_in_a_connected_union_branch() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+    use datafusion_physical_plan::union::UnionExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for fetch in [0, 1] {
+        let union = UnionExec::try_new(vec![
+            Arc::new(CoalescePartitionsExec::new(input.clone()).with_fetch(Some(fetch))),
+            Arc::new(CoalescePartitionsExec::new(input.clone())),
+        ])?;
+        let mut plan =
+            Arc::new(CoalescePartitionsExec::new(union)) as Arc<dyn ExecutionPlan>;
+        for pass in 0..=2 {
+            if pass > 0 {
+                plan = EnforceSorting::new().optimize(plan, &ConfigOptions::new())?;
+            }
+            let batches = datafusion_physical_plan::collect(
+                plan.clone(),
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                fetch + 9,
+                "fetch={fetch}, pass={pass}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_below_larger_topk_survives_optimization() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let first_batch = record_batch!(("a", Int32, [1, 100]))?;
+    let second_batch = record_batch!(("a", Int32, [2, 200]))?;
+    let schema = first_batch.schema();
+    let ordering: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+    let input = Arc::new(
+        TestMemoryExec::try_new(&[vec![first_batch], vec![second_batch]], schema, None)?
+            .try_with_sort_information(vec![ordering.clone()])?,
+    );
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 2;
+
+    for inner_fetch in [0, 1] {
+        for outer_fetch in [1, 2] {
+            let coalesce = Arc::new(
+                CoalescePartitionsExec::new(input.clone()).with_fetch(Some(inner_fetch)),
+            );
+            let mut plan = Arc::new(
+                SortExec::new(ordering.clone(), coalesce).with_fetch(Some(outer_fetch)),
+            ) as Arc<dyn ExecutionPlan>;
+
+            let batches = datafusion_physical_plan::collect(
+                plan.clone(),
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                inner_fetch,
+                "inner_fetch={inner_fetch}, outer_fetch={outer_fetch}, initial"
+            );
+
+            for cycle in 1..=2 {
+                plan = EnforceDistribution::new().optimize(plan, &config)?;
+                plan = EnforceSorting::new().optimize(plan, &config)?;
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    inner_fetch,
+                    "inner_fetch={inner_fetch}, outer_fetch={outer_fetch}, cycle={cycle}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_keeps_selection_before_descending_sort() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let batch = record_batch!(("a", Int32, [1, 100]))?;
+    let schema = batch.schema();
+    let ascending: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+    let descending: LexOrdering = [PhysicalSortExpr::new(
+        col("a", &schema)?,
+        SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    )]
+    .into();
+    let input = Arc::new(
+        TestMemoryExec::try_new(&[vec![batch]], schema, None)?
+            .try_with_sort_information(vec![ascending])?,
+    );
+    let inner = Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1)));
+    let mut plan = Arc::new(SortExec::new(descending, inner).with_fetch(Some(1)))
+        as Arc<dyn ExecutionPlan>;
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 2;
+    for pass in 0..=2 {
+        if pass > 0 {
+            plan = EnforceDistribution::new().optimize(plan, &config)?;
+            plan = EnforceSorting::new().optimize(plan, &config)?;
+        }
+        let batches = datafusion_physical_plan::collect(
+            plan.clone(),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1], "pass={pass}");
+    }
+    Ok(())
+}

@@ -3628,40 +3628,136 @@ fn get_schema() -> SchemaRef {
 }
 #[test]
 fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
-    // Create a base plan
-    let parquet_exec = parquet_exec();
+    for fetch in [None, Some(0), Some(5)] {
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
+        let input = parquet_exec_with_sort(schema(), vec![ordering.clone()]);
+        let spm = Arc::new(
+            SortPreservingMergeExec::new(ordering.clone(), input.clone())
+                .with_fetch(fetch),
+        );
+        let context = DistributionContext::new(
+            spm,
+            true,
+            vec![DistributionContext::new(input, false, vec![])],
+        );
+        let result = replace_order_preserving_variants(context)?;
+        if fetch.is_some() {
+            let merge = result
+                .plan
+                .as_any()
+                .downcast_ref::<SortPreservingMergeExec>()
+                .expect("A fetched merge must retain its ordered row selection");
+            assert_eq!(merge.expr(), &ordering);
+        } else {
+            assert!(result.plan.as_any().is::<CoalescePartitionsExec>());
+        }
+        assert_eq!(result.plan.fetch(), fetch);
+    }
+    Ok(())
+}
 
-    let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("id", 0)));
+#[tokio::test]
+async fn fetch_coalesce_survives_distribution_rewrites() -> Result<()> {
+    use arrow::array::Int32Array;
+    use datafusion::execution::TaskContext;
+    use datafusion_physical_plan::test::TestMemoryExec;
 
-    // Create a SortPreservingMergeExec with fetch=5
-    let spm_exec = Arc::new(
-        SortPreservingMergeExec::new([sort_expr].into(), parquet_exec.clone())
-            .with_fetch(Some(5)),
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 1, 1]))],
+    )?;
+    for partitions in [1, 3] {
+        for fetch in [0, 1] {
+            let input = Arc::new(TestMemoryExec::try_new(
+                &vec![vec![batch.clone()]; partitions],
+                schema.clone(),
+                None,
+            )?);
+            let mut plan =
+                Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(fetch)))
+                    as Arc<dyn ExecutionPlan>;
+            let mut config = ConfigOptions::new();
+            config.execution.target_partitions = 3;
+            for pass in 0..=2 {
+                if pass > 0 {
+                    plan = EnforceDistribution::new().optimize(plan, &config)?;
+                }
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    fetch,
+                    "partitions={partitions}, fetch={fetch}, pass={pass}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_spm_preserves_selected_rows_under_unordered_parent() -> Result<()> {
+    use arrow::array::Int32Array;
+    use datafusion::execution::TaskContext;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    // Whichever batch an unordered coalesce receives first has a losing row.
+    // Only the ordered merge selects [1, 2], so this is scheduler-independent.
+    let partitions = [vec![1, 100], vec![2, 200]]
+        .into_iter()
+        .map(|values| {
+            Ok(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(values))],
+            )?])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordering: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+    let input = Arc::new(
+        TestMemoryExec::try_new(&partitions, schema, None)?
+            .try_with_sort_information(vec![ordering.clone()])?,
     );
-
-    // Create distribution context
-    let dist_context = DistributionContext::new(
-        spm_exec,
-        true,
-        vec![DistributionContext::new(parquet_exec, false, vec![])],
-    );
-
-    // Apply the function
-    let result = replace_order_preserving_variants(dist_context)?;
-
-    // Verify the plan was transformed to CoalescePartitionsExec
-    result
-        .plan
-        .as_any()
-        .downcast_ref::<CoalescePartitionsExec>()
-        .expect("Expected CoalescePartitionsExec");
-
-    // Verify fetch was preserved
-    assert_eq!(
-        result.plan.fetch(),
-        Some(5),
-        "Fetch value was not preserved after transformation"
-    );
-
+    let spm = Arc::new(SortPreservingMergeExec::new(ordering, input).with_fetch(Some(2)));
+    let mut plan = Arc::new(AggregateExec::try_new(
+        AggregateMode::Single,
+        PhysicalGroupBy::new_single(vec![(col("a", &spm.schema())?, "a".to_string())]),
+        vec![],
+        vec![],
+        spm.clone(),
+        spm.schema(),
+    )?) as Arc<dyn ExecutionPlan>;
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 2;
+    for pass in 0..=2 {
+        if pass > 0 {
+            plan = EnforceDistribution::new().optimize(plan, &config)?;
+        }
+        let batches = datafusion_physical_plan::collect(
+            plan.clone(),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2], "pass={pass}");
+    }
     Ok(())
 }
