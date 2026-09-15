@@ -19,8 +19,14 @@
 
 use crate::error::_exec_datafusion_err;
 use crate::{HashSet, Result};
-use arrow::array::ArrayData;
+use arrow::array::{
+    Array, ArrayData, AsArray, GenericByteArray, GenericByteViewArray, GenericListArray,
+    OffsetSizeTrait,
+};
+use arrow::buffer::{Buffer, NullBuffer};
+use arrow::datatypes::{ByteArrayType, ByteViewType, DataType};
 use arrow::record_batch::RecordBatch;
+use arrow::{downcast_dictionary_array, downcast_primitive_array};
 use std::mem::size_of;
 use std::num::NonZero;
 
@@ -151,7 +157,7 @@ pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
 pub struct RecordBatchMemoryCounter {
     /// Start addresses of `Buffer`s that have already been counted (instead of
     /// actual used data region's pointer represented by current `Array`)
-    counted_buffers: HashSet<NonZero<usize>>,
+    counted_buffers: CountedBuffers,
     /// Total memory of all unique buffers counted so far
     memory_usage: usize,
 }
@@ -167,9 +173,8 @@ impl RecordBatchMemoryCounter {
         let mut total_size = 0;
 
         for array in batch.columns() {
-            let array_data = array.to_data();
-            count_array_data_memory_size(
-                &array_data,
+            count_array_memory_size(
+                array.as_ref(),
                 &mut self.counted_buffers,
                 &mut total_size,
             );
@@ -185,23 +190,189 @@ impl RecordBatchMemoryCounter {
     }
 }
 
+/// Number of buffer addresses kept inline before falling back to hashing.
+///
+/// A single batch usually stays under this, and a linear scan over that many
+/// `usize`s is cheaper than hashing and needs no allocation. Anything above it
+/// (wide batches, or a counter accumulating many batches) goes to the hash set.
+const INLINE_BUFFER_ADDRS: usize = 32;
+
+/// Start addresses of the `Buffer` allocations counted so far.
+#[derive(Debug)]
+struct CountedBuffers {
+    inline: [usize; INLINE_BUFFER_ADDRS],
+    inline_len: usize,
+    spilled: HashSet<NonZero<usize>>,
+}
+
+impl Default for CountedBuffers {
+    fn default() -> Self {
+        Self {
+            inline: [0; INLINE_BUFFER_ADDRS],
+            inline_len: 0,
+            spilled: HashSet::default(),
+        }
+    }
+}
+
+impl CountedBuffers {
+    /// Records `addr`, returning `true` if it had not been counted before.
+    fn insert(&mut self, addr: NonZero<usize>) -> bool {
+        if self.inline[..self.inline_len].contains(&addr.get()) {
+            return false;
+        }
+
+        if self.inline_len < INLINE_BUFFER_ADDRS {
+            self.inline[self.inline_len] = addr.get();
+            self.inline_len += 1;
+            return true;
+        }
+
+        self.spilled.insert(addr)
+    }
+}
+
+/// Add `buffer`'s allocation to `total_size` unless it was already counted.
+fn count_buffer(
+    buffer: &Buffer,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    if counted_buffers.insert(buffer.data_ptr().addr()) {
+        *total_size += buffer.capacity();
+    }
+}
+
+fn count_null_buffer(
+    nulls: Option<&NullBuffer>,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    if let Some(nulls) = nulls {
+        count_buffer(nulls.inner().inner(), counted_buffers, total_size);
+    }
+}
+
+fn count_byte_array<T: ByteArrayType>(
+    array: &GenericByteArray<T>,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    count_null_buffer(array.nulls(), counted_buffers, total_size);
+    count_buffer(array.offsets().inner().inner(), counted_buffers, total_size);
+    count_buffer(array.values(), counted_buffers, total_size);
+}
+
+fn count_byte_view_array<T: ByteViewType + ?Sized>(
+    array: &GenericByteViewArray<T>,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    count_null_buffer(array.nulls(), counted_buffers, total_size);
+    count_buffer(array.views().inner(), counted_buffers, total_size);
+    for buffer in array.data_buffers() {
+        count_buffer(buffer, counted_buffers, total_size);
+    }
+}
+
+fn count_list_array<O: OffsetSizeTrait>(
+    array: &GenericListArray<O>,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    count_null_buffer(array.nulls(), counted_buffers, total_size);
+    count_buffer(array.offsets().inner().inner(), counted_buffers, total_size);
+    count_array_memory_size(array.values(), counted_buffers, total_size);
+}
+
+/// Count the memory usage of `array` and its children recursively.
+///
+/// The buffers are read from the concrete array types instead of going through
+/// [`Array::to_data`], which allocates (and immediately drops) one [`ArrayData`]
+/// per array. Layouts that are not matched here still go through [`ArrayData`],
+/// so every array type stays supported.
+fn count_array_memory_size(
+    array: &dyn Array,
+    counted_buffers: &mut CountedBuffers,
+    total_size: &mut usize,
+) {
+    downcast_primitive_array!(
+        array => {
+            count_null_buffer(array.nulls(), counted_buffers, total_size);
+            count_buffer(array.values().inner(), counted_buffers, total_size);
+        }
+        DataType::Null => {}
+        DataType::Boolean => {
+            let array = array.as_boolean();
+            count_null_buffer(array.nulls(), counted_buffers, total_size);
+            count_buffer(array.values().inner(), counted_buffers, total_size);
+        }
+        DataType::Utf8 => {
+            count_byte_array(array.as_string::<i32>(), counted_buffers, total_size)
+        }
+        DataType::LargeUtf8 => {
+            count_byte_array(array.as_string::<i64>(), counted_buffers, total_size)
+        }
+        DataType::Binary => {
+            count_byte_array(array.as_binary::<i32>(), counted_buffers, total_size)
+        }
+        DataType::LargeBinary => {
+            count_byte_array(array.as_binary::<i64>(), counted_buffers, total_size)
+        }
+        DataType::Utf8View => {
+            count_byte_view_array(array.as_string_view(), counted_buffers, total_size)
+        }
+        DataType::BinaryView => {
+            count_byte_view_array(array.as_binary_view(), counted_buffers, total_size)
+        }
+        DataType::FixedSizeBinary(_) => {
+            let array = array.as_fixed_size_binary();
+            count_null_buffer(array.nulls(), counted_buffers, total_size);
+            count_buffer(array.values(), counted_buffers, total_size);
+        }
+        DataType::List(_) => {
+            count_list_array(array.as_list::<i32>(), counted_buffers, total_size)
+        }
+        DataType::LargeList(_) => {
+            count_list_array(array.as_list::<i64>(), counted_buffers, total_size)
+        }
+        DataType::Struct(_) => {
+            let array = array.as_struct();
+            count_null_buffer(array.nulls(), counted_buffers, total_size);
+            for child in array.columns() {
+                count_array_memory_size(child, counted_buffers, total_size);
+            }
+        }
+        DataType::Dictionary(_, _) => downcast_dictionary_array!(
+            array => {
+                let keys = array.keys();
+                count_null_buffer(keys.nulls(), counted_buffers, total_size);
+                count_buffer(keys.values().inner(), counted_buffers, total_size);
+                count_array_memory_size(array.values(), counted_buffers, total_size);
+            },
+            _ => count_array_data_memory_size(&array.to_data(), counted_buffers, total_size)
+        ),
+        _ => count_array_data_memory_size(
+            &array.to_data(),
+            counted_buffers,
+            total_size,
+        ),
+    )
+}
+
 /// Count the memory usage of `array_data` and its children recursively.
 fn count_array_data_memory_size(
     array_data: &ArrayData,
-    counted_buffers: &mut HashSet<NonZero<usize>>,
+    counted_buffers: &mut CountedBuffers,
     total_size: &mut usize,
 ) {
     // Count memory usage for `array_data`
     for buffer in array_data.buffers() {
-        if counted_buffers.insert(buffer.data_ptr().addr()) {
-            *total_size += buffer.capacity();
-        } // Otherwise the buffer's memory is already counted
+        count_buffer(buffer, counted_buffers, total_size);
     }
 
-    if let Some(null_buffer) = array_data.nulls()
-        && counted_buffers.insert(null_buffer.inner().inner().data_ptr().addr())
-    {
-        *total_size += null_buffer.inner().inner().capacity();
+    if let Some(null_buffer) = array_data.nulls() {
+        count_buffer(null_buffer.inner().inner(), counted_buffers, total_size);
     }
 
     // Count all children `ArrayData` recursively
@@ -390,5 +561,242 @@ mod record_batch_tests {
 
         let size = get_record_batch_memory_size(&batch);
         assert_eq!(size, 8208);
+    }
+}
+
+/// Differential tests pinning the direct-buffer walk to the [`ArrayData`] walk
+/// it replaced.
+#[cfg(test)]
+mod array_walk_tests {
+    use super::*;
+    use arrow::array::{
+        ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array,
+        DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Int32Array,
+        LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapBuilder,
+        NullArray, RunArray, StringArray, StringBuilder, StringViewArray, StructArray,
+        UInt32Array,
+    };
+    use arrow::datatypes::{Field, Int8Type, Int32Type, UInt32Type};
+    use std::collections::HashSet as StdHashSet;
+    use std::sync::Arc;
+
+    /// The pre-existing accounting walk, kept verbatim as the differential oracle.
+    fn reference_walk(
+        array_data: &ArrayData,
+        counted: &mut StdHashSet<NonZero<usize>>,
+        total_size: &mut usize,
+    ) {
+        for buffer in array_data.buffers() {
+            if counted.insert(buffer.data_ptr().addr()) {
+                *total_size += buffer.capacity();
+            }
+        }
+
+        if let Some(null_buffer) = array_data.nulls()
+            && counted.insert(null_buffer.inner().inner().data_ptr().addr())
+        {
+            *total_size += null_buffer.inner().inner().capacity();
+        }
+
+        for child in array_data.child_data() {
+            reference_walk(child, counted, total_size);
+        }
+    }
+
+    /// Accumulates `arrays` under one shared dedup state with both walks and
+    /// asserts they agree.
+    #[track_caller]
+    fn assert_matches_reference(arrays: &[ArrayRef]) {
+        let mut counted = CountedBuffers::default();
+        let mut actual = 0;
+        for array in arrays {
+            count_array_memory_size(array.as_ref(), &mut counted, &mut actual);
+        }
+
+        let mut reference_counted = StdHashSet::new();
+        let mut expected = 0;
+        for array in arrays {
+            reference_walk(&array.to_data(), &mut reference_counted, &mut expected);
+        }
+
+        let types: Vec<_> = arrays.iter().map(|a| a.data_type().clone()).collect();
+        assert_eq!(actual, expected, "mismatch for {types:?}");
+    }
+
+    fn string_dictionary(values: ArrayRef) -> ArrayRef {
+        let keys = UInt32Array::from(vec![Some(0), None, Some(2), Some(1)]);
+        Arc::new(DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap())
+    }
+
+    /// Arrays taking the direct-buffer path, each also in sliced form.
+    fn fast_path_arrays() -> Vec<ArrayRef> {
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            None,
+            Some("ccc"),
+            Some("d"),
+        ]));
+        let long_strings = [
+            "inline",
+            "a string long enough to spill out of the view inline prefix",
+            "another long string that lives in a data buffer",
+            "x",
+        ];
+
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])),
+            Arc::new(Decimal128Array::from(vec![1i128, 2, 3, 4])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                Some(false),
+                Some(true),
+            ])),
+            Arc::new(NullArray::new(4)),
+            Arc::clone(&strings),
+            Arc::new(LargeStringArray::from(vec![
+                Some("a"),
+                None,
+                Some("ccc"),
+                Some("d"),
+            ])),
+            Arc::new(BinaryArray::from_vec(vec![b"a", b"bb", b"ccc", b"d"])),
+            Arc::new(LargeBinaryArray::from_vec(vec![b"a", b"bb", b"ccc", b"d"])),
+            Arc::new(StringViewArray::from(long_strings.to_vec())),
+            Arc::new(BinaryViewArray::from(
+                long_strings
+                    .iter()
+                    .map(|s| s.as_bytes())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    [b"ab", b"cd", b"ef", b"gh"].into_iter(),
+                )
+                .unwrap(),
+            ),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3)]),
+                Some(vec![]),
+            ])),
+            Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![
+                    Some(vec![Some(1), Some(2)]),
+                    None,
+                    Some(vec![Some(3)]),
+                    Some(vec![]),
+                ],
+            )),
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("a", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)]))
+                        as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("b", DataType::Utf8, true)),
+                    Arc::clone(&strings),
+                ),
+            ])),
+            string_dictionary(Arc::clone(&strings)),
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    arrow::array::Int8Array::from(vec![0i8, 1, 2, 3]),
+                    Arc::clone(&strings),
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// Arrays whose layout is not matched directly and must fall back to the
+    /// [`ArrayData`] walk.
+    fn fallback_arrays() -> Vec<ArrayRef> {
+        let mut map_builder =
+            MapBuilder::new(None, StringBuilder::new(), Int32Array::builder(0));
+        for i in 0..4 {
+            map_builder.keys().append_value(format!("k{i}"));
+            map_builder.values().append_value(i);
+            map_builder.append(true).unwrap();
+        }
+
+        vec![
+            Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![
+                    Some(vec![Some(1), Some(2)]),
+                    None,
+                    Some(vec![Some(3), Some(4)]),
+                    Some(vec![Some(5), Some(6)]),
+                ],
+                2,
+            )),
+            Arc::new(
+                RunArray::<Int32Type>::try_new(
+                    &Int32Array::from(vec![2, 3, 4]),
+                    &StringArray::from(vec![Some("a"), None, Some("b")]),
+                )
+                .unwrap(),
+            ),
+            Arc::new(map_builder.finish()),
+        ]
+    }
+
+    #[test]
+    fn direct_walk_matches_array_data_walk() {
+        for array in fast_path_arrays().into_iter().chain(fallback_arrays()) {
+            assert_matches_reference(&[Arc::clone(&array)]);
+            assert_matches_reference(&[array.slice(1, 2)]);
+            // A slice and its parent share every buffer.
+            assert_matches_reference(&[array.slice(1, 2), Arc::clone(&array)]);
+        }
+    }
+
+    #[test]
+    fn direct_walk_matches_array_data_walk_for_mixed_batch() {
+        let mut arrays = fast_path_arrays();
+        arrays.extend(fallback_arrays());
+        // More than `INLINE_BUFFER_ADDRS` buffers, so the spilled hash set is used.
+        assert_matches_reference(&arrays);
+
+        // Re-counting after the spill must still deduplicate.
+        let repeated: Vec<_> = arrays
+            .iter()
+            .cloned()
+            .chain(arrays.iter().map(|a| a.slice(0, 2)))
+            .collect();
+        assert_matches_reference(&repeated);
+    }
+
+    #[test]
+    fn dictionaries_sharing_values_count_values_once() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["a", "bb", "ccc"]));
+        let left = string_dictionary(Arc::clone(&values));
+        let right = string_dictionary(Arc::clone(&values));
+
+        let mut counted = CountedBuffers::default();
+        let mut left_size = 0;
+        count_array_memory_size(left.as_ref(), &mut counted, &mut left_size);
+        let mut right_size = 0;
+        count_array_memory_size(right.as_ref(), &mut counted, &mut right_size);
+
+        let mut values_counted = CountedBuffers::default();
+        let mut values_size = 0;
+        count_array_memory_size(values.as_ref(), &mut values_counted, &mut values_size);
+
+        // The second dictionary only adds its own keys buffer and null buffer.
+        assert_eq!(left_size - right_size, values_size);
+    }
+
+    #[test]
+    fn counted_buffers_dedups_across_the_inline_boundary() {
+        let mut counted = CountedBuffers::default();
+        let addrs: Vec<_> = (1..=INLINE_BUFFER_ADDRS + 8)
+            .map(|addr| NonZero::new(addr).unwrap())
+            .collect();
+
+        assert!(addrs.iter().all(|addr| counted.insert(*addr)));
+        assert!(addrs.iter().all(|addr| !counted.insert(*addr)));
     }
 }
