@@ -29,39 +29,47 @@ use arrow::array::{
 use arrow::datatypes::UInt32Type;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::HashSet;
-use datafusion_common::utils::memory::get_record_batch_memory_size;
+use datafusion_common::utils::memory::{
+    RecordBatchMemoryCounter, get_record_batch_memory_size,
+};
 
 /// The accounting walk as it was before the direct-buffer rewrite, so both
 /// variants are measured in the same binary against the same fixtures.
-fn baseline_get_record_batch_memory_size(batch: &RecordBatch) -> usize {
-    fn count_array_data(
-        array_data: &ArrayData,
-        counted_buffers: &mut HashSet<NonZero<usize>>,
-        total_size: &mut usize,
-    ) {
-        for buffer in array_data.buffers() {
-            if counted_buffers.insert(buffer.data_ptr().addr()) {
-                *total_size += buffer.capacity();
-            }
-        }
-
-        if let Some(null_buffer) = array_data.nulls()
-            && counted_buffers.insert(null_buffer.inner().inner().data_ptr().addr())
-        {
-            *total_size += null_buffer.inner().inner().capacity();
-        }
-
-        for child in array_data.child_data() {
-            count_array_data(child, counted_buffers, total_size);
+fn baseline_count_array_data(
+    array_data: &ArrayData,
+    counted_buffers: &mut HashSet<NonZero<usize>>,
+    total_size: &mut usize,
+) {
+    for buffer in array_data.buffers() {
+        if counted_buffers.insert(buffer.data_ptr().addr()) {
+            *total_size += buffer.capacity();
         }
     }
 
-    let mut counted_buffers = HashSet::default();
+    if let Some(null_buffer) = array_data.nulls()
+        && counted_buffers.insert(null_buffer.inner().inner().data_ptr().addr())
+    {
+        *total_size += null_buffer.inner().inner().capacity();
+    }
+
+    for child in array_data.child_data() {
+        baseline_count_array_data(child, counted_buffers, total_size);
+    }
+}
+
+fn baseline_count_batch(
+    batch: &RecordBatch,
+    counted_buffers: &mut HashSet<NonZero<usize>>,
+) -> usize {
     let mut total_size = 0;
     for array in batch.columns() {
-        count_array_data(&array.to_data(), &mut counted_buffers, &mut total_size);
+        baseline_count_array_data(&array.to_data(), counted_buffers, &mut total_size);
     }
     total_size
+}
+
+fn baseline_get_record_batch_memory_size(batch: &RecordBatch) -> usize {
+    baseline_count_batch(batch, &mut HashSet::default())
 }
 
 fn batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
@@ -186,5 +194,38 @@ fn bench_shared_slices(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_single_batch, bench_shared_slices);
+/// One counter accumulating many batches, as the hash join build side does.
+/// Distinct buffers push it past the inline capacity on the first batches.
+fn bench_accumulating_counter(c: &mut Criterion) {
+    let batches: Vec<RecordBatch> = (0..64).map(|_| promql_batch(1024, 4)).collect();
+
+    let mut group = c.benchmark_group("record_batch_memory_size/accumulating_counter");
+    group.bench_function("baseline", |b| {
+        b.iter(|| {
+            let mut counted = HashSet::default();
+            let total: usize = black_box(&batches)
+                .iter()
+                .map(|batch| baseline_count_batch(batch, &mut counted))
+                .sum();
+            black_box(total)
+        })
+    });
+    group.bench_function("direct", |b| {
+        b.iter(|| {
+            let mut counter = RecordBatchMemoryCounter::new();
+            for batch in black_box(&batches) {
+                counter.count_batch(batch);
+            }
+            black_box(counter.memory_usage())
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_single_batch,
+    bench_shared_slices,
+    bench_accumulating_counter
+);
 criterion_main!(benches);

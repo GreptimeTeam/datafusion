@@ -198,19 +198,23 @@ impl RecordBatchMemoryCounter {
 const INLINE_BUFFER_ADDRS: usize = 32;
 
 /// Start addresses of the `Buffer` allocations counted so far.
+// The inline variant is deliberately large: holding the addresses inline is the
+// point, and boxing them would put back the allocation this avoids.
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
-struct CountedBuffers {
-    inline: [usize; INLINE_BUFFER_ADDRS],
-    inline_len: usize,
-    spilled: HashSet<NonZero<usize>>,
+enum CountedBuffers {
+    Inline {
+        addrs: [NonZero<usize>; INLINE_BUFFER_ADDRS],
+        len: usize,
+    },
+    Spilled(HashSet<NonZero<usize>>),
 }
 
 impl Default for CountedBuffers {
     fn default() -> Self {
-        Self {
-            inline: [0; INLINE_BUFFER_ADDRS],
-            inline_len: 0,
-            spilled: HashSet::default(),
+        Self::Inline {
+            addrs: [NonZero::<usize>::MIN; INLINE_BUFFER_ADDRS],
+            len: 0,
         }
     }
 }
@@ -218,17 +222,25 @@ impl Default for CountedBuffers {
 impl CountedBuffers {
     /// Records `addr`, returning `true` if it had not been counted before.
     fn insert(&mut self, addr: NonZero<usize>) -> bool {
-        if self.inline[..self.inline_len].contains(&addr.get()) {
-            return false;
+        match self {
+            Self::Inline { addrs, len } => {
+                if addrs[..*len].contains(&addr) {
+                    return false;
+                }
+                if *len < INLINE_BUFFER_ADDRS {
+                    addrs[*len] = addr;
+                    *len += 1;
+                    return true;
+                }
+                // Past the inline capacity the scan would run on every insert
+                // for the rest of this counter's life, so switch over for good.
+                let mut spilled: HashSet<_> = addrs.iter().copied().collect();
+                spilled.insert(addr);
+                *self = Self::Spilled(spilled);
+                true
+            }
+            Self::Spilled(spilled) => spilled.insert(addr),
         }
-
-        if self.inline_len < INLINE_BUFFER_ADDRS {
-            self.inline[self.inline_len] = addr.get();
-            self.inline_len += 1;
-            return true;
-        }
-
-        self.spilled.insert(addr)
     }
 }
 
@@ -243,12 +255,19 @@ fn count_buffer(
     }
 }
 
+/// Count a validity buffer the way [`ArrayData`] does.
+///
+/// An array can carry a validity buffer with no nulls in it, typically after
+/// slicing away the null entries. [`ArrayDataBuilder::build`] drops such a
+/// buffer, so counting it here would change the reported size.
+///
+/// [`ArrayDataBuilder::build`]: arrow::array::ArrayDataBuilder::build
 fn count_null_buffer(
     nulls: Option<&NullBuffer>,
     counted_buffers: &mut CountedBuffers,
     total_size: &mut usize,
 ) {
-    if let Some(nulls) = nulls {
+    if let Some(nulls) = nulls.filter(|nulls| nulls.null_count() != 0) {
         count_buffer(nulls.inner().inner(), counted_buffers, total_size);
     }
 }
@@ -604,9 +623,10 @@ mod array_walk_tests {
     }
 
     /// Accumulates `arrays` under one shared dedup state with both walks and
-    /// asserts they agree.
+    /// asserts they agree. Returns the dedup state so callers can check which
+    /// representation it ended up in.
     #[track_caller]
-    fn assert_matches_reference(arrays: &[ArrayRef]) {
+    fn assert_matches_reference(arrays: &[ArrayRef]) -> CountedBuffers {
         let mut counted = CountedBuffers::default();
         let mut actual = 0;
         for array in arrays {
@@ -621,6 +641,7 @@ mod array_walk_tests {
 
         let types: Vec<_> = arrays.iter().map(|a| a.data_type().clone()).collect();
         assert_eq!(actual, expected, "mismatch for {types:?}");
+        counted
     }
 
     fn string_dictionary(values: ArrayRef) -> ArrayRef {
@@ -748,17 +769,38 @@ mod array_walk_tests {
         for array in fast_path_arrays().into_iter().chain(fallback_arrays()) {
             assert_matches_reference(&[Arc::clone(&array)]);
             assert_matches_reference(&[array.slice(1, 2)]);
+            // The nulls in the test arrays sit at index 1, so this slice keeps a
+            // validity buffer that holds no nulls.
+            assert_matches_reference(&[array.slice(2, 2)]);
             // A slice and its parent share every buffer.
             assert_matches_reference(&[array.slice(1, 2), Arc::clone(&array)]);
         }
     }
 
     #[test]
+    fn all_valid_slice_does_not_count_its_validity_buffer() {
+        let array = Int32Array::from(vec![None, Some(2), Some(3)]);
+        let slice = array.slice(1, 2);
+        assert_eq!(slice.nulls().map(NullBuffer::null_count), Some(0));
+
+        let batch =
+            RecordBatch::try_from_iter(vec![("ints", Arc::new(slice) as ArrayRef)])
+                .unwrap();
+
+        // Only the 12-byte values buffer of the parent array; the validity
+        // buffer that `ArrayData` drops would add another 64 bytes.
+        assert_eq!(get_record_batch_memory_size(&batch), 12);
+    }
+
+    #[test]
     fn direct_walk_matches_array_data_walk_for_mixed_batch() {
         let mut arrays = fast_path_arrays();
         arrays.extend(fallback_arrays());
-        // More than `INLINE_BUFFER_ADDRS` buffers, so the spilled hash set is used.
-        assert_matches_reference(&arrays);
+        let counted = assert_matches_reference(&arrays);
+        assert!(
+            matches!(counted, CountedBuffers::Spilled(_)),
+            "the mixed batch no longer exercises the spilled hash set"
+        );
 
         // Re-counting after the spill must still deduplicate.
         let repeated: Vec<_> = arrays
