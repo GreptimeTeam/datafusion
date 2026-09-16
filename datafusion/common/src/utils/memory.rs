@@ -192,15 +192,16 @@ impl RecordBatchMemoryCounter {
 
 /// Number of buffer addresses kept inline before falling back to hashing.
 ///
-/// A single batch usually stays under this, and a linear scan over that many
-/// `usize`s is cheaper than hashing and needs no allocation. Anything above it
-/// (wide batches, or a counter accumulating many batches) goes to the hash set.
-const INLINE_BUFFER_ADDRS: usize = 32;
+/// A linear scan over this many `usize`s beats hashing and needs no allocation,
+/// but the array is zero-initialized on every call, so a larger capacity is not
+/// free for narrow batches. Spilling costs far more than the extra slots: a
+/// 20-buffer batch measures 237 ns at a capacity of 16 and 120 ns at 24, while
+/// a 2-buffer batch goes from 10.1 ns at 24 to 13.7 ns at 64. This covers the
+/// batch shapes seen in practice (a 20-column primitive batch, a timestamp plus
+/// value plus eight dictionary tags) with nothing to gain above it.
+const INLINE_BUFFER_ADDRS: usize = 24;
 
 /// Start addresses of the `Buffer` allocations counted so far.
-// The inline variant is deliberately large: holding the addresses inline is the
-// point, and boxing them would put back the allocation this avoids.
-#[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum CountedBuffers {
     // Plain `usize` rather than `NonZero<usize>` so that the unused slots are
