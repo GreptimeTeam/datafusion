@@ -199,25 +199,32 @@ fn bench_shared_slices(c: &mut Criterion) {
 fn bench_accumulating_counter(c: &mut Criterion) {
     let batches: Vec<RecordBatch> = (0..64).map(|_| promql_batch(1024, 4)).collect();
 
+    let accumulate_baseline = |batches: &[RecordBatch]| {
+        let mut counted = HashSet::default();
+        batches
+            .iter()
+            .map(|batch| baseline_count_batch(batch, &mut counted))
+            .sum::<usize>()
+    };
+    let accumulate_direct = |batches: &[RecordBatch]| {
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in batches {
+            counter.count_batch(batch);
+        }
+        counter.memory_usage()
+    };
+    assert_eq!(
+        accumulate_direct(&batches),
+        accumulate_baseline(&batches),
+        "the accumulated totals disagree with the baseline walk"
+    );
+
     let mut group = c.benchmark_group("record_batch_memory_size/accumulating_counter");
     group.bench_function("baseline", |b| {
-        b.iter(|| {
-            let mut counted = HashSet::default();
-            let total: usize = black_box(&batches)
-                .iter()
-                .map(|batch| baseline_count_batch(batch, &mut counted))
-                .sum();
-            black_box(total)
-        })
+        b.iter(|| black_box(accumulate_baseline(black_box(&batches))))
     });
     group.bench_function("direct", |b| {
-        b.iter(|| {
-            let mut counter = RecordBatchMemoryCounter::new();
-            for batch in black_box(&batches) {
-                counter.count_batch(batch);
-            }
-            black_box(counter.memory_usage())
-        })
+        b.iter(|| black_box(accumulate_direct(black_box(&batches))))
     });
     group.finish();
 }

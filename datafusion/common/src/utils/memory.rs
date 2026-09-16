@@ -203,17 +203,19 @@ const INLINE_BUFFER_ADDRS: usize = 32;
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum CountedBuffers {
+    // Plain `usize` rather than `NonZero<usize>` so that the unused slots are
+    // all-zero bytes and the array zero-initializes as one memset.
     Inline {
-        addrs: [NonZero<usize>; INLINE_BUFFER_ADDRS],
+        addrs: [usize; INLINE_BUFFER_ADDRS],
         len: usize,
     },
-    Spilled(HashSet<NonZero<usize>>),
+    Spilled(HashSet<usize>),
 }
 
 impl Default for CountedBuffers {
     fn default() -> Self {
         Self::Inline {
-            addrs: [NonZero::<usize>::MIN; INLINE_BUFFER_ADDRS],
+            addrs: [0; INLINE_BUFFER_ADDRS],
             len: 0,
         }
     }
@@ -222,6 +224,7 @@ impl Default for CountedBuffers {
 impl CountedBuffers {
     /// Records `addr`, returning `true` if it had not been counted before.
     fn insert(&mut self, addr: NonZero<usize>) -> bool {
+        let addr = addr.get();
         match self {
             Self::Inline { addrs, len } => {
                 if addrs[..*len].contains(&addr) {
