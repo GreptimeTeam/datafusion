@@ -2326,13 +2326,27 @@ async fn collect_left_input(
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
             let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
                 let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?
+                        // Each build row also owns an index in the duplicate-key chain.
+                        .checked_add(num_rows * size_of::<u64>())
+                        .ok_or_else(|| {
+                            datafusion_common::exec_datafusion_err!(
+                                "Hash join table size overflow"
+                            )
+                        })?;
                 reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU64::with_capacity(num_rows))
             } else {
                 let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?
+                        // Each build row also owns an index in the duplicate-key chain.
+                        .checked_add(num_rows * size_of::<u32>())
+                        .ok_or_else(|| {
+                            datafusion_common::exec_datafusion_err!(
+                                "Hash join table size overflow"
+                            )
+                        })?;
                 reservation.try_grow(estimated_hashtable_size)?;
                 metrics.build_mem_used.add(estimated_hashtable_size);
                 Box::new(JoinHashMapU32::with_capacity(num_rows))
@@ -2433,6 +2447,38 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_map_admits_row_indices_before_allocation() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+        let rows = 1024;
+        let buckets =
+            estimate_memory_size::<(u32, u64)>(rows, size_of::<JoinHashMapU32>())?;
+        let bytes = buckets + rows * size_of::<u32>();
+        for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let mut reservation = MemoryConsumer::new("row indices").register(&pool);
+            let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+            let result = new_join_hashmap(rows, &mut reservation, &metrics);
+            if succeeds {
+                let map = result?;
+                assert_eq!(reservation.size(), bytes);
+                assert_eq!(metrics.build_mem_used.value(), bytes);
+                drop(map);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(datafusion_common::DataFusionError::ResourcesExhausted(_))
+                ));
+                assert_eq!(reservation.size(), 0);
+                assert_eq!(metrics.build_mem_used.value(), 0);
+            }
+            drop(reservation);
+            assert_eq!(pool.reserved(), 0);
+        }
+        Ok(())
+    }
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
