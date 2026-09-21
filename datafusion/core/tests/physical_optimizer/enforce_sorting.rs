@@ -62,7 +62,7 @@ use datafusion_physical_optimizer::projection_pushdown::ProjectionPushdown;
 use datafusion_physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion::prelude::*;
-use arrow::array::{record_batch, Array, ArrayRef, Int32Array, RecordBatch};
+use arrow::array::{record_batch, Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{Field};
 use arrow_schema::Schema;
 use datafusion_execution::TaskContext;
@@ -3490,6 +3490,360 @@ async fn test_passthrough_wrapper_projection_keeps_ordering() -> Result<()> {
         sort_satisfied,
         "sort should be satisfied, ordering: {ordering}\nplan:\n{plan_str}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_is_not_a_sort_parallelization_bottleneck() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for inner_fetch in [0, 1] {
+        for outer_fetch in [None, Some(2)] {
+            let inner = Arc::new(
+                CoalescePartitionsExec::new(input.clone()).with_fetch(Some(inner_fetch)),
+            );
+            let mut plan =
+                Arc::new(CoalescePartitionsExec::new(inner).with_fetch(outer_fetch))
+                    as Arc<dyn ExecutionPlan>;
+            for pass in 0..=2 {
+                if pass > 0 {
+                    plan = EnsureRequirements::new()
+                        .optimize(plan, &ConfigOptions::new())?;
+                }
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    inner_fetch,
+                    "inner_fetch={inner_fetch}, outer_fetch={outer_fetch:?}, pass={pass}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_is_preserved_in_a_connected_union_branch() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+    use datafusion_physical_plan::union::UnionExec;
+
+    let batch = record_batch!(("a", Int32, [1, 2, 3]))?;
+    let input = Arc::new(TestMemoryExec::try_new(
+        &vec![vec![batch.clone()]; 3],
+        batch.schema(),
+        None,
+    )?);
+    for fetch in [0, 1] {
+        let union = UnionExec::try_new(vec![
+            Arc::new(CoalescePartitionsExec::new(input.clone()).with_fetch(Some(fetch))),
+            Arc::new(CoalescePartitionsExec::new(input.clone())),
+        ])?;
+        let mut plan =
+            Arc::new(CoalescePartitionsExec::new(union)) as Arc<dyn ExecutionPlan>;
+        for pass in 0..=2 {
+            if pass > 0 {
+                plan = EnsureRequirements::new().optimize(plan, &ConfigOptions::new())?;
+            }
+            let batches = datafusion_physical_plan::collect(
+                plan.clone(),
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                fetch + 9,
+                "fetch={fetch}, pass={pass}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_below_larger_topk_survives_optimization() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let first_batch = record_batch!(("a", Int32, [1, 100]))?;
+    let second_batch = record_batch!(("a", Int32, [2, 200]))?;
+    let schema = first_batch.schema();
+    let ordering: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+    let input = Arc::new(
+        TestMemoryExec::try_new(&[vec![first_batch], vec![second_batch]], schema, None)?
+            .try_with_sort_information(vec![ordering.clone()])?,
+    );
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 2;
+
+    for inner_fetch in [0, 1] {
+        for outer_fetch in [1, 2] {
+            let coalesce = Arc::new(
+                CoalescePartitionsExec::new(input.clone()).with_fetch(Some(inner_fetch)),
+            );
+            let mut plan = Arc::new(
+                SortExec::new(ordering.clone(), coalesce).with_fetch(Some(outer_fetch)),
+            ) as Arc<dyn ExecutionPlan>;
+
+            let batches = datafusion_physical_plan::collect(
+                plan.clone(),
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                inner_fetch,
+                "inner_fetch={inner_fetch}, outer_fetch={outer_fetch}, initial"
+            );
+
+            for cycle in 1..=2 {
+                plan = EnsureRequirements::new().optimize(plan, &config)?;
+                let batches = datafusion_physical_plan::collect(
+                    plan.clone(),
+                    Arc::new(TaskContext::default()),
+                )
+                .await?;
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    inner_fetch,
+                    "inner_fetch={inner_fetch}, outer_fetch={outer_fetch}, cycle={cycle}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_coalesce_keeps_selection_before_descending_sort() -> Result<()> {
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion_physical_plan::test::TestMemoryExec;
+
+    let batch = record_batch!(("a", Int32, [1, 100]))?;
+    let schema = batch.schema();
+    let ascending: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+    let descending: LexOrdering = [PhysicalSortExpr::new(
+        col("a", &schema)?,
+        SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    )]
+    .into();
+    let input = Arc::new(
+        TestMemoryExec::try_new(&[vec![batch]], schema, None)?
+            .try_with_sort_information(vec![ascending])?,
+    );
+    let inner = Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1)));
+    let mut plan = Arc::new(SortExec::new(descending, inner).with_fetch(Some(1)))
+        as Arc<dyn ExecutionPlan>;
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 2;
+    for pass in 0..=2 {
+        if pass > 0 {
+            plan = EnsureRequirements::new().optimize(plan, &config)?;
+        }
+        let batches = datafusion_physical_plan::collect(
+            plan.clone(),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1], "pass={pass}");
+    }
+    Ok(())
+}
+
+/// Regression for the GreptimeDB global-limit-over-DISTINCT shape: a fetched
+/// `CoalescePartitionsExec` buried under an empty projection below a
+/// `LocalLimitExec` (inside a multi-partition aggregation) must survive
+/// repeated *full* `PhysicalOptimizer` passes; otherwise `COUNT(*)` above it
+/// silently changes its result (1 becomes 3). The real GreptimeDB plan only
+/// lost its global limit on a re-optimization pass, so the entire rule list is
+/// applied twice and the optimized plan is executed after each pass.
+/// See https://github.com/GreptimeTeam/greptimedb/pull/9071.
+#[tokio::test]
+async fn greptime_shape_fetched_coalesce_survives_two_passes() -> Result<()> {
+    use datafusion_common::utils::expr::COUNT_STAR_EXPANSION;
+    use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_physical_expr::aggregate::{
+        AggregateExprBuilder, AggregateFunctionExpr,
+    };
+    use datafusion_physical_expr::expressions::lit;
+    use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion_physical_plan::aggregates::{
+        AggregateExec, AggregateMode, PhysicalGroupBy,
+    };
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+    // Three partitions of seven rows each, with a duplicate in every
+    // partition: each partition has the six DISTINCT tuples `(a..f, i, 1000*i)`
+    // below, so a lost global limit lets `COUNT(*)` count one DISTINCT row per
+    // partition (3 in total) instead of one row overall.
+    let batch = record_batch!(
+        ("host", Utf8, ["a", "b", "c", "d", "e", "f", "a"]),
+        ("cpu", Float64, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0]),
+        ("ts", Int64, [1000, 2000, 3000, 4000, 5000, 6000, 1000])
+    )?;
+    let schema = batch.schema();
+    let source = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[
+            vec![batch.clone()],
+            vec![batch.clone()],
+            vec![batch.clone()],
+        ],
+        Arc::clone(&schema),
+        None,
+    )?;
+
+    // The DISTINCT: GroupBy(host, cpu, ts) written as a multi-partition
+    // aggregation (Partial -> Hash repartition -> FinalPartitioned).
+    let distinct_partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::new_single(vec![
+            (col("host", &schema)?, "host".to_string()),
+            (col("cpu", &schema)?, "cpu".to_string()),
+            (col("ts", &schema)?, "ts".to_string()),
+        ]),
+        vec![],
+        vec![],
+        source,
+        Arc::clone(&schema),
+    )?);
+    let distinct_partial_schema = distinct_partial.schema();
+    let distinct_hash = Arc::new(RepartitionExec::try_new(
+        distinct_partial,
+        Partitioning::Hash(
+            vec![
+                col("host", &distinct_partial_schema)?,
+                col("cpu", &distinct_partial_schema)?,
+                col("ts", &distinct_partial_schema)?,
+            ],
+            3,
+        ),
+    )?);
+    let distinct_final = Arc::new(AggregateExec::try_new(
+        AggregateMode::FinalPartitioned,
+        PhysicalGroupBy::new_single(vec![
+            (col("host", &distinct_partial_schema)?, "host".to_string()),
+            (col("cpu", &distinct_partial_schema)?, "cpu".to_string()),
+            (col("ts", &distinct_partial_schema)?, "ts".to_string()),
+        ]),
+        vec![],
+        vec![],
+        distinct_hash,
+        distinct_partial_schema,
+    )?);
+
+    // `LIMIT 1` over the DISTINCT, followed by the empty projection
+    // (`expr=[]`) that the real GreptimeDB plan contains, and the *global*
+    // limit above it: this `fetch=1` is what the regression loses.
+    let local_limit = Arc::new(LocalLimitExec::new(distinct_final, 1));
+    let empty_projection = Arc::new(ProjectionExec::try_new(
+        Vec::<(Arc<dyn PhysicalExpr>, String)>::new(),
+        local_limit,
+    )?) as Arc<dyn ExecutionPlan>;
+    let global_limit =
+        Arc::new(CoalescePartitionsExec::new(empty_projection).with_fetch(Some(1)));
+
+    // `COUNT(*)` over the globally limited DISTINCT.
+    let count_input_schema = global_limit.schema();
+    let count_expr: Arc<AggregateFunctionExpr> = Arc::new(
+        AggregateExprBuilder::new(count_udaf(), vec![lit(COUNT_STAR_EXPANSION)])
+            .schema(Arc::clone(&count_input_schema))
+            .alias("count")
+            .build()?,
+    );
+    let count_partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        vec![Arc::clone(&count_expr)],
+        vec![None],
+        global_limit,
+        Arc::clone(&count_input_schema),
+    )?);
+    let count_partial_schema = count_partial.schema();
+    let count_repartition = Arc::new(RepartitionExec::try_new(
+        count_partial,
+        Partitioning::RoundRobinBatch(3),
+    )?);
+    let count_final = Arc::new(AggregateExec::try_new(
+        AggregateMode::Final,
+        PhysicalGroupBy::default(),
+        vec![Arc::clone(&count_expr)],
+        vec![None],
+        count_repartition,
+        count_partial_schema,
+    )?);
+    let mut plan = count_final as Arc<dyn ExecutionPlan>;
+
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 3;
+
+    for pass in 0..2 {
+        // Run the *full* physical optimizer rule list (not just
+        // `EnsureRequirements`), twice: this is how the real GreptimeDB plan
+        // reaches the failing state, where the plain coalesce inserted by
+        // distribution enforcement lets a later sorting traversal splice the
+        // fetched `CoalescePartitionsExec` below it out of the plan.
+        for rule in PhysicalOptimizer::new().rules {
+            plan = rule.optimize(plan, &config).unwrap_or_else(|e| {
+                panic!("pass={pass}: optimizer rule {} failed: {e}", rule.name())
+            });
+        }
+
+        let plan_string = get_plan_string(&plan).join("\n");
+
+        // Execute the optimized plan: the globally limited DISTINCT holds a
+        // single row, so `COUNT(*)` must be 1. Losing the global fetch makes
+        // the count 3 (one row per source partition).
+        let batches = datafusion_physical_plan::collect(
+            Arc::clone(&plan),
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        let count: i64 = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count column")
+                    .value(0)
+            })
+            .sum();
+        assert_eq!(
+            count, 1,
+            "pass={pass}: COUNT(*) over the globally limited DISTINCT must be 1:\n{plan_string}"
+        );
+    }
 
     Ok(())
 }
