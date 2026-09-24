@@ -186,6 +186,14 @@ impl RecordBatchMemoryCounter {
         self.memory_usage - previous_memory_usage
     }
 
+    /// Count `array`, returning the memory used by its buffers that have not
+    /// been counted before.
+    pub fn count_array(&mut self, array: &dyn Array) -> usize {
+        let previous_memory_usage = self.memory_usage;
+        self.count_array_memory_size(array);
+        self.memory_usage - previous_memory_usage
+    }
+
     /// Total memory of the unique buffers of all batches counted so far.
     pub fn memory_usage(&self) -> usize {
         self.memory_usage
@@ -481,6 +489,18 @@ mod record_batch_tests {
         let mut counter = RecordBatchMemoryCounter::new();
         counter.count_array_memory_size(array);
         assert_eq!(counter.memory_usage(), array_data_memory_size(array));
+    }
+
+    #[test]
+    fn test_count_array_counts_shared_buffers_once() {
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let size = array_data_memory_size(&array);
+
+        let mut counter = RecordBatchMemoryCounter::new();
+        assert_eq!(counter.count_array(&array), size);
+        // A slice shares the buffer that is already counted
+        assert_eq!(counter.count_array(&array.slice(1, 2)), 0);
+        assert_eq!(counter.memory_usage(), size);
     }
 
     #[test]
