@@ -511,6 +511,10 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
             + self.group_to_inner.capacity() * size_of::<usize>()
             + self.val_to_inner.capacity() * size_of::<usize>()
             + self.val_hashes.capacity() * size_of::<u64>()
+            + self
+                .cached_values
+                .as_ref()
+                .map_or(0, |values| values.get_array_memory_size())
             + self.null_array.get_array_memory_size()
             + size_of::<Self>()
     }
@@ -569,9 +573,6 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> GroupColumn
         self.value_dedup = HashTable::new();
         self.value_dedup_size = 0;
         self.null_inner_slot = None;
-        // `inner` slots are remapped below, so any cached `val_idx → slot`
-        // mapping is invalid and must be dropped.
-        self.cached_values = None;
         self.hash_values(&all_inner_values);
 
         for (new_slot, &old_slot) in new_to_old.iter().enumerate() {
@@ -739,6 +740,46 @@ mod tests {
             Int32Array::from(keys.to_vec()),
             Arc::clone(values),
         ))
+    }
+
+    #[test]
+    fn cached_values_are_retained_and_accounted_until_take_n() {
+        fn append_with_unreferenced_value(
+            value: &str,
+        ) -> (
+            DictionaryGroupValuesColumn<Int32Type>,
+            std::sync::Weak<dyn Array>,
+            usize,
+        ) {
+            let values: ArrayRef =
+                Arc::new(StringArray::from(vec![Some("a"), Some(value)]));
+            let weak_values = Arc::downgrade(&values);
+            let values_size = values.get_array_memory_size();
+            let input = dict_with_values(&[Some(0)], &values);
+            let mut column = col();
+            column.vectorized_append(&input, &[0]).unwrap();
+            drop(input);
+            drop(values);
+            (column, weak_values, values_size)
+        }
+
+        let (short, short_weak, short_array_size) = append_with_unreferenced_value("b");
+        let (mut long, long_weak, long_array_size) =
+            append_with_unreferenced_value(&"x".repeat(4096));
+
+        assert!(short_weak.upgrade().is_some());
+        assert!(long_weak.upgrade().is_some());
+        assert_eq!(
+            long.size() - short.size(),
+            long_array_size - short_array_size,
+            "the retained values-array size must be included in builder accounting"
+        );
+
+        let size_before_take = long.size();
+        let _emitted = long.take_n(1);
+        assert!(long_weak.upgrade().is_none());
+        assert!(long.size() < size_before_take);
+        assert_eq!(short.inner.len(), 1);
     }
 
     #[test]
