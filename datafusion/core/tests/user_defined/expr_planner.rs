@@ -31,7 +31,7 @@ use datafusion_expr::expr::Alias;
 use datafusion_expr::planner::{
     ExprPlanner, PlannerResult, RawBinaryExpr, RawScalarExpr,
 };
-use datafusion_expr::{BinaryExpr, ColumnarValue, Volatility};
+use datafusion_expr::{BinaryExpr, ColumnarValue, ExprSchemable, Volatility};
 
 #[derive(Debug)]
 struct MyCustomPlanner;
@@ -76,7 +76,9 @@ impl ExprPlanner for ScalarUdfArgPlanner {
     fn plan_scalar(
         &self,
         mut expr: RawScalarExpr,
+        schema: &DFSchema,
     ) -> Result<PlannerResult<RawScalarExpr>> {
+        assert_eq!(expr.args[0].get_type(schema)?, DataType::Int64);
         expr.args = vec![lit(2_i64)];
         Ok(PlannerResult::Original(expr))
     }
@@ -108,6 +110,15 @@ async fn test_scalar_udf_args_are_planned() -> Result<()> {
     assert_eq!(
         format!("{}", dataframe.logical_plan()),
         "Projection: replace_scalar_arg(Int64(2))\n  EmptyRelation: rows=1"
+    );
+
+    // The planner receives the input schema, including columns from a derived table.
+    let dataframe = ctx
+        .sql("SELECT replace_scalar_arg(t.a) FROM (SELECT 1 AS a) AS t")
+        .await?;
+    assert_eq!(
+        format!("{}", dataframe.logical_plan()),
+        "Projection: replace_scalar_arg(Int64(2))\n  SubqueryAlias: t\n    Projection: Int64(1) AS a\n      EmptyRelation: rows=1"
     );
 
     Ok(())

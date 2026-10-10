@@ -265,8 +265,14 @@ pub trait ExprPlanner: Debug + Send + Sync {
 
     /// Plans scalar functions, such as `ABS(<expr>)`
     ///
+    /// The input schema can be used to resolve argument types and field metadata.
+    ///
     /// Returns the original scalar function if not possible
-    fn plan_scalar(&self, expr: RawScalarExpr) -> Result<PlannerResult<RawScalarExpr>> {
+    fn plan_scalar(
+        &self,
+        expr: RawScalarExpr,
+        _schema: &DFSchema,
+    ) -> Result<PlannerResult<RawScalarExpr>> {
         Ok(PlannerResult::Original(expr))
     }
 
