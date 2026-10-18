@@ -41,7 +41,7 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, is_volatile};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::coop::cooperative;
@@ -826,6 +826,11 @@ impl DataSource for FileScanConfig {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
+        if let Some(inner) = self.file_source.projection()
+            && would_duplicate_volatile_exprs(inner, projection)
+        {
+            return Ok(None);
+        }
         match self.file_source.try_pushdown_projection(projection)? {
             Some(new_source) => {
                 let mut new_file_scan_config = self.clone();
@@ -923,6 +928,36 @@ impl DataSource for FileScanConfig {
         };
         Some(Arc::new(new_config))
     }
+}
+
+/// Returns `true` if merging `outer` into `inner` would duplicate a volatile
+/// expression.
+fn would_duplicate_volatile_exprs(
+    inner: &ProjectionExprs,
+    outer: &ProjectionExprs,
+) -> bool {
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    let inner_exprs = inner.as_ref();
+    let mut ref_counts = vec![0usize; inner_exprs.len()];
+    for proj_expr in outer.as_ref() {
+        proj_expr
+            .expr
+            .apply(|expr| {
+                if let Some(col) = expr.as_any().downcast_ref::<Column>()
+                    && let Some(count) = ref_counts.get_mut(col.index())
+                {
+                    *count += 1;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("infallible closure should not fail");
+    }
+
+    ref_counts
+        .iter()
+        .enumerate()
+        .any(|(idx, &count)| count > 1 && is_volatile(&inner_exprs[idx].expr))
 }
 
 impl FileScanConfig {
