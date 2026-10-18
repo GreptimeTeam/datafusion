@@ -1412,16 +1412,10 @@ impl SortMergeJoinStream {
 
                     if needs_deferred_filtering {
                         // Outer/semi/anti/mark joins: push unfiltered batch with metadata for deferred filtering
-                        let mask_to_use = if self.join_type != JoinType::Full {
-                            &mask
-                        } else {
-                            pre_mask
-                        };
-
                         self.joined_record_batches.push_batch_with_filter_metadata(
                             output_batch,
                             &left_indices,
-                            mask_to_use,
+                            &mask,
                             self.streamed_batch_counter.load(Relaxed),
                             self.join_type,
                         );
@@ -1455,7 +1449,7 @@ impl SortMergeJoinStream {
                                     .join_filter_not_matched_map
                                     .get(&buffered_index)
                                     .unwrap_or(&true)
-                                    && !pre_mask.value(i),
+                                    && !mask.value(i),
                             );
                         }
                     }
