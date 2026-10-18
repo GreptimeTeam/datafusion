@@ -956,6 +956,43 @@ where
     }
 
     fn size(&self) -> usize {
-        self.counts.capacity() * size_of::<u64>() + self.sums.capacity() * size_of::<T>()
+        size_of_val(&self.counts)
+            + self.counts.capacity() * size_of::<u64>()
+            + size_of_val(&self.sums)
+            + self.sums.capacity() * size_of::<T::Native>()
+            + self.null_state.size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Float64Array;
+
+    #[test]
+    fn test_groups_accumulator_size_accounts_for_owned_state() -> Result<()> {
+        let mut accumulator = AvgGroupsAccumulator::<Float64Type, _>::new(
+            &DataType::Float64,
+            &DataType::Float64,
+            |sum, count| Ok(sum / count as f64),
+        );
+        let values: ArrayRef = Arc::new(Float64Array::from_iter(
+            (0..64).map(|value| (value != 0).then_some(value as f64)),
+        ));
+        let input_size = values.get_array_memory_size();
+        let group_indices = (0..64).collect::<Vec<_>>();
+
+        accumulator.update_batch(&[values], &group_indices, None, 64)?;
+
+        let expected_size = size_of_val(&accumulator.counts)
+            + accumulator.counts.capacity() * size_of::<u64>()
+            + size_of_val(&accumulator.sums)
+            + accumulator.sums.capacity() * size_of::<f64>()
+            + accumulator.null_state.size();
+
+        // The input Arrow array is borrowed during update and is not owned by the accumulator.
+        assert_eq!(accumulator.size(), expected_size);
+        assert_ne!(accumulator.size(), expected_size + input_size);
+        Ok(())
     }
 }
