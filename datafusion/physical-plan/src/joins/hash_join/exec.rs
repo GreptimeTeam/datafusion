@@ -69,7 +69,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -126,7 +126,7 @@ fn array_map_key_range(
     perfect_hash_join_min_key_density: f64,
     null_equality: NullEquality,
 ) -> Result<Option<(u64, u64)>> {
-    if on_left.len() != 1 {
+    if !should_collect_min_max_for_perfect_hash(on_left, schema)? {
         return Ok(None);
     }
 
