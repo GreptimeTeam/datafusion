@@ -2545,8 +2545,7 @@ pub(crate) mod tests {
                         target.clone(),
                         None,
                     );
-                    let output =
-                        project_column_statistics_through_expr(&expr, &[input], None);
+                    let output = project_column_statistics_through_expr(&expr, &[input]);
                     assert_eq!(
                         output,
                         ColumnStatistics {
