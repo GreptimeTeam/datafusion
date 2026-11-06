@@ -3152,7 +3152,7 @@ mod tests {
     use crate::empty::EmptyExec;
     use crate::execution_plan::Boundedness;
     use crate::expressions::col;
-    use crate::filter::FilterExecBuilder;
+    use crate::filter::{FilterExec, FilterExecBuilder, batch_filter};
     use crate::metrics::MetricValue;
     use crate::statistics::{StatisticsArgs, StatisticsContext};
     use crate::test::TestMemoryExec;
@@ -3183,7 +3183,7 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::first_last::{first_value_udaf, last_value_udaf};
     use datafusion_functions_aggregate::median::median_udaf;
-    use datafusion_functions_aggregate::min_max::min_udaf;
+    use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::Partitioning;
     use datafusion_physical_expr::PhysicalSortExpr;
@@ -7835,6 +7835,218 @@ mod tests {
         fn size(&self) -> usize {
             size_of_val(self) + self.counts.capacity() * size_of::<i64>()
         }
+    }
+
+    // The FilterExec uses a batch size of one so that the aggregate updates the
+    // shared predicate before the filter reads the next input batch.
+    async fn run_aggregate_dynamic_filter_null_case(
+        rows: &[(Option<i64>, Option<i64>, Option<i64>)],
+        max_a: bool,
+    ) -> Result<(
+        Vec<RecordBatch>,
+        Arc<FilterExec>,
+        Arc<DynamicFilterPhysicalExpr>,
+    )> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, true),
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let batches = rows
+            .iter()
+            .map(|(ts, a, b)| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![*ts])),
+                        Arc::new(Int64Array::from(vec![*a])),
+                        Arc::new(Int64Array::from(vec![*b])),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let input = TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+        let aggregates = [
+            ("ts", min_udaf()),
+            ("a", if max_a { max_udaf() } else { min_udaf() }),
+            ("b", min_udaf()),
+        ]
+        .into_iter()
+        .map(|(name, function)| {
+            Ok(Arc::new(
+                AggregateExprBuilder::new(function, vec![col(name, &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias(name)
+                    .build()?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::default(),
+            aggregates,
+            vec![None; 3],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::clone(&schema),
+        )?);
+        let mut produced = aggregate.dynamic_expressions_produced();
+        assert_eq!(produced.len(), 1);
+        let dynamic_filter = (produced.pop().unwrap()
+            as Arc<dyn std::any::Any + Send + Sync>)
+            .downcast::<DynamicFilterPhysicalExpr>()
+            .expect("aggregate should produce a dynamic filter");
+        let filter = Arc::new(
+            FilterExecBuilder::new(
+                Arc::<DynamicFilterPhysicalExpr>::clone(&dynamic_filter),
+                input,
+            )
+            .with_batch_size(1)
+            .build()?,
+        );
+        let aggregate = aggregate.replace_children(
+            vec![Arc::<FilterExec>::clone(&filter)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        let results =
+            collect(aggregate.execute(0, Arc::new(TaskContext::default()))?).await?;
+        Ok((results, filter, dynamic_filter))
+    }
+
+    fn assert_aggregate_dynamic_filter_null_result(
+        batches: &[RecordBatch],
+        expected: [Option<i64>; 3],
+    ) -> Result<()> {
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(index), 0)?,
+                ScalarValue::Int64(value),
+                "aggregate {index}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_dynamic_filter_null_keeps_unknown_columns() -> Result<()> {
+        let (results, filter, dynamic_filter) = run_aggregate_dynamic_filter_null_case(
+            &[(Some(100), None, None), (Some(101), None, Some(2))],
+            false,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(
+            &results,
+            [Some(100), None, Some(2)],
+        )?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(2));
+        assert_eq!(
+            format!("{}", dynamic_filter.current()?),
+            format!("{}", lit(true))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_dynamic_filter_null_to_value_becomes_selective() -> Result<()> {
+        let (results, filter, dynamic_filter) = run_aggregate_dynamic_filter_null_case(
+            &[
+                (Some(100), None, Some(1)),
+                (Some(99), Some(2), None),
+                // No aggregate can improve: the second batch must have tightened
+                // the filter before this batch is read.
+                (Some(101), Some(3), Some(2)),
+                // Only min(a) improves; it must be present in the predicate.
+                (Some(101), Some(1), Some(2)),
+            ],
+            false,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(
+            &results,
+            [Some(99), Some(1), Some(1)],
+        )?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(3));
+        let predicate = dynamic_filter.current()?;
+        assert_ne!(format!("{predicate}"), format!("{}", lit(true)));
+        let probe = RecordBatch::try_new(
+            filter.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![101, 101, 101, 98])),
+                Arc::new(Int64Array::from(vec![0, 2, 2, 2])),
+                Arc::new(Int64Array::from(vec![2, 0, 2, 2])),
+            ],
+        )?;
+        assert_eq!(batch_filter(&probe, &predicate)?.num_rows(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_dynamic_filter_null_mixed_min_max() -> Result<()> {
+        let (results, filter, dynamic_filter) = run_aggregate_dynamic_filter_null_case(
+            &[(None, None, None), (None, None, None)],
+            true,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(&results, [None, None, None])?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(2));
+        assert_eq!(
+            format!("{}", dynamic_filter.current()?),
+            format!("{}", lit(true))
+        );
+
+        let (results, filter, dynamic_filter) = run_aggregate_dynamic_filter_null_case(
+            &[(Some(100), None, None), (Some(101), Some(2), None)],
+            true,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(
+            &results,
+            [Some(100), Some(2), None],
+        )?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(2));
+        assert_eq!(
+            format!("{}", dynamic_filter.current()?),
+            format!("{}", lit(true))
+        );
+
+        let (results, filter, dynamic_filter) = run_aggregate_dynamic_filter_null_case(
+            &[
+                (Some(100), None, None),
+                (Some(101), Some(2), None),
+                (Some(101), Some(3), Some(2)),
+                (Some(101), Some(4), Some(3)),
+                (Some(101), Some(2), Some(3)),
+            ],
+            true,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(
+            &results,
+            [Some(100), Some(4), Some(2)],
+        )?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(4));
+        assert_ne!(
+            format!("{}", dynamic_filter.current()?),
+            format!("{}", lit(true))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_dynamic_filter_null_consumer_uses_updated_predicate() -> Result<()>
+    {
+        let (results, filter, _) = run_aggregate_dynamic_filter_null_case(
+            &[(Some(100), Some(2), Some(1)), (Some(101), Some(3), Some(2))],
+            false,
+        )
+        .await?;
+        assert_aggregate_dynamic_filter_null_result(
+            &results,
+            [Some(100), Some(2), Some(1)],
+        )?;
+        assert_eq!(filter.metrics().unwrap().output_rows(), Some(1));
+        Ok(())
     }
 
     /// Test that [`AggregateExec::with_dynamic_filter_expr`] overrides the existing dynamic filter

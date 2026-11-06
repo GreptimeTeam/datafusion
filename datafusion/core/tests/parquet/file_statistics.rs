@@ -412,3 +412,159 @@ fn get_list_file_cache_size(state1: &SessionState) -> usize {
         .unwrap()
         .len()
 }
+
+/// Regression for SQL CASE simplification hiding a computed NULL from
+/// row-group full-match inference and scan LIMIT pruning.
+#[tokio::test]
+async fn sql_computed_null_cast_limit_preserves_later_row()
+-> datafusion_common::Result<()> {
+    use crate::parquet::utils::MetricsFinder;
+    use arrow::array::{BooleanArray, Int8Array, Int32Array};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_physical_plan::{collect, displayable, metrics::MetricValue};
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::WriterProperties;
+
+    const PREDICATE: &str =
+        "NOT(CASE WHEN a=1 THEN TRY_CAST(x AS TINYINT)>0 ELSE false END) AND b>0";
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("x", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let file = tempfile::Builder::new().suffix(".parquet").tempfile()?;
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .set_bloom_filter_enabled(false)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(file.reopen()?, Arc::clone(&schema), Some(properties))?;
+    for values in [vec![-200, 0], vec![0]] {
+        let rows = values.len();
+        writer.write(&RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1; rows])),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(Int32Array::from(vec![1; rows])),
+            ],
+        )?)?;
+        writer.flush()?;
+    }
+    writer.close()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file.reopen()?)?;
+    assert_eq!(reader.metadata().num_row_groups(), 2);
+    assert_eq!(reader.metadata().row_group(0).num_rows(), 2);
+    assert_eq!(reader.metadata().row_group(1).num_rows(), 1);
+    drop(reader);
+
+    for pushdown in [false, true] {
+        let mut config = SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(8192);
+        config.options_mut().execution.parquet.pushdown_filters = pushdown;
+        config.options_mut().execution.parquet.reorder_filters = false;
+        config.options_mut().execution.parquet.enable_page_index = false;
+        config.options_mut().execution.parquet.bloom_filter_on_read = false;
+        config.options_mut().execution.parquet.pruning = true;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_parquet(
+            "t",
+            file.path().to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        let oracle = ctx
+            .sql(&format!(
+                "SELECT TRY_CAST(x AS TINYINT), {PREDICATE} FROM t"
+            ))
+            .await?
+            .collect()
+            .await?;
+        let casts: Vec<_> = oracle
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect();
+        let predicate: Vec<_> = oracle
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(casts, [None, Some(0), Some(0)]);
+        assert_eq!(predicate, [None, Some(true), Some(true)]);
+
+        for limit in ["", " LIMIT 2"] {
+            let frame = ctx
+                .sql(&format!("SELECT x FROM t WHERE {PREDICATE}{limit}"))
+                .await?;
+            let plan = frame.create_physical_plan().await?;
+            let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(
+                plan_text.contains("TRY_CAST") && !plan_text.contains("CASE"),
+                "{plan_text}"
+            );
+            if pushdown && !limit.is_empty() {
+                assert!(
+                    plan_text.contains("limit=2"),
+                    "scan limit not exercised: {plan_text}"
+                );
+            }
+            let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+            let values: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .iter()
+                        .map(Option::unwrap)
+                })
+                .collect();
+            assert_eq!(values, [0, 0], "pushdown={pushdown}, limit={limit:?}");
+            let metrics =
+                MetricsFinder::find_metrics(plan.as_ref()).expect("Parquet scan metrics");
+            for metric in ["row_groups_pruned_statistics", "limit_pruned_row_groups"] {
+                let value = metrics
+                    .sum(|m| m.value().name() == metric)
+                    .expect("pruning metric");
+                let MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                } = value
+                else {
+                    panic!("expected pruning metric {metric}");
+                };
+                if metric == "row_groups_pruned_statistics" {
+                    assert_eq!(pruning_metrics.fully_matched(), 0);
+                } else {
+                    assert_eq!(pruning_metrics.pruned(), 0);
+                }
+            }
+            if pushdown {
+                assert_eq!(
+                    metrics
+                        .sum_by_name("pushdown_rows_pruned")
+                        .unwrap()
+                        .as_usize(),
+                    1
+                );
+            }
+        }
+    }
+    Ok(())
+}

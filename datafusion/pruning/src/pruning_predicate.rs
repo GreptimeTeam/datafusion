@@ -3609,6 +3609,85 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_inlist_snapshot_keeps_producer_lease_through_pruning() -> Result<()> {
+        use arrow::array::StructArray;
+        use datafusion_physical_expr::expressions::{InListExpr, Literal, NotExpr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Producer {
+            columns: Vec<ArrayRef>,
+            live: Arc<AtomicUsize>,
+            bytes: usize,
+        }
+        impl Drop for Producer {
+            fn drop(&mut self) {
+                self.live.fetch_sub(self.bytes, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(128));
+        let fields = vec![
+            Arc::new(Field::new("c0", DataType::Int32, true)),
+            Arc::new(Field::new("c1", DataType::Int32, true)),
+        ];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![3, 4])),
+        ];
+        let producer = Arc::new(Producer {
+            columns,
+            live: Arc::clone(&live),
+            bytes: 128,
+        });
+        let values = Arc::new(StructArray::from(
+            fields
+                .into_iter()
+                .zip(producer.columns.iter().cloned())
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            values.data_type().clone(),
+            false,
+        )]));
+        let column: PhysicalExprRef = Arc::new(phys_expr::Column::new("k", 0));
+        let list: PhysicalExprRef = Arc::new(
+            InListExpr::try_new_from_array(Arc::clone(&column), values, false, &schema)?
+                .with_producer_lease(producer.clone()),
+        );
+        assert!(
+            list.downcast_ref::<InListExpr>()
+                .unwrap()
+                .list()
+                .iter()
+                .all(|item| item.downcast_ref::<Literal>().is_some())
+        );
+        let negated: PhysicalExprRef = Arc::new(NotExpr::new(list));
+        let dynamic: PhysicalExprRef =
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], negated));
+        let pruning = PruningPredicateBuilder::new()
+            .with_file_schema(schema)
+            .try_build(Arc::clone(&dynamic))?;
+        assert!(
+            pruning
+                .orig_expr()
+                .downcast_ref::<InListExpr>()
+                .unwrap()
+                .negated(),
+            "snapshot must exercise NOT(IN) simplification"
+        );
+        drop(dynamic);
+        drop(producer);
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            128,
+            "pruning predicate lost producer lease during simplification"
+        );
+        drop(pruning);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
     fn row_group_predicate_lt_bool() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Boolean, false)]);
         let expected_expr = "c1_null_count@1 != row_count@2 AND c1_min@0 < true";
@@ -7630,6 +7709,7 @@ mod tests {
             .try_build(case)
             .unwrap();
 
+        assert!(predicate.can_be_inverted_for_full_match());
         let statistics = TestStatistics::new().with(
             "b",
             ContainerStats::new_i32(
@@ -7643,5 +7723,233 @@ mod tests {
         // ([45,55]) holds 50 from the second, so a branch may match in each. The
         // other two intersect neither branch, nor the `ELSE`.
         assert_eq!(result, vec![false, true, true, false]);
+    }
+    #[test]
+    fn computed_null_casts_block_full_match_only_when_not_total() -> Result<()> {
+        use arrow::compute::CastOptions;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("d", DataType::Decimal128(10, 2), false),
+            Field::new("t", DataType::Timestamp(TimeUnit::Second, None), false),
+        ]));
+        let column = |name, index| {
+            Arc::new(phys_expr::Column::new(name, index)) as PhysicalExprRef
+        };
+        let try_cast = |expr, target| {
+            Arc::new(phys_expr::TryCastExpr::new(expr, target)) as PhysicalExprRef
+        };
+        let safe_cast = |expr, target| {
+            Arc::new(phys_expr::CastExpr::new(
+                expr,
+                target,
+                Some(CastOptions {
+                    safe: true,
+                    ..Default::default()
+                }),
+            )) as PhysicalExprRef
+        };
+        let compare = |expr: PhysicalExprRef, value: ScalarValue| {
+            Arc::new(phys_expr::BinaryExpr::new(
+                expr,
+                Operator::Gt,
+                Arc::new(phys_expr::Literal::new(value)),
+            )) as PhysicalExprRef
+        };
+        let build = |expr| {
+            PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&schema))
+                .try_build(expr)
+        };
+        let wide = |v| ScalarValue::Int64(Some(v));
+        let narrow = |v| ScalarValue::Int8(Some(v));
+        let i32_value = |v| ScalarValue::Int32(Some(v));
+        for (label, expr, expected) in [
+            (
+                "TRY narrowing",
+                compare(try_cast(column("x", 0), DataType::Int8), narrow(0)),
+                false,
+            ),
+            (
+                "safe narrowing",
+                compare(safe_cast(column("x", 0), DataType::Int8), narrow(0)),
+                false,
+            ),
+            (
+                "TRY identity",
+                compare(try_cast(column("x", 0), DataType::Int32), i32_value(0)),
+                true,
+            ),
+            (
+                "safe identity",
+                compare(safe_cast(column("x", 0), DataType::Int32), i32_value(0)),
+                true,
+            ),
+            (
+                "TRY widening",
+                compare(try_cast(column("x", 0), DataType::Int64), wide(0)),
+                true,
+            ),
+            (
+                "safe widening",
+                compare(safe_cast(column("x", 0), DataType::Int64), wide(0)),
+                true,
+            ),
+            (
+                "nested unsafe below total",
+                compare(
+                    try_cast(try_cast(column("x", 0), DataType::Int8), DataType::Int64),
+                    wide(0),
+                ),
+                false,
+            ),
+            (
+                "decimal scale change",
+                compare(
+                    try_cast(column("d", 1), DataType::Decimal128(12, 3)),
+                    ScalarValue::Decimal128(Some(0), 12, 3),
+                ),
+                false,
+            ),
+            (
+                "timestamp unit change",
+                compare(
+                    try_cast(
+                        column("t", 2),
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    ),
+                    ScalarValue::TimestampNanosecond(Some(0), None),
+                ),
+                false,
+            ),
+            (
+                "unknown source type",
+                compare(try_cast(column("missing", 99), DataType::Int8), narrow(0)),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                build(expr)?.can_be_inverted_for_full_match(),
+                expected,
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn case_result_nullability_controls_full_match_but_not_forward_pruning() -> Result<()>
+    {
+        use arrow::compute::CastOptions;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("when", DataType::Boolean, true),
+            Field::new("b", DataType::Int32, false),
+            Field::new("nullable", DataType::Boolean, true),
+        ]));
+        let col = |name, index| {
+            Arc::new(phys_expr::Column::new(name, index)) as PhysicalExprRef
+        };
+        let boolean = |value| {
+            Arc::new(phys_expr::Literal::new(ScalarValue::Boolean(value)))
+                as PhysicalExprRef
+        };
+        let false_lit = || boolean(Some(false));
+        let when = || col("when", 0);
+        let compare = |left: PhysicalExprRef| {
+            Arc::new(phys_expr::BinaryExpr::new(
+                left,
+                Operator::Gt,
+                Arc::new(phys_expr::Literal::new(ScalarValue::Int32(Some(0)))),
+            )) as PhysicalExprRef
+        };
+        let case = |then: PhysicalExprRef,
+                    otherwise: Option<PhysicalExprRef>|
+         -> Result<PhysicalExprRef> {
+            Ok(Arc::new(phys_expr::CaseExpr::try_new(
+                None,
+                vec![(when(), then)],
+                otherwise,
+            )?))
+        };
+        let build = |expr| {
+            PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&schema))
+                .try_build(expr)
+        };
+        let nonnull = compare(col("b", 1));
+        let nullable = compare(Arc::new(phys_expr::TryCastExpr::new(
+            col("b", 1),
+            DataType::Int32,
+        )));
+        let safe_cast: PhysicalExprRef = Arc::new(phys_expr::BinaryExpr::new(
+            Arc::new(phys_expr::CastExpr::new(
+                col("b", 1),
+                DataType::Int8,
+                Some(CastOptions {
+                    safe: true,
+                    ..Default::default()
+                }),
+            )),
+            Operator::Gt,
+            Arc::new(phys_expr::Literal::new(ScalarValue::Int8(Some(0)))),
+        ));
+        assert!(!safe_cast.nullable(&schema)?);
+        let nested = case(Arc::clone(&nullable), Some(false_lit()))?;
+        let nullable_else = col("nullable", 2);
+        let invalid_column = col("missing", 99);
+        assert!(invalid_column.nullable(&schema).is_err());
+
+        for (label, then, otherwise, eligible) in [
+            (
+                "nonnull result, nullable WHEN",
+                Arc::clone(&nonnull),
+                Some(false_lit()),
+                true,
+            ),
+            (
+                "nullable THEN",
+                Arc::clone(&nullable),
+                Some(false_lit()),
+                false,
+            ),
+            (
+                "nullable ELSE",
+                Arc::clone(&nonnull),
+                Some(nullable_else),
+                false,
+            ),
+            ("nested nullable CASE", nested, Some(false_lit()), false),
+            (
+                "safe CAST false-nullable",
+                safe_cast,
+                Some(false_lit()),
+                false,
+            ),
+            (
+                "nullable error",
+                Arc::clone(&nonnull),
+                Some(invalid_column),
+                false,
+            ),
+        ] {
+            let predicate = build(case(then, otherwise)?)?;
+            assert_eq!(
+                predicate.can_be_inverted_for_full_match(),
+                eligible,
+                "{label}"
+            );
+        }
+        // Missing ELSE retains the upstream conservative fallback.
+        let no_else = build(case(Arc::clone(&nonnull), None)?)?;
+        assert!(no_else.always_true());
+        let stats = TestStatistics::new().with(
+            "b",
+            ContainerStats::new_i32(vec![Some(-2), Some(1)], vec![Some(-1), Some(2)])
+                .with_null_counts([Some(0), Some(0)])
+                .with_row_counts([Some(1), Some(1)]),
+        );
+        let forward = build(case(nullable, Some(false_lit()))?)?;
+        assert!(!forward.can_be_inverted_for_full_match());
+        assert_eq!(forward.prune(&stats)?, [false, true]);
+        Ok(())
     }
 }

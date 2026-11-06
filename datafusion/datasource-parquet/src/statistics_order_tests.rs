@@ -360,6 +360,31 @@ fn byte_array_order_preserves_matching_rows_at_every_pruning_level() {
 }
 
 #[test]
+fn byte_array_order_does_not_fully_match_from_untrusted_bounds() {
+    for order in [
+        StatisticsOrder::Modern,
+        StatisticsOrder::Deprecated,
+        StatisticsOrder::Missing,
+        StatisticsOrder::Unknown,
+    ] {
+        let file = TestFile::new(order);
+        // The first row group contains "az", which is below "aé" in
+        // Arrow's order, but its legacy minimum is "aé".
+        let (physical, predicate) = file.predicate(&col("s").gt_eq(lit("aé")));
+        let plan = file.row_group_plan(&predicate);
+        assert!(plan.should_scan(0), "order={order:?}");
+        assert!(!plan.is_fully_matched(0), "order={order:?}");
+        assert!(plan.should_scan(2), "order={order:?}");
+        assert_eq!(
+            plan.is_fully_matched(2),
+            matches!(order, StatisticsOrder::Modern | StatisticsOrder::Deprecated),
+            "order={order:?}",
+        );
+        assert_eq!(file.matching_rows(&physical, plan), 5, "order={order:?}");
+    }
+}
+
+#[test]
 fn large_string_in_list_preserves_rows_with_untrusted_page_order() {
     let max_in_list_size = MAX_IN_LIST_SIZE + 2;
     for order in [

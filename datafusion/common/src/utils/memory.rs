@@ -451,8 +451,9 @@ mod record_batch_tests {
     use arrow::array::{
         ArrayData, ArrayRef, BinaryViewArray, Float64Array, Int16Array, Int32Array,
         Int64Array, LargeListViewArray, ListArray, ListViewArray, RunArray, StringArray,
-        StringViewArray, new_null_array,
+        StringViewArray, StructArray, new_null_array,
     };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{
         DataType, Field, Int16Type, Int32Type, Int64Type, Schema, UnionFields, UnionMode,
     };
@@ -609,6 +610,119 @@ mod record_batch_tests {
         let deduped: usize = slices.iter().map(|slice| counter.count_batch(slice)).sum();
         assert_eq!(deduped, get_record_batch_memory_size(&batch));
         assert_eq!(counter.memory_usage(), get_record_batch_memory_size(&batch));
+    }
+
+    #[test]
+    fn test_record_batch_memory_counter_retained_all_valid_buffer() {
+        // ArrayDataBuilder drops all-valid null buffers even though the original
+        // array still retains their allocation.
+        let array =
+            Int32Array::new(vec![1, 2, 3, 4].into(), Some(NullBuffer::new_valid(4)));
+        let validity = array.nulls().unwrap().buffer();
+        let expected = array.values().inner().capacity() + validity.capacity();
+        assert!(validity.capacity() > 0);
+        assert!(array.to_data().nulls().is_none());
+        assert_eq!(
+            array_data_memory_size(&array),
+            array.values().inner().capacity()
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Int32, true),
+            Field::new("second", DataType::Int32, true),
+        ]));
+        let array = Arc::new(array);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::clone(&array) as ArrayRef, array])
+                .unwrap();
+        let mut counter = RecordBatchMemoryCounter::new();
+        assert_eq!(counter.count_batch(&batch), expected);
+        assert_eq!(counter.count_batch(&batch), 0);
+        assert_eq!(counter.memory_usage(), expected);
+    }
+
+    #[test]
+    fn test_record_batch_memory_counter_all_valid_slice_of_nullable_array() {
+        let array = Int32Array::from(vec![None, Some(1), Some(2), Some(3), None]);
+        let slice = array.slice(1, 3);
+        let nulls = slice.nulls().unwrap();
+        assert_eq!(nulls.null_count(), 0);
+        assert_eq!(
+            nulls.buffer().data_ptr(),
+            array.nulls().unwrap().buffer().data_ptr()
+        );
+        assert!(slice.to_data().nulls().is_none());
+        let expected = array.values().inner().capacity() + nulls.buffer().capacity();
+        assert!(nulls.buffer().capacity() > 0);
+        assert_eq!(
+            array_data_memory_size(&slice),
+            array.values().inner().capacity()
+        );
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("ints", DataType::Int32, true)]));
+        let slice_batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(slice)]).unwrap();
+        let original_batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let mut counter = RecordBatchMemoryCounter::new();
+        assert_eq!(counter.count_batch(&slice_batch), expected);
+        assert_eq!(counter.count_batch(&original_batch), 0);
+        assert_eq!(counter.memory_usage(), expected);
+    }
+
+    #[test]
+    fn test_record_batch_memory_counter_nested_retained_all_valid_buffer() {
+        let child = Arc::new(Int32Array::new(
+            vec![1, 2, 3, 4].into(),
+            Some(NullBuffer::new_valid(4)),
+        ));
+        let child_validity = child.nulls().unwrap().buffer().capacity();
+        let child_values = child.values().inner().capacity();
+        assert!(child_validity > 0);
+        let field = Arc::new(Field::new("value", DataType::Int32, true));
+        let struct_array = StructArray::new(
+            vec![Arc::clone(&field)].into(),
+            vec![Arc::clone(&child) as ArrayRef],
+            None,
+        );
+        let list_array = ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i32, 1, 2, 3, 4].into()),
+            child,
+            None,
+        );
+        let offset_size = list_array.offsets().inner().inner().capacity();
+        assert!(struct_array.to_data().child_data()[0].nulls().is_none());
+        assert!(list_array.to_data().child_data()[0].nulls().is_none());
+        assert_eq!(array_data_memory_size(&struct_array), child_values);
+        assert_eq!(
+            array_data_memory_size(&list_array),
+            child_values + offset_size
+        );
+        let mut struct_counter = RecordBatchMemoryCounter::new();
+        struct_counter.count_array_memory_size(&struct_array);
+        assert_eq!(struct_counter.memory_usage(), child_values + child_validity);
+        let mut list_counter = RecordBatchMemoryCounter::new();
+        list_counter.count_array_memory_size(&list_array);
+        assert_eq!(
+            list_counter.memory_usage(),
+            child_values + child_validity + offset_size
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("struct", struct_array.data_type().clone(), false),
+            Field::new("list", list_array.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(struct_array), Arc::new(list_array)],
+        )
+        .unwrap();
+        let expected = child_validity + child_values + offset_size;
+        let mut counter = RecordBatchMemoryCounter::new();
+        assert_eq!(counter.count_batch(&batch), expected);
+        assert_eq!(counter.count_batch(&batch), 0);
+        assert_eq!(counter.memory_usage(), expected);
     }
 
     #[test]

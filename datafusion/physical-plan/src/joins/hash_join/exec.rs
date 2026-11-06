@@ -2823,6 +2823,157 @@ mod tests {
         Ok(())
     }
 
+    /// Published membership expressions must keep the build's reservation alive
+    /// after the originating stream and plan are gone, including remapped copies.
+    #[tokio::test]
+    async fn dynamic_membership_retains_build_reservation() -> Result<()> {
+        use crate::joins::hash_join::partitioned_hash_eval::HashTableLookupExpr;
+        use arrow::array::BooleanArray;
+        use datafusion_common::tree_node::TreeNode;
+        use datafusion_physical_expr::expressions::InListExpr;
+
+        for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+            for (in_list, key_count) in [(false, 1), (true, 1), (true, 2)] {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                ]));
+                let batch = |keys: Vec<i64>, values: Vec<i64>| -> Result<RecordBatch> {
+                    Ok(RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from(keys)),
+                            Arc::new(Int64Array::from(values)),
+                        ],
+                    )?)
+                };
+                let build = batch(vec![0, 1_000_000], vec![10, 20])?;
+                let original_buffers = build
+                    .columns()
+                    .iter()
+                    .map(|column| column.to_data().buffers()[0].as_ptr() as usize)
+                    .collect::<Vec<_>>();
+                let probe = batch(vec![0, 1_000_000, 99], vec![10, 20, 10])?;
+                let left = TestMemoryExec::try_new_exec(
+                    &[vec![build]],
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let right = TestMemoryExec::try_new_exec(
+                    &[vec![probe.clone()]],
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let on = (0..key_count)
+                    .map(|index| {
+                        let key: PhysicalExprRef =
+                            Arc::new(Column::new(schema.field(index).name(), index));
+                        (Arc::clone(&key), key)
+                    })
+                    .collect();
+                let (join, dynamic) = hash_join_with_dynamic_filter_and_mode(
+                    left,
+                    right,
+                    on,
+                    JoinType::Inner,
+                    mode,
+                )?;
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build_arc()?;
+                let mut config = SessionConfig::new();
+                if !in_list {
+                    config
+                        .options_mut()
+                        .optimizer
+                        .hash_join_inlist_pushdown_max_size = 0;
+                }
+                let task = Arc::new(
+                    TaskContext::default()
+                        .with_runtime(runtime)
+                        .with_session_config(config),
+                );
+                let stream = join.execute(0, task)?;
+                let batches = common::collect(stream).await?;
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+                let expression = dynamic.current()?;
+                let mut membership = None;
+                expression.apply(|node| {
+                    if node.downcast_ref::<InListExpr>().is_some()
+                        || node.downcast_ref::<HashTableLookupExpr>().is_some()
+                    {
+                        membership = Some(Arc::clone(node));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                let membership = membership.expect("dynamic membership expression");
+                assert_eq!(membership.downcast_ref::<InListExpr>().is_some(), in_list);
+                let bitmap = membership
+                    .downcast_ref::<HashTableLookupExpr>()
+                    .and_then(|lookup| lookup.pruning_bitmap().cloned());
+                if !in_list {
+                    assert!(bitmap.is_some(), "sparse keys should produce a bitmap");
+                }
+                if in_list && key_count == 2 {
+                    let list = membership.downcast_ref::<InListExpr>().unwrap();
+                    let literal = list.list()[0].downcast_ref::<Literal>().unwrap();
+                    let ScalarValue::Struct(value) = literal.value() else {
+                        panic!("struct-key IN-list must retain real Struct literals");
+                    };
+                    let buffers = value
+                        .columns()
+                        .iter()
+                        .map(|column| column.to_data().buffers()[0].as_ptr() as usize)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        buffers, original_buffers,
+                        "literals share producer buffers"
+                    );
+                }
+                let children = membership.children().into_iter().cloned().collect();
+                let remapped = Arc::clone(&membership).with_new_children(children)?;
+                assert!(pool.reserved() > 0);
+                drop(batches);
+                drop(expression);
+                drop(dynamic);
+                drop(join);
+                let retained = pool.reserved();
+                assert!(
+                    retained > 0,
+                    "{mode:?} in_list={in_list} keys={key_count}: detached expression lost producer charge"
+                );
+                let result = remapped.evaluate(&probe)?.into_array(probe.num_rows())?;
+                assert_eq!(
+                    result.as_any().downcast_ref::<BooleanArray>().unwrap(),
+                    &BooleanArray::from(vec![true, true, false])
+                );
+                drop(membership);
+                assert_eq!(
+                    pool.reserved(),
+                    retained,
+                    "remap shares producer charge once"
+                );
+                drop(remapped);
+                if let Some(bitmap) = bitmap {
+                    assert_eq!(
+                        pool.reserved(),
+                        bitmap.size(),
+                        "bitmap alone retains only its own charge"
+                    );
+                    assert!(bitmap.may_contain_range(0, 0));
+                    drop(bitmap);
+                }
+                assert_eq!(pool.reserved(), 0);
+                eprintln!(
+                    "passed {mode:?} in_list={in_list} keys={key_count}, retained={retained}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Runs a join whose 200 keys spread over 2M would size a pruning bitmap
     /// at the 128 KiB cap, and reports the bytes the build side reserved.
     ///
@@ -6818,6 +6969,180 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Ordinary LeftAnti joins preserve their NULL semantics in both build maps.
+    #[rstest]
+    #[tokio::test]
+    async fn left_anti_retains_null_equality_semantics(
+        #[values(false, true)] perfect_hash: bool,
+    ) -> Result<()> {
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            let left = build_table_two_cols(
+                ("a1", &vec![None, Some(1), Some(2)]),
+                ("b1", &vec![Some(10), Some(20), Some(30)]),
+            );
+            let right = build_table_two_cols(
+                ("a2", &vec![None, Some(2)]),
+                ("b2", &vec![Some(40), Some(50)]),
+            );
+            let on = vec![(
+                Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+            )];
+            let join = HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                null_equality,
+                false,
+            )?;
+            let output =
+                common::collect(join.execute(0, prepare_task_ctx(8192, perfect_hash))?)
+                    .await?;
+            if null_equality == NullEquality::NullEqualsNull {
+                assert_batches_sorted_eq!(
+                    [
+                        "+----+----+",
+                        "| a1 | b1 |",
+                        "+----+----+",
+                        "| 1  | 20 |",
+                        "+----+----+",
+                    ],
+                    &output
+                );
+            } else {
+                assert_batches_sorted_eq!(
+                    [
+                        "+----+----+",
+                        "| a1 | b1 |",
+                        "+----+----+",
+                        "|    | 10 |",
+                        "| 1  | 20 |",
+                        "+----+----+",
+                    ],
+                    &output
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Mutable visited-state charges must not follow a published build lease.
+    #[tokio::test]
+    async fn visited_bitmap_reservation_is_execution_local() -> Result<()> {
+        use crate::memory::MemoryStream;
+        let values: Vec<i32> = (0..1024).collect();
+        let batch = build_table_i32(("a1", &values), ("b1", &values), ("c1", &values));
+        let schema = batch.schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let data = collect_left_input(
+            HASH_JOIN_SEED.random_state().clone(),
+            Box::pin(MemoryStream::try_new(vec![batch], schema, None)?),
+            vec![Arc::new(Column::new("a1", 0))],
+            BuildProbeJoinMetrics::new(0, &metrics_set),
+            MemoryConsumer::new("visited lease").register(&pool),
+            true,
+            1,
+            true,
+            Arc::new(ConfigOptions::default()),
+            NullEquality::NullEqualsNothing,
+            MetricBuilder::new(&metrics_set)
+                .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0),
+            BuildMode::Ordinary,
+        )
+        .await?;
+        let producer_bytes = data.build.reservation.size();
+        // Inspect the keepalive reservation to verify its execution-local charge.
+        #[expect(clippy::used_underscore_binding)]
+        let visited_bytes = data._visited_reservation.size();
+        let bitmap_bytes = data.membership.bitmap_reserved_bytes();
+        assert_eq!(visited_bytes, 1024 / 8);
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes + visited_bytes + bitmap_bytes
+        );
+        let producer = Arc::clone(&data.build);
+        drop(data);
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes,
+            "visited and unshared pruning bitmap must release with execution"
+        );
+        drop(producer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// A build lease retains the batch, computed keys, map, and their reservation.
+    #[rstest]
+    #[tokio::test]
+    async fn build_lease_retains_computed_keys_and_map_reservation(
+        #[values(false, true)] perfect_hash: bool,
+    ) -> Result<()> {
+        use crate::memory::MemoryStream;
+
+        let values: Vec<i32> = (0..1024).collect();
+        let batch = build_table_i32(("a1", &values), ("b1", &values), ("c1", &values));
+        let schema = batch.schema();
+        let on: Vec<PhysicalExprRef> = vec![Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a1", 0)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+        ))];
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("build lease").register(&pool);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = BuildProbeJoinMetrics::new(0, &metrics_set);
+        let count = MetricBuilder::new(&metrics_set)
+            .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0);
+        let config = Arc::clone(
+            prepare_task_ctx(8192, perfect_hash)
+                .session_config()
+                .options(),
+        );
+        let data = collect_left_input(
+            HASH_JOIN_SEED.random_state().clone(),
+            Box::pin(MemoryStream::try_new(vec![batch], schema, None)?),
+            on,
+            metrics,
+            reservation,
+            false,
+            1,
+            false,
+            config,
+            NullEquality::NullEqualsNothing,
+            count,
+            BuildMode::Ordinary,
+        )
+        .await?;
+        assert_eq!(matches!(data.map(), Map::ArrayMap(_)), perfect_hash);
+        assert!(!data.map().is_empty());
+        let mut counter = RecordBatchMemoryCounter::new();
+        let batch_bytes = counter.count_batch(data.batch());
+        let key_bytes = counter.count_array(data.values()[0].as_ref());
+        assert!(key_bytes > 0, "the computed key must own separate buffers");
+        let reserved = pool.reserved();
+        assert!(
+            reserved > batch_bytes + key_bytes,
+            "map storage must stay charged"
+        );
+        let lease = Arc::clone(&data.build);
+        drop(data);
+        assert_eq!(pool.reserved(), reserved);
+        assert!(!lease.map.is_empty());
+        assert_eq!(lease.values[0].len(), 1024);
+        drop(lease);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 
