@@ -569,11 +569,13 @@ impl HashJoinStream {
             PartitionMode::Partitioned => PartitionBuildData::Partitioned {
                 partition_id: self.partition,
                 pushdown,
+                build_lease: Some(left_data.build_lease()),
                 bounds,
                 keys_have_null,
             },
             PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
                 pushdown,
+                build_lease: Some(left_data.build_lease()),
                 bounds,
                 keys_have_null,
             },

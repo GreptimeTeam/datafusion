@@ -26,7 +26,7 @@ use crate::ExecutionPlanProperties;
 use crate::Partitioning;
 use crate::joins::Map;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::HASH_JOIN_SEED;
+use crate::joins::hash_join::exec::{HASH_JOIN_SEED, JoinBuildData};
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::partitioned_hash_eval::{
     HashExpr, HashTableLookupExpr, SeededRandomState,
@@ -96,6 +96,7 @@ impl PartitionBounds {
 fn create_membership_predicate(
     on_right: &[PhysicalExprRef],
     pushdown: PushdownStrategy,
+    build_lease: Option<Arc<JoinBuildData>>,
     random_state: &SeededRandomState,
     schema: &Schema,
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
@@ -129,23 +130,25 @@ fn create_membership_predicate(
             };
 
             // Use InListExpr::try_new_from_array() to build an InList with static_filter optimization (hash-based lookup)
-            Ok(Some(Arc::new(InListExpr::try_new_from_array(
-                expr,
-                in_list_array,
-                false,
-                schema,
-            )?)))
+            let mut in_list =
+                InListExpr::try_new_from_array(expr, in_list_array, false, schema)?;
+            if let Some(build_lease) = build_lease {
+                in_list = in_list.with_producer_lease(build_lease);
+            }
+            Ok(Some(Arc::new(in_list)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::Map(hash_map, pruning_bitmap) => {
-            Ok(Some(Arc::new(HashTableLookupExpr::new(
+        PushdownStrategy::Map(hash_map, pruning_bitmap) => Ok(Some(Arc::new(
+            HashTableLookupExpr::new(
                 on_right.to_vec(),
                 random_state.clone(),
                 hash_map,
                 "hash_lookup".to_string(),
                 pruning_bitmap,
-            )) as Arc<dyn PhysicalExpr>))
-        }
+            )
+            .with_build_lease(build_lease),
+        )
+            as Arc<dyn PhysicalExpr>)),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -288,16 +291,27 @@ pub(crate) enum PushdownStrategy {
     Empty,
 }
 
+impl PushdownStrategy {
+    pub(super) fn bitmap_reserved_bytes(&self) -> usize {
+        match self {
+            Self::Map(_, Some(bitmap)) => bitmap.reserved_bytes(),
+            _ => 0,
+        }
+    }
+}
+
 /// Build-side data reported by a single partition
 pub(crate) enum PartitionBuildData {
     Partitioned {
         partition_id: usize,
         pushdown: PushdownStrategy,
+        build_lease: Option<Arc<JoinBuildData>>,
         bounds: PartitionBounds,
         keys_have_null: bool,
     },
     CollectLeft {
         pushdown: PushdownStrategy,
+        build_lease: Option<Arc<JoinBuildData>>,
         bounds: PartitionBounds,
         keys_have_null: bool,
     },
@@ -308,6 +322,7 @@ pub(crate) enum PartitionBuildData {
 struct PartitionData {
     bounds: PartitionBounds,
     pushdown: PushdownStrategy,
+    build_lease: Option<Arc<JoinBuildData>>,
     /// Whether any build key of this partition is NULL. Decides whether the pushed
     /// filter must keep probe-side NULL rows for a null-equal join to match them.
     keys_have_null: bool,
@@ -494,6 +509,7 @@ impl SharedBuildAccumulator {
                 PartitionBuildData::Partitioned {
                     partition_id,
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 },
@@ -507,6 +523,7 @@ impl SharedBuildAccumulator {
                 }
                 partitions[partition_id] = PartitionStatus::Reported(PartitionData {
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 });
@@ -514,6 +531,7 @@ impl SharedBuildAccumulator {
             (
                 PartitionBuildData::CollectLeft {
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 },
@@ -526,6 +544,7 @@ impl SharedBuildAccumulator {
                 if matches!(data, PartitionStatus::Pending) {
                     *data = PartitionStatus::Reported(PartitionData {
                         pushdown,
+                        build_lease,
                         bounds,
                         keys_have_null,
                     });
@@ -621,6 +640,7 @@ impl SharedBuildAccumulator {
                     let membership_expr = create_membership_predicate(
                         &self.on_right,
                         partition_data.pushdown.clone(),
+                        partition_data.build_lease.clone(),
                         &HASH_JOIN_SEED,
                         self.probe_schema.as_ref(),
                     )?;
@@ -669,6 +689,7 @@ impl SharedBuildAccumulator {
                             let membership_expr = create_membership_predicate(
                                 &self.on_right,
                                 partition.pushdown.clone(),
+                                partition.build_lease.clone(),
                                 &HASH_JOIN_SEED,
                                 self.probe_schema.as_ref(),
                             )?;

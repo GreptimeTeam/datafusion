@@ -388,12 +388,16 @@ pub struct PruningPredicate {
     max_in_list_size: usize,
     /// Whether its logical inverse can safely prove every row matches.
     can_be_inverted_for_full_match: bool,
+    /// A simplified snapshot may retain producer buffers through its literal
+    /// children while dropping the input expression's producer lease. This is
+    /// dropped after the expressions and literal guarantees that may share them.
+    _snapshot_lease: Option<Arc<dyn PhysicalExpr>>,
 }
 
 #[derive(Default)]
 struct PruningExpressionProperties {
-    /// The rewrite preserves which rows can be TRUE, but not whether rejected
-    /// rows are FALSE or UNKNOWN.
+    /// A rewrite or computed NULL preserves which rows can be TRUE, but does
+    /// not prove whether rejected rows are FALSE rather than UNKNOWN.
     has_filter_semantics_only: bool,
 }
 
@@ -531,6 +535,7 @@ impl<'a> PruningPredicateBuilder<'a> {
         // In particular this unravels any `DynamicFilterPhysicalExpr`s by snapshotting them
         // so that PruningPredicate can work with a static expression.
         let tf = snapshot_physical_expr_opt(predicate)?;
+        let mut snapshot_lease = None;
         if tf.transformed {
             // If we had an expression such as Dynamic(part_col < 5 and col < 10)
             // (this could come from something like `select * from t order by part_col, col, limit 10`)
@@ -539,7 +544,11 @@ impl<'a> PruningPredicateBuilder<'a> {
             // the expression we have now is `8 < 5 and col < 10`.
             // Thus we need as simplifier pass to get `false and col < 10` => `false` here.
             let simplifier = PhysicalExprSimplifier::new(&file_schema);
-            predicate = simplifier.simplify(tf.data)?;
+            let snapshot = tf.data;
+            predicate = simplifier.simplify(Arc::clone(&snapshot))?;
+            if !Arc::ptr_eq(&predicate, &snapshot) {
+                snapshot_lease = Some(snapshot);
+            }
         } else {
             predicate = tf.data;
         }
@@ -548,6 +557,37 @@ impl<'a> PruningPredicateBuilder<'a> {
         // build predicate expression once
         let mut required_columns = RequiredColumns::new();
         let mut properties = PruningExpressionProperties::default();
+        // A failing TRY_CAST or safe CAST can manufacture NULL even when its
+        // input column is known non-null. Statistics over that column cannot
+        // then prove the inverse predicate is FALSE for every row. Inspect the
+        // original expression before statistics rewriting loses cast options.
+        if predicate
+            .apply(|node| {
+                let cast = if let Some(cast) =
+                    node.downcast_ref::<phys_expr::TryCastExpr>()
+                {
+                    Some((cast.expr(), cast.cast_type()))
+                } else if let Some(cast) = node.downcast_ref::<phys_expr::CastExpr>() {
+                    cast.cast_options()
+                        .safe
+                        .then_some((cast.expr(), cast.cast_type()))
+                } else {
+                    None
+                };
+                if let Some((expr, target)) = cast
+                    && !expr.data_type(&file_schema).is_ok_and(|source| {
+                        phys_expr::CastExpr::check_bigger_cast(target, &source)
+                    })
+                {
+                    properties.has_filter_semantics_only = true;
+                }
+                // Continue through total outer casts to inspect nested casts too.
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .is_err()
+        {
+            properties.has_filter_semantics_only = true;
+        }
         let predicate_expr = build_predicate_expression(
             &predicate,
             &file_schema,
@@ -567,6 +607,7 @@ impl<'a> PruningPredicateBuilder<'a> {
             predicate_expr,
             required_columns,
             orig_expr: predicate,
+            _snapshot_lease: snapshot_lease,
             literal_guarantees,
             max_in_list_size: self.max_in_list_size,
             can_be_inverted_for_full_match: !properties.has_filter_semantics_only,
@@ -1897,6 +1938,18 @@ fn build_predicate_expression(
         // FALSE either, which full-match inference must be able to tell apart.
         if case.else_expr().is_none() {
             return unhandled_hook.handle(expr);
+        }
+        // OR-ing results is a valid may-be-TRUE relaxation, but it cannot
+        // prove a full match when a selected result can be UNKNOWN.
+        for branch in case
+            .when_then_expr()
+            .iter()
+            .map(|(_, then)| then)
+            .chain(case.else_expr())
+        {
+            if !matches!(branch.nullable(schema), Ok(false)) {
+                properties.has_filter_semantics_only = true;
+            }
         }
         return case
             .when_then_expr()

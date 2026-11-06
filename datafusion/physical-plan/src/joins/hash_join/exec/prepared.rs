@@ -38,6 +38,8 @@ use datafusion_execution::memory_pool::MemoryPool;
 /// nested build columns remain unsupported. UTF-8 and fixed-size binary keys
 /// use hash-table membership filters instead of copying range or IN-list values.
 pub struct PreparedHashJoinBuild {
+    // Membership may retain build buffers; drop it before the build reservation.
+    membership: PushdownStrategy,
     build: Arc<JoinBuildData>,
     keys: Vec<usize>,
     null_equality: NullEquality,
@@ -58,7 +60,7 @@ impl fmt::Debug for PreparedHashJoinBuild {
 impl PreparedHashJoinBuild {
     /// Return the retained build reservation, excluding all per-probe state.
     pub fn reserved_bytes(&self) -> usize {
-        self.build.reservation.size()
+        self.build.reservation.size() + self.membership.bitmap_reserved_bytes()
     }
 
     /// Return the complete build row count, including duplicate and null keys.
@@ -74,6 +76,8 @@ impl PreparedHashJoinBuild {
             probe_threads_counter: AtomicUsize::new(probe_threads),
             probe_side_non_empty: AtomicBool::new(false),
             probe_side_has_null: AtomicBool::new(false),
+            membership: self.membership.clone(),
+            _visited_reservation: self.build.reservation.new_empty(),
         }
     }
 
@@ -199,6 +203,7 @@ impl HashJoinExec {
         .await?;
         Ok(Arc::new(PreparedHashJoinBuild {
             build: data.build,
+            membership: data.membership,
             keys,
             null_equality: self.null_equality,
         }))
