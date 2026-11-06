@@ -435,6 +435,12 @@ impl RowGroupAccessPlanFilter {
         else {
             return;
         };
+        // The inverse can introduce filter-only rewrites that were hidden
+        // inside an unhandled expression in the forward predicate. In that
+        // case pruning UNKNOWN cannot establish that every row matches.
+        if !inverted_predicate.can_be_inverted_for_full_match() {
+            return;
+        }
 
         let inverted_pruning_stats = RowGroupPruningStatistics {
             parquet_schema: pruning_stats.parquet_schema,

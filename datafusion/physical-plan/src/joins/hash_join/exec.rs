@@ -199,19 +199,17 @@ fn array_map_key_range(
 }
 
 /// Immutable build buffers and their durable reservation.
-struct JoinBuildData {
+pub(super) struct JoinBuildData {
     /// Hash table with row indices into `batch`, also shared with dynamic filters.
-    map: Arc<Map>,
+    pub(super) map: Arc<Map>,
     /// The input rows for the build side.
-    batch: RecordBatch,
+    pub(super) batch: RecordBatch,
     /// Evaluated build-side key expressions.
-    values: Vec<ArrayRef>,
+    pub(super) values: Vec<ArrayRef>,
     /// Bounds computed from the build side; absent for an empty partition.
-    bounds: Option<PartitionBounds>,
-    /// IN-list values or a hash-table reference used for filter pushdown.
-    membership: PushdownStrategy,
+    pub(super) bounds: Option<PartitionBounds>,
     // Declared last so accounted-for build allocations are released first.
-    reservation: MemoryReservation,
+    pub(super) reservation: MemoryReservation,
 }
 
 /// A build lease and mutable bookkeeping for one join execution.
@@ -224,7 +222,10 @@ pub(super) struct JoinLeftData {
     pub(super) probe_side_non_empty: AtomicBool,
     /// Whether any probe partition saw a NULL key (for null-aware anti joins).
     pub(super) probe_side_has_null: AtomicBool,
-    // Drop the reservation after the mutable state it also accounts for.
+    /// IN-list values or a hash-table reference used for filter pushdown.
+    membership: PushdownStrategy,
+    /// The mutable visited bitmap belongs to this execution, not the build owner.
+    _visited_reservation: MemoryReservation,
     build: Arc<JoinBuildData>,
 }
 
@@ -268,7 +269,11 @@ impl JoinLeftData {
 
     /// returns a reference to the InList values for filter pushdown
     pub(super) fn membership(&self) -> &PushdownStrategy {
-        &self.build.membership
+        &self.membership
+    }
+
+    pub(super) fn build_lease(&self) -> Arc<JoinBuildData> {
+        Arc::clone(&self.build)
     }
 
     /// Borrow bounds without sharing a consuming join's dynamic-filter state.
@@ -2602,16 +2607,17 @@ async fn collect_left_input(
     metrics.build_mem_used.add(keys_size);
 
     // Reserve additional memory for visited indices bitmap and create shared builder
-    let visited_indices_bitmap = if with_visited_indices_bitmap {
+    let (visited_indices_bitmap, visited_reservation) = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
         reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
+        let visited_reservation = reservation.split(bitmap_size);
 
         let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
         bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
+        (bitmap_buffer, visited_reservation)
     } else {
-        BooleanBufferBuilder::new(0)
+        (BooleanBufferBuilder::new(0), reservation.new_empty())
     };
 
     let map = Arc::new(join_hash_map);
@@ -2645,9 +2651,8 @@ async fn collect_left_input(
         } else {
             // Past the InList threshold use a bucket bitmap for container pruning.
             let pruning_bitmap = match (left_values.as_slice(), bounds.as_ref()) {
-                ([keys], Some(bounds)) if !keys.is_empty() => bounds
-                    .get_column_bounds(0)
-                    .and_then(|b| {
+                ([keys], Some(bounds)) if !keys.is_empty() => {
+                    bounds.get_column_bounds(0).and_then(|b| {
                         KeyRangeBitmap::try_new(
                             keys,
                             &b.min,
@@ -2655,17 +2660,19 @@ async fn collect_left_input(
                             map.num_of_distinct_key(),
                         )
                     })
-                    .map(Arc::new),
+                }
                 _ => None,
             };
-            // Held for the join's lifetime, so charge it like the maps; it is
-            // optional, so skip it rather than fail when the pool is full.
-            let pruning_bitmap = pruning_bitmap.filter(|bitmap| {
-                let ok = reservation.try_grow(bitmap.size()).is_ok();
-                if ok {
-                    metrics.build_mem_used.add(bitmap.size());
+            // A derived pruning expression may outlive the build. Transfer the
+            // accepted charge to the bitmap; admission failure remains optional.
+            let pruning_bitmap = pruning_bitmap.and_then(|bitmap| {
+                let bytes = bitmap.size();
+                if reservation.try_grow(bytes).is_ok() {
+                    metrics.build_mem_used.add(bytes);
+                    Some(Arc::new(bitmap.with_reservation(reservation.split(bytes))))
+                } else {
+                    None
                 }
-                ok
             });
             PushdownStrategy::Map(Arc::clone(&map), pruning_bitmap)
         }
@@ -2692,12 +2699,13 @@ async fn collect_left_input(
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         probe_side_non_empty: AtomicBool::new(false),
         probe_side_has_null: AtomicBool::new(false),
+        membership,
+        _visited_reservation: visited_reservation,
         build: Arc::new(JoinBuildData {
             map,
             batch,
             values: left_values,
             bounds,
-            membership,
             reservation,
         }),
     };

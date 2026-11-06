@@ -264,6 +264,8 @@ pub struct HashTableLookupExpr {
     random_state: SeededRandomState,
     /// Map to check against (hash table or array map)
     map: Arc<Map>,
+    /// Retain the build reservation as long as the published map is retained.
+    build_lease: Option<Arc<super::exec::JoinBuildData>>,
     /// Description for display
     description: String,
     /// Shared pruning-only view of the build side's key range
@@ -292,9 +294,18 @@ impl HashTableLookupExpr {
             on_columns,
             random_state,
             map,
+            build_lease: None,
             description,
             pruning_bitmap,
         }
+    }
+
+    pub(super) fn with_build_lease(
+        mut self,
+        lease: Option<Arc<super::exec::JoinBuildData>>,
+    ) -> Self {
+        self.build_lease = lease;
+        self
     }
 
     /// Which parts of this build side's key range hold keys, for container pruning.
@@ -357,6 +368,7 @@ impl PhysicalExpr for HashTableLookupExpr {
             on_columns: children,
             random_state: self.random_state.clone(),
             map: Arc::clone(&self.map),
+            build_lease: self.build_lease.clone(),
             description: self.description.clone(),
             pruning_bitmap: self.pruning_bitmap.clone(),
         }))

@@ -21,6 +21,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, downcast_integer_array};
 use arrow::buffer::{BooleanBuffer, MutableBuffer};
 use arrow::util::bit_util;
 use datafusion_common::ScalarValue;
+use datafusion_execution::memory_pool::MemoryReservation;
 use num_traits::AsPrimitive;
 
 use crate::joins::array_map::ArrayMap;
@@ -58,6 +59,8 @@ pub struct KeyRangeBitmap {
     shift: u32,
     /// One bit per bucket.
     bits: BooleanBuffer,
+    /// Reservation follows this bitmap even when a pruning expression retains it.
+    reservation: Option<MemoryReservation>,
 }
 
 impl KeyRangeBitmap {
@@ -98,7 +101,20 @@ impl KeyRangeBitmap {
             span,
             shift,
             bits,
+            reservation: None,
         })
+    }
+
+    /// Attach the existing build-side charge before publishing this bitmap.
+    pub(crate) fn with_reservation(mut self, reservation: MemoryReservation) -> Self {
+        debug_assert_eq!(reservation.size(), self.size());
+        self.reservation = Some(reservation);
+        self
+    }
+
+    /// Bytes currently charged to this bitmap.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.as_ref().map_or(0, MemoryReservation::size)
     }
 
     /// One Boolean per `[min[i], max[i]]` container interval: `false` proves no
