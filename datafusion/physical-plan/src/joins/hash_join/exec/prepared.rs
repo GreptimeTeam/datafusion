@@ -70,12 +70,10 @@ impl PreparedHashJoinBuild {
     pub(super) fn probe_data(&self, probe_threads: usize) -> JoinLeftData {
         JoinLeftData {
             build: Arc::clone(&self.build),
-            null_aware_scope_map: None,
-            null_value_build_rows: None,
             visited_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
-            null_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
-            probe_completion: ProbeCompletion::new(probe_threads),
-            build_side_has_null: false,
+            probe_threads_counter: AtomicUsize::new(probe_threads),
+            probe_side_non_empty: AtomicBool::new(false),
+            probe_side_has_null: AtomicBool::new(false),
         }
     }
 
@@ -195,7 +193,6 @@ impl HashJoinExec {
             !byte_keys,
             config,
             self.null_equality,
-            None,
             count,
             BuildMode::Prepared,
         )
