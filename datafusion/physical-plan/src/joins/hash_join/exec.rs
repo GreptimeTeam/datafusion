@@ -209,21 +209,19 @@ struct JoinBuildData {
     bounds: Option<PartitionBounds>,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
-    // Keep the reservation after the allocations it accounts for.
+    // Declared last so accounted-for build allocations are released first.
     reservation: MemoryReservation,
 }
 
 /// A build lease and mutable bookkeeping for one join execution.
 pub(super) struct JoinLeftData {
-    /// Shared bitmap for visited left indices within this consuming join.
+    /// Shared bitmap for visited build indices within this join execution.
     visited_indices_bitmap: SharedBitmapBuilder,
-    /// Counter of running probe-threads, potentially
-    /// able to update `visited_indices_bitmap`
+    /// Counter of running probe partitions that may update the bitmap.
     probe_threads_counter: AtomicUsize,
-    /// Shared atomic flag indicating if any probe partition saw data (for null-aware anti joins)
-    /// This is shared across all probe partitions to provide global knowledge
+    /// Whether any probe partition saw data (for null-aware anti joins).
     pub(super) probe_side_non_empty: AtomicBool,
-    /// Shared atomic flag indicating if any probe partition saw NULL in join keys (for null-aware anti joins)
+    /// Whether any probe partition saw a NULL key (for null-aware anti joins).
     pub(super) probe_side_has_null: AtomicBool,
     // Drop the reservation after the mutable state it also accounts for.
     build: Arc<JoinBuildData>,
@@ -2259,7 +2257,9 @@ impl BuildSideState {
     }
 }
 
-/// range and density, see [`array_map_key_range`].
+/// Whether a single build key is a candidate for perfect hashing.
+/// The final decision also depends on the observed range and density; see
+/// [`array_map_key_range`].
 fn should_collect_min_max_for_perfect_hash(
     on_left: &[PhysicalExprRef],
     schema: &SchemaRef,
@@ -2647,8 +2647,7 @@ async fn collect_left_input(
 
     if prepared {
         drop(batches);
-        // Prepared keys are direct columns. IN-list arrays share these batch
-        // buffers, including through multi-key StructArray children.
+        // Prepared keys are direct columns; numeric IN-list arrays share batch buffers.
         let retained = RecordBatchMemoryCounter::new().count_batch(&batch);
         prepared::reconcile_prepared_copy_reservation(
             &reservation,
@@ -2659,6 +2658,10 @@ async fn collect_left_input(
     }
 
     let data = JoinLeftData {
+        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        probe_threads_counter: AtomicUsize::new(probe_threads_count),
+        probe_side_non_empty: AtomicBool::new(false),
+        probe_side_has_null: AtomicBool::new(false),
         build: Arc::new(JoinBuildData {
             map,
             batch,
@@ -2667,10 +2670,6 @@ async fn collect_left_input(
             membership,
             reservation,
         }),
-        visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
-        probe_threads_counter: AtomicUsize::new(probe_threads_count),
-        probe_side_non_empty: AtomicBool::new(false),
-        probe_side_has_null: AtomicBool::new(false),
     };
 
     Ok(data)
@@ -2679,38 +2678,6 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hash_map_admits_row_indices_before_allocation() -> Result<()> {
-        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-
-        let rows = 1024;
-        let buckets =
-            estimate_memory_size::<(u32, u64)>(rows, size_of::<JoinHashMapU32>())?;
-        let bytes = buckets + rows * size_of::<u32>();
-        for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
-            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
-            let mut reservation = MemoryConsumer::new("row indices").register(&pool);
-            let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
-            let result = new_join_hashmap(rows, &mut reservation, &metrics);
-            if succeeds {
-                let map = result?;
-                assert_eq!(reservation.size(), bytes);
-                assert_eq!(metrics.build_mem_used.value(), bytes);
-                drop(map);
-            } else {
-                assert!(matches!(
-                    result,
-                    Err(datafusion_common::DataFusionError::ResourcesExhausted(_))
-                ));
-                assert_eq!(reservation.size(), 0);
-                assert_eq!(metrics.build_mem_used.value(), 0);
-            }
-            drop(reservation);
-            assert_eq!(pool.reserved(), 0);
-        }
-        Ok(())
-    }
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
@@ -2785,6 +2752,38 @@ mod tests {
     use insta::{allow_duplicates, assert_snapshot};
     use rstest::*;
     use rstest_reuse::*;
+
+    #[test]
+    fn hash_map_admits_row_indices_before_allocation() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+        let rows = 1024;
+        let buckets =
+            estimate_memory_size::<(u32, u64)>(rows, size_of::<JoinHashMapU32>())?;
+        let bytes = buckets + rows * size_of::<u32>();
+        for (limit, succeeds) in [(bytes - 1, false), (bytes, true)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let mut reservation = MemoryConsumer::new("row indices").register(&pool);
+            let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+            let result = new_join_hashmap(rows, &mut reservation, &metrics);
+            if succeeds {
+                let map = result?;
+                assert_eq!(reservation.size(), bytes);
+                assert_eq!(metrics.build_mem_used.value(), bytes);
+                drop(map);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(datafusion_common::DataFusionError::ResourcesExhausted(_))
+                ));
+                assert_eq!(reservation.size(), 0);
+                assert_eq!(metrics.build_mem_used.value(), 0);
+            }
+            drop(reservation);
+            assert_eq!(pool.reserved(), 0);
+        }
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct PartitionedTestExec {
