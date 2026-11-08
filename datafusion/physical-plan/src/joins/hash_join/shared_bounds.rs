@@ -931,6 +931,81 @@ mod tests {
         expressions::{Column, Literal},
     };
 
+    fn test_build_lease(
+        pool: &Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+    ) -> Arc<JoinBuildData> {
+        use crate::joins::join_hash_map::JoinHashMapU32;
+        use datafusion_execution::memory_pool::MemoryConsumer;
+        let reservation = MemoryConsumer::new("publication test").register(pool);
+        reservation.try_grow(128).unwrap();
+        let batch = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        Arc::new(JoinBuildData {
+            map: Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(2)))),
+            values: vec![Arc::clone(batch.column(0))],
+            batch,
+            bounds: None,
+            reservation,
+        })
+    }
+
+    #[test]
+    fn publication_constructor_error_releases_producer_lease() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let producer = test_build_lease(&pool);
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let invalid_schema =
+            Schema::new(vec![Field::new("probe_key", DataType::Utf8, false)]);
+        let result = create_membership_predicate(
+            &test_on_right(),
+            PushdownStrategy::InList(array),
+            Some(Arc::clone(&producer)),
+            &HASH_JOIN_SEED,
+            &invalid_schema,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            pool.reserved(),
+            128,
+            "error drops temporary lease but not original owner"
+        );
+        drop(producer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partitioned_accumulator_retains_reported_build_until_drop() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let producer = test_build_lease(&pool);
+        let array: ArrayRef = Arc::clone(producer.batch.column(0));
+        let acc = make_partitioned_expr_accumulator_for_test(2);
+        let mut report =
+            Box::pin(acc.report_build_data(PartitionBuildData::Partitioned {
+                partition_id: 0,
+                pushdown: PushdownStrategy::InList(array),
+                build_lease: Some(Arc::clone(&producer)),
+                bounds: no_bounds(),
+                keys_have_null: false,
+            }));
+        assert!(futures::poll!(&mut report).is_pending());
+        drop(report);
+        drop(producer);
+        assert_eq!(
+            pool.reserved(),
+            128,
+            "accumulator must retain an already reported partition after the stream is dropped"
+        );
+        drop(acc);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
     fn test_on_right() -> Vec<PhysicalExprRef> {
         vec![Arc::new(Column::new("probe_key", 0))]
     }
@@ -1011,6 +1086,7 @@ mod tests {
     fn reported(pushdown: PushdownStrategy, bounds: PartitionBounds) -> PartitionStatus {
         PartitionStatus::Reported(PartitionData {
             pushdown,
+            build_lease: None,
             bounds,
             keys_have_null: false,
         })
@@ -1385,6 +1461,7 @@ mod tests {
                 PartitionBuildData::Partitioned {
                     partition_id: 0,
                     pushdown: PushdownStrategy::Empty,
+                    build_lease: None,
                     bounds: PartitionBounds::new(vec![]),
                     keys_have_null: false,
                 },

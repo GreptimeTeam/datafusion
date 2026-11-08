@@ -1084,6 +1084,7 @@ mod tests {
         PartitionBuildData::Partitioned {
             partition_id,
             pushdown: PushdownStrategy::Empty,
+            build_lease: None,
             bounds: PartitionBounds::new(vec![]),
             keys_have_null: false,
         }

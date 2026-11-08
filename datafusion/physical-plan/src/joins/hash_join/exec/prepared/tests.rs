@@ -381,8 +381,32 @@ async fn prepared_build_reuses_data_with_independent_dynamic_filters() -> Result
         assert!(futures::poll!(Box::pin(dynamic.filter.wait_complete())).is_ready());
     }
     assert_eq!(pool.reserved(), bytes);
+    let published = plans
+        .iter()
+        .map(|plan| {
+            plan.dynamic_filter
+                .as_ref()
+                .unwrap()
+                .filter
+                .current()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     drop(plans);
     drop(prepared);
+    assert_eq!(
+        pool.reserved(),
+        bytes,
+        "two published consumers share one prepared build charge"
+    );
+    let mut published = published.into_iter();
+    drop(published.next());
+    assert_eq!(
+        pool.reserved(),
+        bytes,
+        "remaining consumer keeps producer charge"
+    );
+    drop(published);
     assert_eq!(pool.reserved(), 0);
     Ok(())
 }
@@ -764,7 +788,7 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
         ] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
             let prepared = prepare(&base, batches.clone(), Arc::clone(&pool)).await?;
-            let PushdownStrategy::InList(values) = &prepared.build.membership else {
+            let PushdownStrategy::InList(values) = &prepared.membership else {
                 panic!("expected IN-list membership");
             };
             let columns = prepared.build.batch.columns();
@@ -797,7 +821,7 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
                     Arc::new(config),
                 )
                 .await?;
-            let PushdownStrategy::Map(_, bitmap) = &map.build.membership else {
+            let PushdownStrategy::Map(_, bitmap) = &map.membership else {
                 panic!("expected hash-map membership");
             };
             let bitmap_bytes = bitmap.as_ref().map_or(0, |bitmap| bitmap.size());
@@ -891,10 +915,7 @@ async fn prepared_byte_keys_use_hash_membership() -> Result<()> {
             )
             .await?;
         assert!(prepared.build.bounds.is_none());
-        assert!(matches!(
-            &prepared.build.membership,
-            PushdownStrategy::Map(_, _)
-        ));
+        assert!(matches!(&prepared.membership, PushdownStrategy::Map(_, _)));
         let task = with_probe_filter(base)?
             .builder()
             .with_prepared_build(prepared)
