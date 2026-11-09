@@ -71,6 +71,7 @@ use crate::{
 };
 
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::buffer::NullBuffer;
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -216,6 +217,12 @@ pub(super) struct JoinBuildData {
 pub(super) struct JoinLeftData {
     /// Shared bitmap for visited build indices within this join execution.
     visited_indices_bitmap: SharedBitmapBuilder,
+    /// Logical nulls of the scalar build key for an uncorrelated null-aware
+    /// `LeftAnti` join.
+    ///
+    /// Computed once while collecting the build side because dictionary
+    /// logical-null discovery can scan nested dictionary values.
+    null_aware_build_key_nulls: Option<NullBuffer>,
     /// Bitmap of the build rows whose `NOT IN` is UNKNOWN instead of TRUE.
     ///
     /// Filled by the probe phase of a correlated null-aware join, whose
@@ -274,6 +281,12 @@ impl JoinLeftData {
     /// UNKNOWN
     pub(super) fn null_indices_bitmap(&self) -> &SharedBitmapBuilder {
         &self.null_indices_bitmap
+    }
+
+    /// returns the logical nulls of the scalar build key, when they were
+    /// precomputed
+    pub(super) fn null_aware_build_key_nulls(&self) -> Option<&NullBuffer> {
+        self.null_aware_build_key_nulls.as_ref()
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -1593,8 +1606,11 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
-                    // Correlated null-aware joins record UNKNOWN per build row.
+                    // Correlated null-aware joins record UNKNOWN per build row,
+                    // uncorrelated ones precompute the logical nulls of the
+                    // scalar build key for the final stage.
                     self.null_aware && self.filter.is_some(),
+                    self.null_aware && self.filter.is_none(),
                     right_partitions,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -1617,6 +1633,7 @@ impl ExecutionPlan for HashJoinExec {
                     reservation,
                     need_produce_result_in_final(self.join_type),
                     self.null_aware && self.filter.is_some(),
+                    self.null_aware && self.filter.is_none(),
                     1,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -2416,6 +2433,8 @@ fn concat_build_batches(
 /// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
 /// * `with_null_aware_row_state` - Whether to track the per-build-row UNKNOWN
 ///   decision of a correlated null-aware join
+/// * `with_null_aware_build_key_nulls` - Whether to precompute the logical
+///   nulls of the scalar build key for an uncorrelated null-aware join
 /// * `probe_threads_count` - Number of threads that will probe this hash table
 /// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
 ///
@@ -2447,6 +2466,7 @@ async fn collect_left_input(
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
     with_null_aware_row_state: bool,
+    with_null_aware_build_key_nulls: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
     config: Arc<ConfigOptions>,
@@ -2655,6 +2675,30 @@ async fn collect_left_input(
         BooleanBufferBuilder::new(0)
     };
 
+    // Logical nulls, so that a dictionary key pointing at a NULL dictionary
+    // value counts as a NULL build key in the final stage.
+    let null_aware_build_key_nulls =
+        if with_null_aware_build_key_nulls && !left_values.is_empty() {
+            left_values[0]
+                .logical_nulls()
+                .filter(|nulls| nulls.null_count() > 0)
+        } else {
+            None
+        };
+    if let Some(nulls) = &null_aware_build_key_nulls {
+        // `logical_nulls` reuses an array's physical null buffer when it can.
+        // Only charge newly materialized buffers, such as dictionary logical
+        // nulls, because the build batch's buffers were reserved above.
+        let reuses_input_buffer = left_values[0]
+            .nulls()
+            .is_some_and(|input| input.inner().ptr_eq(nulls.inner()));
+        if !reuses_input_buffer {
+            let retained_size = nulls.buffer().capacity();
+            reservation.try_grow(retained_size)?;
+            metrics.build_mem_used.add(retained_size);
+        }
+    }
+
     let map = Arc::new(join_hash_map);
 
     // For an ordinary build, nothing reads the strategy unless this join's own
@@ -2732,6 +2776,7 @@ async fn collect_left_input(
     let data = JoinLeftData {
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
         null_indices_bitmap: Mutex::new(null_indices_bitmap),
+        null_aware_build_key_nulls,
         probe_completion: ProbeCompletion::new(probe_threads_count),
         membership,
         _visited_reservation: visited_reservation,
@@ -2811,7 +2856,6 @@ mod tests {
         ScalarValue, assert_batches_eq, assert_batches_sorted_eq, assert_contains,
         exec_err, internal_err,
     };
-    use futures::StreamExt;
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::memory_pool::{
         GreedyMemoryPool, MemoryPool, UnboundedMemoryPool,
@@ -2822,6 +2866,7 @@ mod tests {
     use datafusion_physical_expr::{
         EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
+    use futures::StreamExt;
     use hashbrown::HashTable;
     use insta::{allow_duplicates, assert_snapshot};
     use rstest::*;
@@ -8931,8 +8976,8 @@ mod tests {
             +----+-------+
             | c1 | dummy |
             +----+-------+
-            | 1  | 10    |
             |    | 0     |
+            | 1  | 10    |
             +----+-------+
             ");
         }
@@ -9038,6 +9083,72 @@ mod tests {
             ");
         }
 
+        Ok(())
+    }
+
+    /// `NULL NOT IN (5, 6)` is UNKNOWN, so the build row whose key points at a
+    /// NULL dictionary value must be dropped, as it is when the key is a
+    /// physical NULL.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_anti_build_logical_null(
+        batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_dict_key(
+            "c1",
+            vec![Some(1), None, Some(2)],
+            vec![0, 1, 2],
+            "dummy",
+            vec![Some(10), Some(0), Some(20)],
+        );
+        let left_key = left
+            .execute(0, Arc::clone(&task_ctx))?
+            .next()
+            .await
+            .unwrap()?;
+        assert_eq!(left_key.column(0).null_count(), 0);
+        assert_eq!(left_key.column(0).logical_null_count(), 1);
+
+        let right = build_table_dict_key(
+            "c2",
+            vec![Some(5), Some(6)],
+            vec![0, 1],
+            "dummy",
+            vec![Some(50), Some(60)],
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+
+            | c1 | dummy |
+            +----+-------+
+            | 1  | 10    |
+            | 2  | 20    |
+            +----+-------+
+            ");
+        }
         Ok(())
     }
 
