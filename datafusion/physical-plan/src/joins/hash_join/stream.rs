@@ -988,6 +988,23 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         };
 
+        // A NULL probe key seen by any partition makes `build.key NOT IN (probe)`
+        // UNKNOWN for every build row, so nothing is emitted. Decide that before
+        // materialising the unmatched indices: an uncorrelated join would build
+        // the whole index set only to have `null_aware_left_anti_final_indices`
+        // discard it, which costs an `O(build rows)` scan and two temporary arrays.
+        // Correlated joins keep going, because their UNKNOWN decision is per build
+        // row and already recorded by the probe phase.
+        if self.null_aware
+            && self.join_type == JoinType::LeftAnti
+            && self.filter.is_none()
+            && probe_summary.has_null
+        {
+            timer.done();
+            self.state = HashJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         // use the global left bitmap to produce the left indices and right indices
         let (mut left_side, mut right_side) = get_final_indices_from_shared_bitmap(
             build_side.left_data.visited_indices_bitmap(),
