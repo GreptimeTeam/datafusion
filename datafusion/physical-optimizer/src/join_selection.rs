@@ -283,9 +283,10 @@ pub(crate) fn partitioned_hash_join(
         hash_join.swap_inputs(PartitionMode::Partitioned)
     } else {
         // Null-aware anti joins must use CollectLeft mode because they track probe-side state
-        // (probe_side_non_empty, probe_side_has_null) per-partition, but need global knowledge
-        // for correct null handling. With partitioning, a partition might not see probe rows
-        // even if the probe side is globally non-empty, leading to incorrect NULL row handling.
+        // (did any probe partition see a row, did any see a NULL key) that has to be shared
+        // between partitions for correct null handling. With partitioning, a partition might
+        // not see probe rows even if the probe side is globally non-empty, leading to
+        // incorrect NULL row handling.
         let partition_mode = if hash_join.null_aware {
             PartitionMode::CollectLeft
         } else {
