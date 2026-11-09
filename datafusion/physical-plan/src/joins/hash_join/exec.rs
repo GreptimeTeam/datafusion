@@ -70,7 +70,9 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanBufferBuilder, GenericListArray, OffsetSizeTrait,
+};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -2321,6 +2323,11 @@ fn new_join_hashmap(
 ///
 /// Concatenating view arrays copies only the views and keeps sharing the data
 /// buffers of the inputs, which are already accounted for.
+///
+/// `concat` slices the child values of list and map arrays to the range selected
+/// by their offsets before copying them (see `concat_lists` and `concat_maps` in
+/// `arrow-select`), so only that range is newly allocated. The rest of the child
+/// backing stays shared with the inputs, which already reserve it.
 fn estimate_concat_allocation(array: &dyn Array) -> Result<usize> {
     match array.data_type() {
         DataType::Utf8View | DataType::BinaryView => {
@@ -2330,8 +2337,61 @@ fn estimate_concat_allocation(array: &dyn Array) -> Result<usize> {
                 .unwrap_or_default();
             Ok(array.len() * size_of::<u128>() + nulls)
         }
+        DataType::List(_) => list_concat_allocation(array.as_list::<i32>()),
+        DataType::LargeList(_) => list_concat_allocation(array.as_list::<i64>()),
+        DataType::Map(_, _) => {
+            let map = array.as_map();
+            let (start, len) = selected_child_range(map.offsets(), map.len());
+            let entries = map.entries().slice(start, len);
+            Ok(merged_offsets_size::<i32>(map.len(), map.nulls().is_some())
+                + estimate_concat_allocation(&entries)?)
+        }
+        DataType::Struct(_) => {
+            // Slicing a struct array slices its children and `concat` recurses
+            // into them, so only the children's own estimates are needed.
+            let struct_array = array.as_struct();
+            let mut size =
+                concat_nulls_size(struct_array.len(), struct_array.nulls().is_some());
+            for column in struct_array.columns() {
+                size += estimate_concat_allocation(column.as_ref())?;
+            }
+            Ok(size)
+        }
         _ => Ok(array.to_data().get_slice_memory_size()?),
     }
+}
+
+/// Estimates the memory newly allocated for a list array's share of a
+/// concatenated list array.
+fn list_concat_allocation<O: OffsetSizeTrait>(
+    array: &GenericListArray<O>,
+) -> Result<usize> {
+    let (start, len) = selected_child_range(array.value_offsets(), array.len());
+    Ok(
+        merged_offsets_size::<O>(array.len(), array.nulls().is_some())
+            + estimate_concat_allocation(array.values().slice(start, len).as_ref())?,
+    )
+}
+
+/// The `(start, len)` range of the child values a list or map array concatenates.
+///
+/// Note the offsets are absolute within the child buffer, which stays unsliced
+/// when the parent array is sliced.
+fn selected_child_range<O: OffsetSizeTrait>(offsets: &[O], len: usize) -> (usize, usize) {
+    let start = offsets[0].as_usize();
+    (start, offsets[len].as_usize() - start)
+}
+
+/// Memory newly allocated for the merged offsets and validity of a concatenated
+/// list or map array of `len` elements.
+fn merged_offsets_size<O: OffsetSizeTrait>(len: usize, has_nulls: bool) -> usize {
+    // One boundary per element plus the final one.
+    (len + 1) * size_of::<O>() + concat_nulls_size(len, has_nulls)
+}
+
+/// Memory newly allocated for a validity bitmap of `len` elements.
+fn concat_nulls_size(len: usize, has_nulls: bool) -> usize {
+    if has_nulls { bit_util::ceil(len, 8) } else { 0 }
 }
 
 /// Concatenates the build side `batches` into a single batch, in reverse order
@@ -2765,11 +2825,11 @@ mod tests {
     };
 
     use arrow::array::{
-        BinaryViewArray, Date32Array, Int32Array, Int64Array, StringArray,
-        StringViewArray, StructArray, UInt32Array, UInt64Array,
+        BinaryViewArray, Date32Array, Int32Array, Int64Array, ListArray, MapArray,
+        StringArray, StringViewArray, StructArray, UInt32Array, UInt64Array,
     };
-    use arrow::buffer::NullBuffer;
-    use arrow::datatypes::{DataType, Field};
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
+    use arrow::datatypes::{DataType, Field, Fields};
     use datafusion_common::hash_utils::create_hashes;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{
@@ -6687,6 +6747,132 @@ mod tests {
         Ok((reservation, counter.memory_usage()))
     }
 
+    /// Values buffer shared by the two [`list_slice_batches`] inputs.
+    const LIST_SLICE_CHILD_BYTES: usize = 1024 * 1024 * size_of::<i64>();
+
+    /// Two batches of a `k: Int32, l: List<Int64>` schema that are one-element,
+    /// zero-copy slices of a single `1024 x 1024` Int64 `ListArray`: both `l`
+    /// columns share one 8 MiB values buffer while selecting 1024 values each.
+    fn list_slice_batches(keys: [i32; 2]) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        const LISTS: usize = 1024;
+        const VALUES_PER_LIST: usize = 1024;
+        let item = Arc::new(Field::new("item", DataType::Int64, false));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("l", DataType::List(Arc::clone(&item)), true),
+        ]));
+        let values = Int64Array::from(vec![7_i64; LISTS * VALUES_PER_LIST]);
+        let parent = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths(std::iter::repeat_n(VALUES_PER_LIST, LISTS)),
+            Arc::new(values),
+            None,
+        );
+        let batches = [0, 512]
+            .into_iter()
+            .zip(keys)
+            .map(|(offset, key)| -> Result<RecordBatch> {
+                // One-element zero-copy slice of the shared parent list.
+                let payload: ArrayRef = Arc::new(parent.slice(offset, 1));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(vec![key])), payload],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches))
+    }
+
+    /// Two batches of a `k: Int32, s: Struct<l: List<Int64>>` schema whose `s`
+    /// columns are one-element, zero-copy slices of one `4 x 1024` Int64 parent:
+    /// both share a single 32 KiB values buffer while selecting 1024 values each.
+    fn struct_list_slice_batches() -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        const LISTS: usize = 4;
+        const VALUES_PER_LIST: usize = 1024;
+        let item = Arc::new(Field::new("item", DataType::Int64, false));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(VALUES_PER_LIST, LISTS)),
+            Arc::new(Int64Array::from(vec![7_i64; LISTS * VALUES_PER_LIST])),
+            None,
+        );
+        let list_field = Arc::new(Field::new("l", list.data_type().clone(), true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new(
+                "s",
+                DataType::Struct(vec![Arc::clone(&list_field)].into()),
+                true,
+            ),
+        ]));
+        let parent = StructArray::new(
+            vec![list_field].into(),
+            vec![Arc::new(list) as ArrayRef],
+            None,
+        );
+        let batches = [0, 2]
+            .into_iter()
+            .zip([1, 2])
+            .map(|(offset, key)| -> Result<RecordBatch> {
+                let payload: ArrayRef = Arc::new(parent.slice(offset, 1));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(vec![key])), payload],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches))
+    }
+
+    /// Two batches of a `k: Int32, m: Map<Int32, Int64>` schema whose `m` columns
+    /// are one-element, zero-copy slices of one `4 x 1024` entries parent: both
+    /// share a single entries backing while selecting 1024 entries each.
+    fn map_slice_batches() -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        const MAPS: usize = 4;
+        const ENTRIES_PER_MAP: usize = 1024;
+        let keys = Arc::new(Field::new("key", DataType::Int32, false));
+        let values = Arc::new(Field::new("value", DataType::Int64, false));
+        let entries_fields = Fields::from(vec![Arc::clone(&keys), Arc::clone(&values)]);
+        let entries = StructArray::new(
+            entries_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    0..(MAPS * ENTRIES_PER_MAP) as i32,
+                )),
+                Arc::new(Int64Array::from(vec![7_i64; MAPS * ENTRIES_PER_MAP])),
+            ],
+            None,
+        );
+        let field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entries_fields),
+            false,
+        ));
+        let parent = MapArray::new(
+            Arc::clone(&field),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(ENTRIES_PER_MAP, MAPS)),
+            entries,
+            None,
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("m", parent.data_type().clone(), true),
+        ]));
+        let batches = [0, 2]
+            .into_iter()
+            .zip([1, 2])
+            .map(|(offset, key)| -> Result<RecordBatch> {
+                let payload: ArrayRef = Arc::new(parent.slice(offset, 1));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(vec![key])), payload],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches))
+    }
+
     #[test]
     fn concat_build_batches_matches_concat_batches() -> Result<()> {
         let batches = concat_test_batches(4, 100);
@@ -6805,6 +6991,222 @@ mod tests {
             &metrics,
         )?;
         assert_eq!(reservation.size(), get_record_batch_memory_size(&batch));
+        Ok(())
+    }
+
+    /// `concat` slices the values of a `List` input to the range selected by its
+    /// offsets before copying them, so the shared child backing must not be
+    /// reserved a second time on top of the inputs that already hold it.
+    #[test]
+    fn concat_build_batches_list_child_not_reserved_twice() -> Result<()> {
+        let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+        let (schema, batches) = list_slice_batches([1, 2])?;
+        let selected = batches
+            .iter()
+            .map(|batch| batch.column(1).as_list::<i32>().value(0))
+            .collect::<Vec<_>>();
+
+        // The inputs share the child values buffer, so it is reserved once.
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            counter.count_batch(batch);
+        }
+        let expected_inputs = counter.memory_usage();
+        assert!(expected_inputs >= LIST_SLICE_CHILD_BYTES);
+        assert!(expected_inputs < LIST_SLICE_CHILD_BYTES + 16 * 1024);
+
+        // Concatenating copies two one-element lists, i.e. 2 x 1024 Int64 values
+        // plus the merged offsets. A 1 MiB allowance is very loose for that, but
+        // far below the ~16 MiB of counting the full child once per input.
+        let copy_allowance = 1 << 20;
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
+        assert_eq!(inputs_reserved, expected_inputs);
+
+        let batch = concat_build_batches(
+            &schema,
+            batches,
+            false,
+            inputs_reserved,
+            &mut reservation,
+            &metrics,
+        )?;
+
+        // Only the selected values were copied, so the reservation ends up at
+        // what the concatenated batch actually retains.
+        assert_eq!(batch.num_rows(), 2);
+        let retained = get_record_batch_memory_size(&batch);
+        assert!(retained < copy_allowance);
+        assert_eq!(reservation.size(), retained);
+        assert_eq!(pool.reserved(), retained);
+
+        // The payloads of both inputs are preserved.
+        let payload = batch.column(1).as_list::<i32>();
+        assert_eq!(payload.value(0).as_ref(), selected[0].as_ref());
+        assert_eq!(payload.value(1).as_ref(), selected[1].as_ref());
+        Ok(())
+    }
+
+    /// A `List` nested in a `Struct` is sliced by `StructArray::slice` and the
+    /// list values are then sliced again by `concat`, so their shared backing
+    /// must not be counted once per input either.
+    #[test]
+    fn concat_build_batches_struct_list_child_not_reserved_twice() -> Result<()> {
+        let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+        let (schema, batches) = struct_list_slice_batches()?;
+        let child_bytes = 4 * 1024 * size_of::<i64>();
+
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            counter.count_batch(batch);
+        }
+        let expected_inputs = counter.memory_usage();
+        assert!(expected_inputs >= child_bytes);
+        assert!(expected_inputs < child_bytes + 16 * 1024);
+
+        // Concatenating copies two one-element lists: 2 x 1024 Int64 values plus
+        // the merged offsets and the struct validity.
+        let copy_allowance = 32 * 1024;
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
+        assert_eq!(inputs_reserved, expected_inputs);
+
+        let batch = concat_build_batches(
+            &schema,
+            batches,
+            false,
+            inputs_reserved,
+            &mut reservation,
+            &metrics,
+        )?;
+
+        assert_eq!(batch.num_rows(), 2);
+        let retained = get_record_batch_memory_size(&batch);
+        assert!(retained < copy_allowance);
+        assert_eq!(reservation.size(), retained);
+
+        let lists = batch.column(1).as_struct().column(0).as_list::<i32>();
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists.value_length(0), 1024);
+        assert_eq!(lists.value_length(1), 1024);
+        Ok(())
+    }
+
+    /// `concat` slices the entries of a `Map` input to the range selected by its
+    /// offsets, so the shared entries backing must not be counted again.
+    #[test]
+    fn concat_build_batches_map_entries_not_reserved_twice() -> Result<()> {
+        let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+        let (schema, batches) = map_slice_batches()?;
+        let child_bytes = 4 * 1024 * (size_of::<i32>() + size_of::<i64>());
+
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            counter.count_batch(batch);
+        }
+        let expected_inputs = counter.memory_usage();
+        assert!(expected_inputs >= child_bytes);
+        assert!(expected_inputs < child_bytes + 16 * 1024);
+
+        // Concatenating copies two one-element maps: 2 x 1024 (Int32, Int64)
+        // entries plus the merged offsets.
+        let copy_allowance = 32 * 1024;
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
+        assert_eq!(inputs_reserved, expected_inputs);
+
+        let batch = concat_build_batches(
+            &schema,
+            batches,
+            false,
+            inputs_reserved,
+            &mut reservation,
+            &metrics,
+        )?;
+
+        assert_eq!(batch.num_rows(), 2);
+        let retained = get_record_batch_memory_size(&batch);
+        assert!(retained < copy_allowance);
+        assert_eq!(reservation.size(), retained);
+
+        let maps = batch.column(1).as_map();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps.value_length(0), 1024);
+        assert_eq!(maps.value_length(1), 1024);
+        Ok(())
+    }
+
+    /// The ordinary hash join build path must fit in a pool that only has room
+    /// for the build inputs and the `List` values `concat` actually copies.
+    #[tokio::test]
+    async fn join_build_list_slice_concat_not_reserved_twice() -> Result<()> {
+        // Sparse keys keep the build on the hash table path instead of the
+        // perfect hash map.
+        let (left_schema, batches) = list_slice_batches([1, 100_000])?;
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            counter.count_batch(batch);
+        }
+        let inputs = counter.memory_usage();
+        assert!(inputs >= LIST_SLICE_CHILD_BYTES);
+
+        let copy_allowance = 1 << 20;
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(inputs + copy_allowance));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let left = TestMemoryExec::try_new_exec(
+            std::slice::from_ref(&batches),
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        let right_schema =
+            Arc::new(Schema::new(vec![Field::new("k2", DataType::Int32, false)]));
+        let probe = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 100_000]))],
+        )?;
+        let right = TestMemoryExec::try_new_exec(
+            &[vec![probe]],
+            Arc::clone(&right_schema),
+            None,
+        )?;
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left_schema)?) as _,
+            Arc::new(Column::new_with_schema("k2", &right_schema)?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+
+        let stream = join.execute(0, Arc::clone(&task_ctx))?;
+        let output = common::collect(stream).await?;
+        let rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 2);
+
+        // The build payload survives the concat: one selected list per output row.
+        let mut value_lengths = Vec::new();
+        for batch in &output {
+            let payload = batch.column(1).as_list::<i32>();
+            for row in 0..payload.len() {
+                value_lengths.push(payload.value_length(row));
+            }
+        }
+        assert_eq!(value_lengths, vec![1024, 1024]);
         Ok(())
     }
 
