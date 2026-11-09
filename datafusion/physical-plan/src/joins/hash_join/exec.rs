@@ -216,6 +216,12 @@ pub(super) struct JoinBuildData {
 pub(super) struct JoinLeftData {
     /// Shared bitmap for visited build indices within this join execution.
     visited_indices_bitmap: SharedBitmapBuilder,
+    /// Bitmap of the build rows whose `NOT IN` is UNKNOWN instead of TRUE.
+    ///
+    /// Filled by the probe phase of a correlated null-aware join, whose
+    /// per-build-row decision replaces the shared probe-side flags (see
+    /// [`HashJoinExec::null_aware`]).
+    null_indices_bitmap: SharedBitmapBuilder,
     /// Tracks which probe partition finishes last and what the partitions
     /// collectively saw. See [`ProbeCompletion`] for the invariant it upholds.
     probe_completion: ProbeCompletion,
@@ -262,6 +268,12 @@ impl JoinLeftData {
     /// returns a reference to the visited indices bitmap
     pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
         &self.visited_indices_bitmap
+    }
+
+    /// returns a reference to the bitmap of build rows whose `NOT IN` is
+    /// UNKNOWN
+    pub(super) fn null_indices_bitmap(&self) -> &SharedBitmapBuilder {
+        &self.null_indices_bitmap
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -822,6 +834,15 @@ pub struct HashJoinExec {
     /// The equality null-handling behavior of the join algorithm.
     pub null_equality: NullEquality,
     /// Flag to indicate if this is a null-aware anti join
+    ///
+    /// Set for the physical lowering of scalar `NOT IN` subqueries
+    /// (`JoinType::LeftAnti`). When `true`, NULLs in the join keys follow SQL
+    /// `NOT IN` three-valued logic rather than ordinary equi-join semantics.
+    ///
+    /// A join filter holds the non-equality part of a correlated subquery, and
+    /// only the build rows it keeps take part in the three-valued logic: such
+    /// a join records the UNKNOWN decision per build row in the null-indices
+    /// bitmap instead of in shared probe-side flags.
     pub null_aware: bool,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
@@ -1572,6 +1593,8 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    // Correlated null-aware joins record UNKNOWN per build row.
+                    self.null_aware && self.filter.is_some(),
                     right_partitions,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -1593,6 +1616,7 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    self.null_aware && self.filter.is_some(),
                     1,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -2390,6 +2414,8 @@ fn concat_build_batches(
 /// * `metrics` - Metrics collector for tracking memory usage and row counts
 /// * `reservation` - Memory reservation tracker for the hash table and data
 /// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
+/// * `with_null_aware_row_state` - Whether to track the per-build-row UNKNOWN
+///   decision of a correlated null-aware join
 /// * `probe_threads_count` - Number of threads that will probe this hash table
 /// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
 ///
@@ -2420,6 +2446,7 @@ async fn collect_left_input(
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
+    with_null_aware_row_state: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
     config: Arc<ConfigOptions>,
@@ -2614,6 +2641,20 @@ async fn collect_left_input(
         (BooleanBufferBuilder::new(0), reservation.new_empty())
     };
 
+    // Shared by all probe partitions of a correlated null-aware join, which
+    // record the per-build-row UNKNOWN decision here. Charged to the build
+    // reservation, which stays alive as long as this data is reachable.
+    let null_indices_bitmap = if with_null_aware_row_state {
+        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
+        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        bitmap_buffer.append_n(num_rows, false);
+        bitmap_buffer
+    } else {
+        BooleanBufferBuilder::new(0)
+    };
+
     let map = Arc::new(join_hash_map);
 
     // For an ordinary build, nothing reads the strategy unless this join's own
@@ -2690,6 +2731,7 @@ async fn collect_left_input(
 
     let data = JoinLeftData {
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        null_indices_bitmap: Mutex::new(null_indices_bitmap),
         probe_completion: ProbeCompletion::new(probe_threads_count),
         membership,
         _visited_reservation: visited_reservation,
@@ -8894,6 +8936,108 @@ mod tests {
             +----+-------+
             ");
         }
+        Ok(())
+    }
+
+    /// `left.z > right.z` over the second column of two-column tables: the
+    /// non-equality correlation of
+    /// `id NOT IN (SELECT r.id FROM r WHERE r.z < l.z)`.
+    fn prepare_second_column_gt_filter() -> JoinFilter {
+        let column_indices = vec![
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+        ];
+        let intermediate_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, true),
+            Field::new("z", DataType::Int32, true),
+        ]);
+        let filter_expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("z", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("z", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        JoinFilter::new(
+            filter_expression,
+            column_indices,
+            Arc::new(intermediate_schema),
+        )
+    }
+
+    /// Build and probe sides of a null-aware join whose only correlation is
+    /// the non-equality filter from [`prepare_second_column_gt_filter`].
+    ///
+    /// For each build row, the probe rows with a smaller `z` form its
+    /// subquery result:
+    /// - `(1, 10)` and `(2, 20)`: `{1, NULL}`
+    /// - `(NULL, 30)`: `{1, NULL}`
+    /// - `(4, 40)`: `{1, 4, NULL}`
+    /// - `(NULL, 1)` and `(5, 1)`: empty
+    ///
+    /// The probe row `(NULL, 50)` never passes the filter.
+    fn build_null_aware_filter_only_inputs()
+    -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>, JoinOn) {
+        let left = build_table_two_cols(
+            ("id", &vec![Some(1), Some(2), None, Some(4), None, Some(5)]),
+            (
+                "z",
+                &vec![Some(10), Some(20), Some(30), Some(40), Some(1), Some(1)],
+            ),
+        );
+        let right = build_table_two_cols(
+            ("id", &vec![Some(1), None, Some(4), None]),
+            ("z", &vec![Some(5), Some(50), Some(35), Some(2)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("id", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("id", &right.schema()).unwrap()) as _,
+        )];
+        (left, right, on)
+    }
+
+    /// Null-aware `LeftAnti` with a join filter and no correlation scope keys.
+    ///
+    /// A NULL on either side only makes `NOT IN` UNKNOWN for the build rows
+    /// where the filter keeps the NULL, so the NULLs must not remove every row.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_anti_filter_only(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+        let (left, right, on) = build_null_aware_filter_only_inputs();
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(prepare_second_column_gt_filter()),
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        // Only the rows with an empty subquery result are TRUE.
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+---+
+            | id | z |
+            +----+---+
+            |    | 1 |
+            | 5  | 1 |
+            +----+---+
+            ");
+        }
+
         Ok(())
     }
 
