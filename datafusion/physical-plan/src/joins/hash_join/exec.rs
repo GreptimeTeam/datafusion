@@ -234,7 +234,10 @@ pub(super) struct JoinLeftData {
     probe_completion: ProbeCompletion,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
-    /// The mutable visited bitmap belongs to this execution, not the build owner.
+    /// The mutable probe-side bitmaps belong to this execution, not the build
+    /// owner: the visited bitmap and, for a correlated null-aware join, the
+    /// correlation bitmap. Charging them here keeps a leased build from
+    /// carrying the cost of state that belongs to one consuming join.
     _visited_reservation: MemoryReservation,
     build: Arc<JoinBuildData>,
 }
@@ -2662,11 +2665,13 @@ async fn collect_left_input(
     };
 
     // Shared by all probe partitions of a correlated null-aware join, which
-    // record the per-build-row UNKNOWN decision here. Charged to the build
-    // reservation, which stays alive as long as this data is reachable.
+    // record the per-build-row UNKNOWN decision here. It is per-execution
+    // state, so it is charged to the same lease as the visited bitmap: a
+    // dynamic filter can retain the build data after this join's own state is
+    // dropped, and that retained lease must not carry this bitmap's cost.
     let null_indices_bitmap = if with_null_aware_row_state {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
+        visited_reservation.try_grow(bitmap_size)?;
         metrics.build_mem_used.add(bitmap_size);
         let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
         bitmap_buffer.append_n(num_rows, false);
@@ -7594,6 +7599,8 @@ mod tests {
             BuildProbeJoinMetrics::new(0, &metrics_set),
             MemoryConsumer::new("build quota").register(&unbounded),
             false,
+            false,
+            false,
             1,
             false,
             Arc::clone(&config),
@@ -7622,6 +7629,8 @@ mod tests {
                 on_left.clone(),
                 BuildProbeJoinMetrics::new(0, &metrics_set),
                 MemoryConsumer::new("build quota").register(&pool),
+                false,
+                false,
                 false,
                 1,
                 false,
@@ -7815,6 +7824,8 @@ mod tests {
             BuildProbeJoinMetrics::new(0, &metrics_set),
             MemoryConsumer::new("visited lease").register(&pool),
             true,
+            false,
+            false,
             1,
             true,
             Arc::new(ConfigOptions::default()),
@@ -7840,6 +7851,57 @@ mod tests {
             pool.reserved(),
             producer_bytes,
             "visited and unshared pruning bitmap must release with execution"
+        );
+        drop(producer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// The correlation bitmap of a correlated null-aware join is mutable
+    /// per-execution state too: a retained build lease must not keep paying
+    /// for it once the join's own state is gone.
+    #[tokio::test]
+    async fn correlated_bitmap_reservation_is_execution_local() -> Result<()> {
+        use crate::memory::MemoryStream;
+        let values: Vec<i32> = (0..1024).collect();
+        let batch = build_table_i32(("a1", &values), ("b1", &values), ("c1", &values));
+        let schema = batch.schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let data = collect_left_input(
+            HASH_JOIN_SEED.random_state().clone(),
+            Box::pin(MemoryStream::try_new(vec![batch], schema, None)?),
+            vec![Arc::new(Column::new("a1", 0))],
+            BuildProbeJoinMetrics::new(0, &metrics_set),
+            MemoryConsumer::new("correlated lease").register(&pool),
+            true,
+            true,
+            false,
+            1,
+            true,
+            Arc::new(ConfigOptions::default()),
+            NullEquality::NullEqualsNothing,
+            MetricBuilder::new(&metrics_set)
+                .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0),
+            BuildMode::Ordinary,
+        )
+        .await?;
+        let producer_bytes = data.build.reservation.size();
+        #[expect(clippy::used_underscore_binding)]
+        let visited_bytes = data._visited_reservation.size();
+        let bitmap_bytes = data.membership.bitmap_reserved_bytes();
+        // Visited bitmap plus the correlation bitmap, one bit per build row each.
+        assert_eq!(visited_bytes, 2 * (1024 / 8));
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes + visited_bytes + bitmap_bytes
+        );
+        let producer = Arc::clone(&data.build);
+        drop(data);
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes,
+            "both mutable bitmaps must release with execution, not with the lease"
         );
         drop(producer);
         assert_eq!(pool.reserved(), 0);
@@ -7879,6 +7941,8 @@ mod tests {
             on,
             metrics,
             reservation,
+            false,
+            false,
             false,
             1,
             false,

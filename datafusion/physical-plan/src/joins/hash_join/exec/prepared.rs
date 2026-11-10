@@ -73,9 +73,11 @@ impl PreparedHashJoinBuild {
         JoinLeftData {
             build: Arc::clone(&self.build),
             visited_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
-            probe_threads_counter: AtomicUsize::new(probe_threads),
-            probe_side_non_empty: AtomicBool::new(false),
-            probe_side_has_null: AtomicBool::new(false),
+            probe_completion: ProbeCompletion::new(probe_threads),
+            // A prepared build serves ordinary joins only: correlated
+            // null-aware joins are rejected before they can consume one.
+            null_indices_bitmap: Mutex::new(BooleanBufferBuilder::new(0)),
+            null_aware_build_key_nulls: None,
             membership: self.membership.clone(),
             _visited_reservation: self.build.reservation.new_empty(),
         }
@@ -192,6 +194,8 @@ impl HashJoinExec {
             self.on.iter().map(|(left, _)| Arc::clone(left)).collect(),
             metrics,
             reservation,
+            false,
+            false,
             false,
             0,
             !byte_keys,
