@@ -91,6 +91,100 @@ statement ok
 drop table t0;
 
 
+# Regression for https://github.com/apache/datafusion/issues/25523.
+# A filter on a lossy cast must not turn the cast input into a constant and
+# remove the required ORDER BY.
+
+# Single execution partition control.
+statement ok
+SET datafusion.execution.target_partitions = 1;
+
+statement ok
+CREATE TABLE lossy_cast (id INT, x DOUBLE, k REAL, n BIGINT)
+AS VALUES (1, -0.5, 1.5, 16777216), (2, 0.5, 2.5, 16777217),
+          (3, NULL, 1.0, NULL), (4, NULL, 1.25, NULL);
+
+# A singleton cast result does not imply a singleton input: CAST(k AS BIGINT) = 1
+# matches 1.0, 1.25 and 1.5, so ORDER BY k must survive. The matching rows are
+# inserted in neither ascending nor descending k order, so a dropped sort cannot
+# accidentally satisfy the ASC expectation.
+query IR
+SELECT id, k FROM lossy_cast WHERE CAST(k AS BIGINT) = 1 ORDER BY k ASC;
+----
+3 1
+4 1.25
+1 1.5
+
+query IR
+SELECT id, k FROM lossy_cast WHERE CAST(k AS BIGINT) = 1 ORDER BY k DESC;
+----
+1 1.5
+4 1.25
+3 1
+
+query I
+SELECT id FROM lossy_cast WHERE CAST(x AS INT) = 0 ORDER BY x DESC;
+----
+2
+1
+
+query I
+SELECT id FROM lossy_cast WHERE CAST(n AS REAL) = 16777216::REAL ORDER BY n DESC;
+----
+2
+1
+
+# Same regressions with multiple execution partitions.
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
+query IR
+SELECT id, k FROM lossy_cast WHERE CAST(k AS BIGINT) = 1 ORDER BY k ASC;
+----
+3 1
+4 1.25
+1 1.5
+
+query IR
+SELECT id, k FROM lossy_cast WHERE CAST(k AS BIGINT) = 1 ORDER BY k DESC;
+----
+1 1.5
+4 1.25
+3 1
+
+query I
+SELECT id FROM lossy_cast WHERE CAST(x AS INT) = 0 ORDER BY x DESC;
+----
+2
+1
+
+statement ok
+DROP TABLE lossy_cast;
+
+statement ok
+CREATE TABLE lossy_non_numeric (id INT, t TIMESTAMP, s VARCHAR)
+AS VALUES (1, TIMESTAMP '2026-01-01 01:00:00', '01'),
+          (2, TIMESTAMP '2026-01-01 02:00:00', '1');
+
+query I
+SELECT id FROM lossy_non_numeric
+WHERE CAST(t AS DATE) = DATE '2026-01-01' ORDER BY t DESC;
+----
+2
+1
+
+query I
+SELECT id FROM lossy_non_numeric WHERE CAST(s AS INT) = 1 ORDER BY s DESC;
+----
+2
+1
+
+statement ok
+DROP TABLE lossy_non_numeric;
+
+statement ok
+SET datafusion.execution.target_partitions = 4;
+
 # ensure that automatically casting with "datafusion.optimizer.expand_views_at_output" does not
 # change the column name
 
