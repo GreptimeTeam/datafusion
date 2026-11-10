@@ -415,6 +415,62 @@ SELECT * FROM test_table WHERE (c1 NOT IN (SELECT c2 FROM test_table)) = true;
 # This will be addressed in next Phase (multi-column support).
 
 #############
+## Correlated NOT IN with a non-equality (residual) correlation
+#############
+## The correlation `residual_outer.g > 0` cannot become an equi-join key, so it
+## stays a join filter. A NULL in the subquery then only makes `NOT IN`
+## UNKNOWN for the outer rows the filter keeps: the rows with `g = 0` or
+## `g IS NULL` see an empty subquery, and `NOT IN (empty)` is TRUE for them.
+
+statement ok
+CREATE TABLE residual_outer(id INT, g INT) AS VALUES (1,5),(2,5),(3,0),(4,NULL),(NULL,5),(NULL,0);
+
+statement ok
+CREATE TABLE residual_inner(id INT) AS VALUES (1),(NULL);
+
+query II rowsort
+SELECT id, g FROM residual_outer
+WHERE id NOT IN (SELECT id FROM residual_inner WHERE residual_outer.g > 0);
+----
+3 0
+4 NULL
+NULL 0
+
+# The shape the executor fix covers: a single equi key plus the residual
+# `> 0` correlation as the join filter, on a null-aware `LeftAnti`.
+query TT
+EXPLAIN SELECT id, g FROM residual_outer
+WHERE id NOT IN (SELECT id FROM residual_inner WHERE residual_outer.g > 0);
+----
+logical_plan
+01)LeftAnti Join: residual_outer.id = __correlated_sq_1.id Filter: residual_outer.g > Int32(0) null_aware
+02)--TableScan: residual_outer projection=[id, g]
+03)--SubqueryAlias: __correlated_sq_1
+04)----TableScan: residual_inner projection=[id]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(id@0, id@0)], filter=g@0 > 0, null_aware
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+03)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Subquery left empty by the residual: NULL NOT IN (empty) is TRUE.
+query II rowsort
+SELECT id, g FROM residual_outer
+WHERE id NOT IN (SELECT id FROM residual_inner WHERE residual_outer.g > 100);
+----
+1 5
+2 5
+3 0
+4 NULL
+NULL 0
+NULL 5
+
+statement ok
+DROP TABLE residual_outer;
+
+statement ok
+DROP TABLE residual_inner;
+
+#############
 ## Cleanup
 #############
 

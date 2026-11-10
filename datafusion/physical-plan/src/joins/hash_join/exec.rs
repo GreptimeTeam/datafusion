@@ -18,7 +18,6 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
@@ -33,6 +32,7 @@ use crate::filter_pushdown::{
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
+use crate::joins::hash_join::probe_completion::{ProbeCompletion, ProbeSideSummary};
 use crate::joins::hash_join::shared_bounds::{
     ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
 };
@@ -71,6 +71,7 @@ use crate::{
 };
 
 use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::buffer::NullBuffer;
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -216,15 +217,27 @@ pub(super) struct JoinBuildData {
 pub(super) struct JoinLeftData {
     /// Shared bitmap for visited build indices within this join execution.
     visited_indices_bitmap: SharedBitmapBuilder,
-    /// Counter of running probe partitions that may update the bitmap.
-    probe_threads_counter: AtomicUsize,
-    /// Whether any probe partition saw data (for null-aware anti joins).
-    pub(super) probe_side_non_empty: AtomicBool,
-    /// Whether any probe partition saw a NULL key (for null-aware anti joins).
-    pub(super) probe_side_has_null: AtomicBool,
+    /// Logical nulls of the scalar build key for an uncorrelated null-aware
+    /// `LeftAnti` join.
+    ///
+    /// Computed once while collecting the build side because dictionary
+    /// logical-null discovery can scan nested dictionary values.
+    null_aware_build_key_nulls: Option<NullBuffer>,
+    /// Bitmap of the build rows whose `NOT IN` is UNKNOWN instead of TRUE.
+    ///
+    /// Filled by the probe phase of a correlated null-aware join, whose
+    /// per-build-row decision replaces the shared probe-side flags (see
+    /// [`HashJoinExec::null_aware`]).
+    null_indices_bitmap: SharedBitmapBuilder,
+    /// Tracks which probe partition finishes last and what the partitions
+    /// collectively saw. See [`ProbeCompletion`] for the invariant it upholds.
+    probe_completion: ProbeCompletion,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
-    /// The mutable visited bitmap belongs to this execution, not the build owner.
+    /// The mutable probe-side bitmaps belong to this execution, not the build
+    /// owner: the visited bitmap and, for a correlated null-aware join, the
+    /// correlation bitmap. Charging them here keeps a leased build from
+    /// carrying the cost of state that belongs to one consuming join.
     _visited_reservation: MemoryReservation,
     build: Arc<JoinBuildData>,
 }
@@ -267,6 +280,18 @@ impl JoinLeftData {
         &self.visited_indices_bitmap
     }
 
+    /// returns a reference to the bitmap of build rows whose `NOT IN` is
+    /// UNKNOWN
+    pub(super) fn null_indices_bitmap(&self) -> &SharedBitmapBuilder {
+        &self.null_indices_bitmap
+    }
+
+    /// returns the logical nulls of the scalar build key, when they were
+    /// precomputed
+    pub(super) fn null_aware_build_key_nulls(&self) -> Option<&NullBuffer> {
+        self.null_aware_build_key_nulls.as_ref()
+    }
+
     /// returns a reference to the InList values for filter pushdown
     pub(super) fn membership(&self) -> &PushdownStrategy {
         &self.membership
@@ -281,10 +306,29 @@ impl JoinLeftData {
         self.build.bounds.as_ref()
     }
 
-    /// Decrements the counter of running threads, and returns `true`
-    /// if caller is the last running thread
-    pub(super) fn report_probe_completed(&self) -> bool {
-        self.probe_threads_counter.fetch_sub(1, Ordering::Relaxed) == 1
+    /// Records what a probe partition saw in one batch, for the null-aware
+    /// rules evaluated in the final stage.
+    pub(super) fn record_probe_batch(&self, non_empty: bool, has_null: bool) {
+        self.probe_completion.record_batch(non_empty, has_null);
+    }
+
+    /// Whether some probe partition has already recorded a NULL join key.
+    ///
+    /// Only an early-exit hint for the probe phase: it may lag behind sibling
+    /// partitions. Final-stage decisions must use the [`ProbeSideSummary`]
+    /// returned by [`Self::report_probe_completed`] instead.
+    pub(super) fn probe_side_has_null_hint(&self) -> bool {
+        self.probe_completion.saw_null_key_hint()
+    }
+
+    /// Marks this probe partition as finished, returning `Some` for the last
+    /// one together with what every partition saw.
+    ///
+    /// The summary is reachable only through this call, which is what stops
+    /// the final stage from reading the shared flags before its own
+    /// decrement. See [`ProbeCompletion`] for why that ordering matters.
+    pub(super) fn report_probe_completed(&self) -> Option<ProbeSideSummary> {
+        self.probe_completion.report_completed()
     }
 }
 
@@ -806,6 +850,15 @@ pub struct HashJoinExec {
     /// The equality null-handling behavior of the join algorithm.
     pub null_equality: NullEquality,
     /// Flag to indicate if this is a null-aware anti join
+    ///
+    /// Set for the physical lowering of scalar `NOT IN` subqueries
+    /// (`JoinType::LeftAnti`). When `true`, NULLs in the join keys follow SQL
+    /// `NOT IN` three-valued logic rather than ordinary equi-join semantics.
+    ///
+    /// A join filter holds the non-equality part of a correlated subquery, and
+    /// only the build rows it keeps take part in the three-valued logic: such
+    /// a join records the UNKNOWN decision per build row in the null-indices
+    /// bitmap instead of in shared probe-side flags.
     pub null_aware: bool,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
@@ -1556,6 +1609,11 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    // Correlated null-aware joins record UNKNOWN per build row,
+                    // uncorrelated ones precompute the logical nulls of the
+                    // scalar build key for the final stage.
+                    self.null_aware && self.filter.is_some(),
+                    self.null_aware && self.filter.is_none(),
                     right_partitions,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -1577,6 +1635,8 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    self.null_aware && self.filter.is_some(),
+                    self.null_aware && self.filter.is_none(),
                     1,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -2374,6 +2434,10 @@ fn concat_build_batches(
 /// * `metrics` - Metrics collector for tracking memory usage and row counts
 /// * `reservation` - Memory reservation tracker for the hash table and data
 /// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
+/// * `with_null_aware_row_state` - Whether to track the per-build-row UNKNOWN
+///   decision of a correlated null-aware join
+/// * `with_null_aware_build_key_nulls` - Whether to precompute the logical
+///   nulls of the scalar build key for an uncorrelated null-aware join
 /// * `probe_threads_count` - Number of threads that will probe this hash table
 /// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
 ///
@@ -2404,6 +2468,8 @@ async fn collect_left_input(
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
+    with_null_aware_row_state: bool,
+    with_null_aware_build_key_nulls: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
     config: Arc<ConfigOptions>,
@@ -2598,6 +2664,46 @@ async fn collect_left_input(
         (BooleanBufferBuilder::new(0), reservation.new_empty())
     };
 
+    // Shared by all probe partitions of a correlated null-aware join, which
+    // record the per-build-row UNKNOWN decision here. It is per-execution
+    // state, so it is charged to the same lease as the visited bitmap: a
+    // dynamic filter can retain the build data after this join's own state is
+    // dropped, and that retained lease must not carry this bitmap's cost.
+    let null_indices_bitmap = if with_null_aware_row_state {
+        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        visited_reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
+        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        bitmap_buffer.append_n(num_rows, false);
+        bitmap_buffer
+    } else {
+        BooleanBufferBuilder::new(0)
+    };
+
+    // Logical nulls, so that a dictionary key pointing at a NULL dictionary
+    // value counts as a NULL build key in the final stage.
+    let null_aware_build_key_nulls =
+        if with_null_aware_build_key_nulls && !left_values.is_empty() {
+            left_values[0]
+                .logical_nulls()
+                .filter(|nulls| nulls.null_count() > 0)
+        } else {
+            None
+        };
+    if let Some(nulls) = &null_aware_build_key_nulls {
+        // `logical_nulls` reuses an array's physical null buffer when it can.
+        // Only charge newly materialized buffers, such as dictionary logical
+        // nulls, because the build batch's buffers were reserved above.
+        let reuses_input_buffer = left_values[0]
+            .nulls()
+            .is_some_and(|input| input.inner().ptr_eq(nulls.inner()));
+        if !reuses_input_buffer {
+            let retained_size = nulls.buffer().capacity();
+            reservation.try_grow(retained_size)?;
+            metrics.build_mem_used.add(retained_size);
+        }
+    }
+
     let map = Arc::new(join_hash_map);
 
     // For an ordinary build, nothing reads the strategy unless this join's own
@@ -2674,9 +2780,9 @@ async fn collect_left_input(
 
     let data = JoinLeftData {
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
-        probe_threads_counter: AtomicUsize::new(probe_threads_count),
-        probe_side_non_empty: AtomicBool::new(false),
-        probe_side_has_null: AtomicBool::new(false),
+        null_indices_bitmap: Mutex::new(null_indices_bitmap),
+        null_aware_build_key_nulls,
+        probe_completion: ProbeCompletion::new(probe_threads_count),
         membership,
         _visited_reservation: visited_reservation,
         build: Arc::new(JoinBuildData {
@@ -2765,6 +2871,7 @@ mod tests {
     use datafusion_physical_expr::{
         EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
+    use futures::StreamExt;
     use hashbrown::HashTable;
     use insta::{allow_duplicates, assert_snapshot};
     use rstest::*;
@@ -7492,6 +7599,8 @@ mod tests {
             BuildProbeJoinMetrics::new(0, &metrics_set),
             MemoryConsumer::new("build quota").register(&unbounded),
             false,
+            false,
+            false,
             1,
             false,
             Arc::clone(&config),
@@ -7520,6 +7629,8 @@ mod tests {
                 on_left.clone(),
                 BuildProbeJoinMetrics::new(0, &metrics_set),
                 MemoryConsumer::new("build quota").register(&pool),
+                false,
+                false,
                 false,
                 1,
                 false,
@@ -7713,6 +7824,8 @@ mod tests {
             BuildProbeJoinMetrics::new(0, &metrics_set),
             MemoryConsumer::new("visited lease").register(&pool),
             true,
+            false,
+            false,
             1,
             true,
             Arc::new(ConfigOptions::default()),
@@ -7738,6 +7851,57 @@ mod tests {
             pool.reserved(),
             producer_bytes,
             "visited and unshared pruning bitmap must release with execution"
+        );
+        drop(producer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// The correlation bitmap of a correlated null-aware join is mutable
+    /// per-execution state too: a retained build lease must not keep paying
+    /// for it once the join's own state is gone.
+    #[tokio::test]
+    async fn correlated_bitmap_reservation_is_execution_local() -> Result<()> {
+        use crate::memory::MemoryStream;
+        let values: Vec<i32> = (0..1024).collect();
+        let batch = build_table_i32(("a1", &values), ("b1", &values), ("c1", &values));
+        let schema = batch.schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let data = collect_left_input(
+            HASH_JOIN_SEED.random_state().clone(),
+            Box::pin(MemoryStream::try_new(vec![batch], schema, None)?),
+            vec![Arc::new(Column::new("a1", 0))],
+            BuildProbeJoinMetrics::new(0, &metrics_set),
+            MemoryConsumer::new("correlated lease").register(&pool),
+            true,
+            true,
+            false,
+            1,
+            true,
+            Arc::new(ConfigOptions::default()),
+            NullEquality::NullEqualsNothing,
+            MetricBuilder::new(&metrics_set)
+                .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0),
+            BuildMode::Ordinary,
+        )
+        .await?;
+        let producer_bytes = data.build.reservation.size();
+        #[expect(clippy::used_underscore_binding)]
+        let visited_bytes = data._visited_reservation.size();
+        let bitmap_bytes = data.membership.bitmap_reserved_bytes();
+        // Visited bitmap plus the correlation bitmap, one bit per build row each.
+        assert_eq!(visited_bytes, 2 * (1024 / 8));
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes + visited_bytes + bitmap_bytes
+        );
+        let producer = Arc::clone(&data.build);
+        drop(data);
+        assert_eq!(
+            pool.reserved(),
+            producer_bytes,
+            "both mutable bitmaps must release with execution, not with the lease"
         );
         drop(producer);
         assert_eq!(pool.reserved(), 0);
@@ -7777,6 +7941,8 @@ mod tests {
             on,
             metrics,
             reservation,
+            false,
+            false,
             false,
             1,
             false,
@@ -8573,6 +8739,477 @@ mod tests {
             +----+-------+
             | 4  | 40    |
             | 5  | 50    |
+            +----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// Builds a two-partition probe side for the cross-partition null-aware
+    /// tests: partition 0 holds the only NULL key, partition 1 holds none.
+    fn build_two_partition_probe_with_null_in_partition_0() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c2", DataType::Int32, true),
+            Field::new("dummy", DataType::Int32, true),
+        ]));
+        let partition_0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Arc::new(Int32Array::from(vec![Some(100), Some(400)])),
+            ],
+        )
+        .unwrap();
+        let partition_1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(200)])),
+            ],
+        )
+        .unwrap();
+        TestMemoryExec::try_new_exec(
+            &[vec![partition_0], vec![partition_1]],
+            schema,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The dictionary counterpart of
+    /// [`build_two_partition_probe_with_null_in_partition_0`]: the same two
+    /// probe partitions, but the join key is a dictionary and partition 0's
+    /// NULL exists only logically.
+    ///
+    /// Every dictionary key is a physically valid index; one of them points at
+    /// a NULL dictionary value. The array therefore reports
+    /// `null_count() == 0` while `logical_null_count() > 0`, which is the case
+    /// that a physical-NULL check silently misses.
+    fn build_two_partition_dict_probe_with_logical_null_in_partition_0()
+    -> Arc<dyn ExecutionPlan> {
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c2", dict_type, true),
+            Field::new("dummy", DataType::Int32, true),
+        ]));
+
+        // Dictionary values: [1, NULL]; keys: [0, 1] => logical [1, NULL].
+        let with_logical_null: ArrayRef = Arc::new(DictionaryArray::new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+        ));
+        assert_eq!(
+            with_logical_null.null_count(),
+            0,
+            "the probe NULL must be logical only, or this test stops covering \
+             the logical_null_count path"
+        );
+        assert!(
+            with_logical_null.logical_null_count() > 0,
+            "the probe key must carry a logical NULL"
+        );
+
+        let partition_0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                with_logical_null,
+                Arc::new(Int32Array::from(vec![Some(100), Some(400)])),
+            ],
+        )
+        .unwrap();
+
+        // Dictionary values: [2]; keys: [0] => logical [2], no NULL anywhere.
+        let partition_1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(DictionaryArray::new(
+                    Int32Array::from(vec![0]),
+                    Arc::new(Int32Array::from(vec![Some(2)])),
+                )),
+                Arc::new(Int32Array::from(vec![Some(200)])),
+            ],
+        )
+        .unwrap();
+
+        TestMemoryExec::try_new_exec(
+            &[vec![partition_0], vec![partition_1]],
+            schema,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Builds a table whose join key is dictionary encoded, so a key can point
+    /// at a NULL dictionary value and be logically, but not physically, NULL.
+    fn build_table_dict_key(
+        key_name: &str,
+        dict_values: Vec<Option<i32>>,
+        keys: Vec<i32>,
+        dummy_name: &str,
+        dummy: Vec<Option<i32>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let dict_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(key_name, dict_type, true),
+            Field::new(dummy_name, DataType::Int32, true),
+        ]));
+        let values = Int32Array::from(dict_values);
+        let key_array = Int32Array::from(keys);
+        let dict: ArrayRef = Arc::new(DictionaryArray::new(key_array, Arc::new(values)));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![dict, Arc::new(Int32Array::from(dummy))],
+        )
+        .unwrap();
+        TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
+    }
+
+    /// Drains the probe partitions of `join` one after another in the given
+    /// order and returns everything they emitted.
+    async fn collect_partitions_in_order(
+        join: &HashJoinExec,
+        order: &[usize],
+        task_ctx: &Arc<TaskContext>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut batches = vec![];
+        for &partition in order {
+            let stream = join.execute(partition, Arc::clone(task_ctx))?;
+            batches.extend(common::collect(stream).await?);
+        }
+        Ok(batches)
+    }
+
+    /// A NULL probe key silences a null-aware anti join even when the
+    /// partition that saw it is not the one emitting the final build rows.
+    ///
+    /// `CollectLeft` with several probe partitions is what the planner
+    /// produces for `NOT IN`, and only the last partition to finish emits the
+    /// build rows, reading what its siblings recorded. Both finishing orders
+    /// must produce no rows.
+    ///
+    /// These partitions are drained sequentially, so this covers the
+    /// cross-partition plumbing, not the concurrent race that motivated
+    /// [`ProbeCompletion`].
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_anti_join_probe_null_in_other_partition(
+        batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        for order in [[0, 1], [1, 0]] {
+            let left = build_table_two_cols(
+                ("c1", &vec![Some(1), Some(2), Some(3), Some(4)]),
+                ("dummy", &vec![Some(10), Some(20), Some(30), Some(40)]),
+            );
+            let right = build_two_partition_probe_with_null_in_partition_0();
+
+            let on = vec![(
+                Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+            )];
+
+            let join = HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true, // null_aware = true
+            )?;
+
+            let batches = collect_partitions_in_order(&join, &order, &task_ctx).await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                rows, 0,
+                "probe order {order:?} emitted rows although a probe partition saw NULL"
+            );
+        }
+        Ok(())
+    }
+
+    /// The dictionary counterpart of
+    /// [`test_null_aware_anti_join_probe_null_in_other_partition`], where the
+    /// silencing probe NULL exists only logically.
+    ///
+    /// A dictionary key that points at a NULL dictionary value has
+    /// `null_count() == 0`, so it takes the logical-null check to record it.
+    /// This pins that check to the cross-partition summary: the partition
+    /// holding the logical NULL is not the one that emits the build rows, in
+    /// either drain order.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_anti_join_probe_logical_null_in_other_partition(
+        batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        for order in [[0, 1], [1, 0]] {
+            // Build keys are dictionary-encoded too, and NULL-free.
+            let left = build_table_dict_key(
+                "c1",
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                vec![0, 1, 2, 3],
+                "dummy",
+                vec![Some(10), Some(20), Some(30), Some(40)],
+            );
+            let right = build_two_partition_dict_probe_with_logical_null_in_partition_0();
+
+            let on = vec![(
+                Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+            )];
+
+            let join = HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true, // null_aware = true
+            )?;
+
+            let batches = collect_partitions_in_order(&join, &order, &task_ctx).await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                rows, 0,
+                "probe order {order:?} emitted rows although a probe partition saw a logical NULL"
+            );
+        }
+        Ok(())
+    }
+
+    /// `NULL NOT IN (empty)` is TRUE: with an empty probe side the NULL build
+    /// key must be kept, even though the same build side emits nothing once
+    /// the probe side has a row.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_anti_join_empty_probe_keeps_null_build_key(
+        batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("c1", &vec![Some(1), None]),
+            ("dummy", &vec![Some(10), Some(0)]),
+        );
+        // Genuinely empty probe side (not an all-NULL probe side, which is the
+        // different `NOT IN` UNKNOWN case).
+        let empty_right_schema = Arc::new(Schema::new(vec![
+            Field::new("c2", DataType::Int32, true),
+            Field::new("dummy", DataType::Int32, true),
+        ]));
+        let empty_right = TestMemoryExec::try_new_exec(
+            &[vec![RecordBatch::new_empty(Arc::clone(
+                &empty_right_schema,
+            ))]],
+            empty_right_schema,
+            None,
+        )?;
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &empty_right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            empty_right,
+            on,
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true, // null_aware = true
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+
+            | c1 | dummy |
+            +----+-------+
+            |    | 0     |
+            | 1  | 10    |
+            +----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// `left.z > right.z` over the second column of two-column tables: the
+    /// non-equality correlation of
+    /// `id NOT IN (SELECT r.id FROM r WHERE r.z < l.z)`.
+    fn prepare_second_column_gt_filter() -> JoinFilter {
+        let column_indices = vec![
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+        ];
+        let intermediate_schema = Schema::new(vec![
+            Field::new("z", DataType::Int32, true),
+            Field::new("z", DataType::Int32, true),
+        ]);
+        let filter_expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("z", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("z", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        JoinFilter::new(
+            filter_expression,
+            column_indices,
+            Arc::new(intermediate_schema),
+        )
+    }
+
+    /// Build and probe sides of a null-aware join whose only correlation is
+    /// the non-equality filter from [`prepare_second_column_gt_filter`].
+    ///
+    /// For each build row, the probe rows with a smaller `z` form its
+    /// subquery result:
+    /// - `(1, 10)` and `(2, 20)`: `{1, NULL}`
+    /// - `(NULL, 30)`: `{1, NULL}`
+    /// - `(4, 40)`: `{1, 4, NULL}`
+    /// - `(NULL, 1)` and `(5, 1)`: empty
+    ///
+    /// The probe row `(NULL, 50)` never passes the filter.
+    fn build_null_aware_filter_only_inputs()
+    -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>, JoinOn) {
+        let left = build_table_two_cols(
+            ("id", &vec![Some(1), Some(2), None, Some(4), None, Some(5)]),
+            (
+                "z",
+                &vec![Some(10), Some(20), Some(30), Some(40), Some(1), Some(1)],
+            ),
+        );
+        let right = build_table_two_cols(
+            ("id", &vec![Some(1), None, Some(4), None]),
+            ("z", &vec![Some(5), Some(50), Some(35), Some(2)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("id", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("id", &right.schema()).unwrap()) as _,
+        )];
+        (left, right, on)
+    }
+
+    /// Null-aware `LeftAnti` with a join filter and no correlation scope keys.
+    ///
+    /// A NULL on either side only makes `NOT IN` UNKNOWN for the build rows
+    /// where the filter keeps the NULL, so the NULLs must not remove every row.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_anti_filter_only(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+        let (left, right, on) = build_null_aware_filter_only_inputs();
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(prepare_second_column_gt_filter()),
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        // Only the rows with an empty subquery result are TRUE.
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+---+
+            | id | z |
+            +----+---+
+            |    | 1 |
+            | 5  | 1 |
+            +----+---+
+            ");
+        }
+
+        Ok(())
+    }
+
+    /// `NULL NOT IN (5, 6)` is UNKNOWN, so the build row whose key points at a
+    /// NULL dictionary value must be dropped, as it is when the key is a
+    /// physical NULL.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_anti_build_logical_null(
+        batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_dict_key(
+            "c1",
+            vec![Some(1), None, Some(2)],
+            vec![0, 1, 2],
+            "dummy",
+            vec![Some(10), Some(0), Some(20)],
+        );
+        let left_key = left
+            .execute(0, Arc::clone(&task_ctx))?
+            .next()
+            .await
+            .unwrap()?;
+        assert_eq!(left_key.column(0).null_count(), 0);
+        assert_eq!(left_key.column(0).logical_null_count(), 1);
+
+        let right = build_table_dict_key(
+            "c2",
+            vec![Some(5), Some(6)],
+            vec![0, 1],
+            "dummy",
+            vec![Some(50), Some(60)],
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+
+            | c1 | dummy |
+            +----+-------+
+            | 1  | 10    |
+            | 2  | 20    |
             +----+-------+
             ");
         }
