@@ -21,7 +21,8 @@ use arrow::array::BooleanBufferBuilder;
 pub use cross_join::CrossJoinExec;
 use datafusion_physical_expr::PhysicalExprRef;
 pub use hash_join::{
-    HashExpr, HashJoinExec, HashJoinExecBuilder, HashTableLookupExpr, SeededRandomState,
+    HashExpr, HashJoinExec, HashJoinExecBuilder, HashTableLookupExpr,
+    PreparedHashJoinBuild, SeededRandomState,
 };
 pub use nested_loop_join::{NestedLoopJoinExec, NestedLoopJoinExecBuilder};
 use parking_lot::Mutex;
@@ -48,6 +49,7 @@ mod join_filter;
 /// Note: This module is public for internal testing purposes only
 /// and is not guaranteed to be stable across versions.
 pub mod join_hash_map;
+pub mod key_range_bitmap;
 
 use array_map::ArrayMap;
 use utils::JoinHashMapType;

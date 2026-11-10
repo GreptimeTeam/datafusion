@@ -52,6 +52,9 @@ pub struct InListExpr {
     list: Vec<Arc<dyn PhysicalExpr>>,
     negated: bool,
     static_filter: Option<Arc<dyn StaticFilter + Send + Sync>>,
+    // Opaque lease for producer-owned buffers referenced by join-created lists.
+    // It does not account for this expression's own allocations.
+    producer_lease: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Debug for InListExpr {
@@ -155,7 +158,19 @@ impl InListExpr {
             list,
             negated,
             static_filter,
+            producer_lease: None,
         }
+    }
+
+    /// Retain an existing producer's reservation while this expression can
+    /// reference its buffers. This does not account for expression allocations.
+    #[doc(hidden)]
+    pub fn with_producer_lease(
+        mut self,
+        lease: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.producer_lease = Some(lease);
+        self
     }
 
     /// Input expression
@@ -447,12 +462,14 @@ impl PhysicalExpr for InListExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         // assume the static_filter will not change during the rewrite process
-        Ok(Arc::new(InListExpr::new(
+        let mut remapped = InListExpr::new(
             Arc::clone(&children[0]),
             children[1..].to_vec(),
             self.negated,
             self.static_filter.as_ref().map(Arc::clone),
-        )))
+        );
+        remapped.producer_lease.clone_from(&self.producer_lease);
+        Ok(Arc::new(remapped))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

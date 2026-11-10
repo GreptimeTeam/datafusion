@@ -26,11 +26,12 @@ use crate::ExecutionPlanProperties;
 use crate::Partitioning;
 use crate::joins::Map;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::exec::HASH_JOIN_SEED;
+use crate::joins::hash_join::exec::{HASH_JOIN_SEED, JoinBuildData};
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::partitioned_hash_eval::{
     HashExpr, HashTableLookupExpr, SeededRandomState,
 };
+use crate::joins::key_range_bitmap::KeyRangeBitmap;
 use crate::repartition::RangeExpr;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -95,6 +96,7 @@ impl PartitionBounds {
 fn create_membership_predicate(
     on_right: &[PhysicalExprRef],
     pushdown: PushdownStrategy,
+    build_lease: Option<Arc<JoinBuildData>>,
     random_state: &SeededRandomState,
     schema: &Schema,
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
@@ -128,20 +130,25 @@ fn create_membership_predicate(
             };
 
             // Use InListExpr::try_new_from_array() to build an InList with static_filter optimization (hash-based lookup)
-            Ok(Some(Arc::new(InListExpr::try_new_from_array(
-                expr,
-                in_list_array,
-                false,
-                schema,
-            )?)))
+            let mut in_list =
+                InListExpr::try_new_from_array(expr, in_list_array, false, schema)?;
+            if let Some(build_lease) = build_lease {
+                in_list = in_list.with_producer_lease(build_lease);
+            }
+            Ok(Some(Arc::new(in_list)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::Map(hash_map) => Ok(Some(Arc::new(HashTableLookupExpr::new(
-            on_right.to_vec(),
-            random_state.clone(),
-            hash_map,
-            "hash_lookup".to_string(),
-        )) as Arc<dyn PhysicalExpr>)),
+        PushdownStrategy::Map(hash_map, pruning_bitmap) => Ok(Some(Arc::new(
+            HashTableLookupExpr::new(
+                on_right.to_vec(),
+                random_state.clone(),
+                hash_map,
+                "hash_lookup".to_string(),
+                pruning_bitmap,
+            )
+            .with_build_lease(build_lease),
+        )
+            as Arc<dyn PhysicalExpr>)),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
@@ -277,10 +284,20 @@ pub(crate) struct SharedBuildAccumulator {
 pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
-    /// Use map lookup for large build sides
-    Map(Arc<Map>),
+    /// Use map lookup for large build sides. If `Some` the second field
+    /// represents the build side's keys using a bucket bitmap.
+    Map(Arc<Map>, Option<Arc<KeyRangeBitmap>>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
+}
+
+impl PushdownStrategy {
+    pub(super) fn bitmap_reserved_bytes(&self) -> usize {
+        match self {
+            Self::Map(_, Some(bitmap)) => bitmap.reserved_bytes(),
+            _ => 0,
+        }
+    }
 }
 
 /// Build-side data reported by a single partition
@@ -288,11 +305,13 @@ pub(crate) enum PartitionBuildData {
     Partitioned {
         partition_id: usize,
         pushdown: PushdownStrategy,
+        build_lease: Option<Arc<JoinBuildData>>,
         bounds: PartitionBounds,
         keys_have_null: bool,
     },
     CollectLeft {
         pushdown: PushdownStrategy,
+        build_lease: Option<Arc<JoinBuildData>>,
         bounds: PartitionBounds,
         keys_have_null: bool,
     },
@@ -303,6 +322,7 @@ pub(crate) enum PartitionBuildData {
 struct PartitionData {
     bounds: PartitionBounds,
     pushdown: PushdownStrategy,
+    build_lease: Option<Arc<JoinBuildData>>,
     /// Whether any build key of this partition is NULL. Decides whether the pushed
     /// filter must keep probe-side NULL rows for a null-equal join to match them.
     keys_have_null: bool,
@@ -489,6 +509,7 @@ impl SharedBuildAccumulator {
                 PartitionBuildData::Partitioned {
                     partition_id,
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 },
@@ -502,6 +523,7 @@ impl SharedBuildAccumulator {
                 }
                 partitions[partition_id] = PartitionStatus::Reported(PartitionData {
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 });
@@ -509,6 +531,7 @@ impl SharedBuildAccumulator {
             (
                 PartitionBuildData::CollectLeft {
                     pushdown,
+                    build_lease,
                     bounds,
                     keys_have_null,
                 },
@@ -521,6 +544,7 @@ impl SharedBuildAccumulator {
                 if matches!(data, PartitionStatus::Pending) {
                     *data = PartitionStatus::Reported(PartitionData {
                         pushdown,
+                        build_lease,
                         bounds,
                         keys_have_null,
                     });
@@ -616,6 +640,7 @@ impl SharedBuildAccumulator {
                     let membership_expr = create_membership_predicate(
                         &self.on_right,
                         partition_data.pushdown.clone(),
+                        partition_data.build_lease.clone(),
                         &HASH_JOIN_SEED,
                         self.probe_schema.as_ref(),
                     )?;
@@ -664,6 +689,7 @@ impl SharedBuildAccumulator {
                             let membership_expr = create_membership_predicate(
                                 &self.on_right,
                                 partition.pushdown.clone(),
+                                partition.build_lease.clone(),
                                 &HASH_JOIN_SEED,
                                 self.probe_schema.as_ref(),
                             )?;
@@ -905,6 +931,81 @@ mod tests {
         expressions::{Column, Literal},
     };
 
+    fn test_build_lease(
+        pool: &Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+    ) -> Arc<JoinBuildData> {
+        use crate::joins::join_hash_map::JoinHashMapU32;
+        use datafusion_execution::memory_pool::MemoryConsumer;
+        let reservation = MemoryConsumer::new("publication test").register(pool);
+        reservation.try_grow(128).unwrap();
+        let batch = RecordBatch::try_new(
+            test_probe_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        Arc::new(JoinBuildData {
+            map: Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(2)))),
+            values: vec![Arc::clone(batch.column(0))],
+            batch,
+            bounds: None,
+            reservation,
+        })
+    }
+
+    #[test]
+    fn publication_constructor_error_releases_producer_lease() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let producer = test_build_lease(&pool);
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let invalid_schema =
+            Schema::new(vec![Field::new("probe_key", DataType::Utf8, false)]);
+        let result = create_membership_predicate(
+            &test_on_right(),
+            PushdownStrategy::InList(array),
+            Some(Arc::clone(&producer)),
+            &HASH_JOIN_SEED,
+            &invalid_schema,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            pool.reserved(),
+            128,
+            "error drops temporary lease but not original owner"
+        );
+        drop(producer);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partitioned_accumulator_retains_reported_build_until_drop() -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let producer = test_build_lease(&pool);
+        let array: ArrayRef = Arc::clone(producer.batch.column(0));
+        let acc = make_partitioned_expr_accumulator_for_test(2);
+        let mut report =
+            Box::pin(acc.report_build_data(PartitionBuildData::Partitioned {
+                partition_id: 0,
+                pushdown: PushdownStrategy::InList(array),
+                build_lease: Some(Arc::clone(&producer)),
+                bounds: no_bounds(),
+                keys_have_null: false,
+            }));
+        assert!(futures::poll!(&mut report).is_pending());
+        drop(report);
+        drop(producer);
+        assert_eq!(
+            pool.reserved(),
+            128,
+            "accumulator must retain an already reported partition after the stream is dropped"
+        );
+        drop(acc);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
     fn test_on_right() -> Vec<PhysicalExprRef> {
         vec![Arc::new(Column::new("probe_key", 0))]
     }
@@ -985,6 +1086,7 @@ mod tests {
     fn reported(pushdown: PushdownStrategy, bounds: PartitionBounds) -> PartitionStatus {
         PartitionStatus::Reported(PartitionData {
             pushdown,
+            build_lease: None,
             bounds,
             keys_have_null: false,
         })
@@ -1359,6 +1461,7 @@ mod tests {
                 PartitionBuildData::Partitioned {
                     partition_id: 0,
                     pushdown: PushdownStrategy::Empty,
+                    build_lease: None,
                     bounds: PartitionBounds::new(vec![]),
                     keys_have_null: false,
                 },

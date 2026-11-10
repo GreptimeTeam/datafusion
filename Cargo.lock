@@ -2588,6 +2588,7 @@ name = "datafusion-pruning"
 version = "55.1.0"
 dependencies = [
  "arrow",
+ "criterion",
  "datafusion-common",
  "datafusion-datasource",
  "datafusion-expr",
@@ -2599,6 +2600,7 @@ dependencies = [
  "insta",
  "itertools 0.15.0",
  "log",
+ "rstest",
 ]
 
 [[package]]

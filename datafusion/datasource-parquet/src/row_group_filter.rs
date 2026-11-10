@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
+use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_order};
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
+use arrow::compute::nullif;
 use arrow::datatypes::Schema;
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
@@ -31,7 +33,8 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
 use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::basic::ColumnOrder;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::schema::types::SchemaDescriptor;
 
 /// Reduces the [`ParquetAccessPlan`] based on row group level metadata.
@@ -252,8 +255,10 @@ impl RowGroupAccessPlanFilter {
     ///
     /// Updates this set to mark row groups that should not be scanned
     ///
-    /// Note: This method currently ignores ColumnOrder
-    /// <https://github.com/apache/datafusion/issues/8335>
+    /// This method has no file footer, so it cannot establish the sort order
+    /// of string or binary min/max statistics. Such bounds are ignored. Use
+    /// [`Self::prune_by_statistics_with_metadata`] when the full metadata is
+    /// available. Null counts and other columns' statistics remain usable.
     ///
     /// # Panics
     /// if `groups.len() != self.len()`
@@ -262,6 +267,51 @@ impl RowGroupAccessPlanFilter {
         arrow_schema: &Schema,
         parquet_schema: &SchemaDescriptor,
         groups: &[RowGroupMetaData],
+        predicate: &PruningPredicate,
+        metrics: &ParquetFileMetrics,
+    ) {
+        self.prune_by_statistics_inner(
+            arrow_schema,
+            parquet_schema,
+            groups,
+            None,
+            predicate,
+            metrics,
+        );
+    }
+
+    /// Prune row groups using statistics and the comparison orders recorded
+    /// in the Parquet file footer.
+    ///
+    /// Unlike [`Self::prune_by_statistics`], this method can use string and
+    /// binary bounds when their ordering is known to match Arrow's ordering.
+    ///
+    /// # Panics
+    /// if `metadata.num_row_groups() != self.len()`
+    pub fn prune_by_statistics_with_metadata(
+        &mut self,
+        arrow_schema: &Schema,
+        metadata: &ParquetMetaData,
+        predicate: &PruningPredicate,
+        metrics: &ParquetFileMetrics,
+    ) {
+        let file_metadata = metadata.file_metadata();
+        self.prune_by_statistics_inner(
+            arrow_schema,
+            file_metadata.schema_descr(),
+            metadata.row_groups(),
+            file_metadata.column_orders().map(Vec::as_slice),
+            predicate,
+            metrics,
+        );
+    }
+
+    fn prune_by_statistics_inner(
+        &mut self,
+        arrow_schema: &Schema,
+        parquet_schema: &SchemaDescriptor,
+        groups: &[RowGroupMetaData],
+        column_orders: Option<&[ColumnOrder]>,
         predicate: &PruningPredicate,
         metrics: &ParquetFileMetrics,
     ) {
@@ -278,6 +328,7 @@ impl RowGroupAccessPlanFilter {
 
         let pruning_stats = RowGroupPruningStatistics {
             parquet_schema,
+            column_orders,
             row_group_metadatas,
             arrow_schema,
             // Preserve the existing row-group pruning behavior. This path only
@@ -304,8 +355,7 @@ impl RowGroupAccessPlanFilter {
                 // Check if any of the matched row groups are fully contained by the predicate
                 self.identify_fully_matched_row_groups(
                     &fully_contained_candidates_original_idx,
-                    arrow_schema,
-                    parquet_schema,
+                    &pruning_stats,
                     groups,
                     predicate,
                     metrics,
@@ -330,8 +380,7 @@ impl RowGroupAccessPlanFilter {
     fn identify_fully_matched_row_groups(
         &mut self,
         candidate_row_group_indices: &[usize],
-        arrow_schema: &Schema,
-        parquet_schema: &SchemaDescriptor,
+        pruning_stats: &RowGroupPruningStatistics<'_>,
         groups: &[RowGroupMetaData],
         predicate: &PruningPredicate,
         metrics: &ParquetFileMetrics,
@@ -339,6 +388,12 @@ impl RowGroupAccessPlanFilter {
         if candidate_row_group_indices.is_empty() {
             return;
         }
+        // Some pruning rewrites preserve only whether rows can be TRUE, while
+        // full-match inference must distinguish FALSE from UNKNOWN.
+        if !predicate.can_be_inverted_for_full_match() {
+            return;
+        }
+        let arrow_schema = pruning_stats.arrow_schema;
 
         let mut inverted_expr: Arc<dyn PhysicalExpr> =
             Arc::new(NotExpr::new(Arc::clone(predicate.orig_expr())));
@@ -375,13 +430,21 @@ impl RowGroupAccessPlanFilter {
 
         let Ok(inverted_predicate) = PruningPredicateBuilder::new()
             .with_file_schema(Arc::clone(predicate.schema()))
+            .with_max_in_list_size(predicate.max_in_list_size())
             .try_build(inverted_expr)
         else {
             return;
         };
+        // The inverse can introduce filter-only rewrites that were hidden
+        // inside an unhandled expression in the forward predicate. In that
+        // case pruning UNKNOWN cannot establish that every row matches.
+        if !inverted_predicate.can_be_inverted_for_full_match() {
+            return;
+        }
 
         let inverted_pruning_stats = RowGroupPruningStatistics {
-            parquet_schema,
+            parquet_schema: pruning_stats.parquet_schema,
+            column_orders: pruning_stats.column_orders,
             row_group_metadatas: candidate_row_group_indices
                 .iter()
                 .map(|&i| &groups[i])
@@ -463,6 +526,7 @@ impl RowGroupAccessPlanFilter {
 /// duplicating the statistics-to-`PruningStatistics` plumbing.
 pub(crate) struct RowGroupPruningStatistics<'a> {
     pub(crate) parquet_schema: &'a SchemaDescriptor,
+    pub(crate) column_orders: Option<&'a [ColumnOrder]>,
     pub(crate) row_group_metadatas: Vec<&'a RowGroupMetaData>,
     pub(crate) arrow_schema: &'a Schema,
     pub(crate) missing_null_counts_as_zero: bool,
@@ -470,14 +534,11 @@ pub(crate) struct RowGroupPruningStatistics<'a> {
 
 impl<'a> RowGroupPruningStatistics<'a> {
     /// Return an iterator over the row group metadata
-    fn metadata_iter(&'a self) -> impl Iterator<Item = &'a RowGroupMetaData> + 'a {
+    fn metadata_iter(&self) -> impl Iterator<Item = &'a RowGroupMetaData> + '_ {
         self.row_group_metadatas.iter().copied()
     }
 
-    fn statistics_converter<'b>(
-        &'a self,
-        column: &'b Column,
-    ) -> Result<StatisticsConverter<'a>> {
+    fn statistics_converter(&self, column: &Column) -> Result<StatisticsConverter<'a>> {
         Ok(StatisticsConverter::try_new(
             &column.name,
             self.arrow_schema,
@@ -485,19 +546,53 @@ impl<'a> RowGroupPruningStatistics<'a> {
         )?
         .with_missing_null_counts_as_zero(self.missing_null_counts_as_zero))
     }
+
+    fn min_max_statistics_converter(
+        &self,
+        column: &Column,
+    ) -> Option<StatisticsConverter<'a>> {
+        let converter = self.statistics_converter(column).ok()?;
+        let parquet_index = converter.parquet_column_index();
+        if parquet_index.is_some_and(|index| {
+            has_untrusted_min_max_order(self.parquet_schema, self.column_orders, index)
+        }) {
+            return None;
+        }
+        Some(converter)
+    }
+
+    fn mask_untrusted_byte_array_stats(
+        &self,
+        parquet_index: Option<usize>,
+        values: ArrayRef,
+    ) -> Option<ArrayRef> {
+        if !has_untrusted_byte_array_stats(
+            self.parquet_schema,
+            parquet_index,
+            self.metadata_iter(),
+        ) {
+            return Some(values);
+        }
+        // A file may mix legacy and modern row-group statistics. Keep the
+        // modern bounds usable rather than discarding this entire column.
+        let mask = BooleanArray::from_iter(self.metadata_iter().map(|group| {
+            has_untrusted_byte_array_stats(self.parquet_schema, parquet_index, [group])
+        }));
+        nullif(values.as_ref(), &mask).ok()
+    }
 }
 
 impl PruningStatistics for RowGroupPruningStatistics<'_> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
-            .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
-            .ok()
+        let converter = self.min_max_statistics_converter(column)?;
+        let values = converter.row_group_mins(self.metadata_iter()).ok()?;
+        self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
-            .and_then(|c| Ok(c.row_group_maxes(self.metadata_iter())?))
-            .ok()
+        let converter = self.min_max_statistics_converter(column)?;
+        let values = converter.row_group_maxes(self.metadata_iter()).ok()?;
+        self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
     }
 
     fn num_containers(&self) -> usize {
@@ -601,6 +696,235 @@ mod tests {
             self.byte_len = Some(byte_len);
             self
         }
+    }
+
+    /// Exercise a real join producer through the pruning snapshot boundary,
+    /// and the independently owned bitmap used by a detached pruning expr.
+    #[tokio::test]
+    async fn pruning_pipeline_retains_join_producer_and_detached_bitmap() -> Result<()> {
+        use arrow::array::Int64Array;
+        use arrow::record_batch::RecordBatch;
+        use datafusion_common::pruning::PrunableStatistics;
+        use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion_common::{JoinType, NullEquality, Statistics};
+        use datafusion_datasource::memory::MemorySourceConfig;
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::config::SessionConfig;
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion_physical_expr::PhysicalExprRef;
+        use datafusion_physical_expr::expressions::{
+            Column as PhysicalColumn, DynamicFilterPhysicalExpr, InListExpr, Literal,
+            lit as physical_lit,
+        };
+        use datafusion_physical_plan::ExecutionPlan;
+        use datafusion_physical_plan::common::collect;
+        use datafusion_physical_plan::filter::FilterExecBuilder;
+        use datafusion_physical_plan::joins::{
+            HashJoinExec, HashTableLookupExpr, PartitionMode,
+        };
+
+        for struct_in_list in [true, false] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let batch = |keys: Vec<i64>, values: Vec<i64>| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Int64Array::from(values)),
+                    ],
+                )
+            };
+            let build = batch(vec![0, 1_000_000], vec![10, 20])?;
+            let build_buffers = build
+                .columns()
+                .iter()
+                .map(|column| column.to_data().buffers()[0].as_ptr() as usize)
+                .collect::<Vec<_>>();
+            let probe = batch(vec![0, 1_000_000, 99], vec![10, 20, 10])?;
+            let left = MemorySourceConfig::try_new_exec(
+                &[vec![build]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let right = MemorySourceConfig::try_new_exec(
+                &[vec![probe.clone()]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let keys = (0..if struct_in_list { 2 } else { 1 })
+                .map(|index| {
+                    Arc::new(PhysicalColumn::new(schema.field(index).name(), index))
+                        as PhysicalExprRef
+                })
+                .collect::<Vec<_>>();
+            let on = keys
+                .iter()
+                .map(|key| (Arc::clone(key), Arc::clone(key)))
+                .collect();
+            let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                keys.clone(),
+                physical_lit(true),
+            ));
+            let consumer: PhysicalExprRef = dynamic.clone();
+            let right = Arc::new(FilterExecBuilder::new(consumer, right).build()?);
+            let join = HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?
+            .with_dynamic_filter_expr(Arc::clone(&dynamic))?;
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build_arc()?;
+            let mut config = SessionConfig::new();
+            if !struct_in_list {
+                config
+                    .options_mut()
+                    .optimizer
+                    .hash_join_inlist_pushdown_max_size = 0;
+            }
+            let task = Arc::new(
+                TaskContext::default()
+                    .with_runtime(runtime)
+                    .with_session_config(config),
+            );
+            let batches = collect(join.execute(0, task)?).await?;
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+            let current = dynamic.current()?;
+            let mut membership = None;
+            current.apply(|node| {
+                if node.downcast_ref::<InListExpr>().is_some()
+                    || node.downcast_ref::<HashTableLookupExpr>().is_some()
+                {
+                    membership = Some(Arc::clone(node));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            let membership = membership.expect("join-created membership expression");
+            assert!(pool.reserved() > 0);
+
+            if struct_in_list {
+                let list = membership
+                    .downcast_ref::<InListExpr>()
+                    .expect("join IN-list");
+                let literal = list.list()[0].downcast_ref::<Literal>().unwrap();
+                let ScalarValue::Struct(values) = literal.value() else {
+                    panic!("join must publish Struct IN literals");
+                };
+                let buffers = values
+                    .columns()
+                    .iter()
+                    .map(|column| column.to_data().buffers()[0].as_ptr() as usize)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    buffers, build_buffers,
+                    "literal buffers are producer buffers"
+                );
+                let negated: PhysicalExprRef =
+                    Arc::new(NotExpr::new(Arc::clone(&membership)));
+                let snapshot: PhysicalExprRef =
+                    Arc::new(DynamicFilterPhysicalExpr::new(keys, negated));
+                let pruning = PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&schema))
+                    .try_build(Arc::clone(&snapshot))?;
+                assert!(
+                    pruning
+                        .orig_expr()
+                        .downcast_ref::<InListExpr>()
+                        .unwrap()
+                        .negated(),
+                    "exercise actual snapshot NOT(IN) simplification"
+                );
+                let producer_charge = pool.reserved();
+                assert!(producer_charge > 0);
+                drop(snapshot);
+                drop(membership);
+                drop(current);
+                drop(batches);
+                drop(dynamic);
+                drop(join);
+                assert_eq!(
+                    pool.reserved(),
+                    producer_charge,
+                    "pruner must retain the entire original producer charge"
+                );
+                let actual = pruning
+                    .orig_expr()
+                    .evaluate(&probe)?
+                    .into_array(probe.num_rows())?;
+                assert_eq!(
+                    actual.as_ref(),
+                    &BooleanArray::from(vec![false, false, true])
+                );
+                let unknown = PrunableStatistics::new(
+                    vec![Arc::new(Statistics::new_unknown(&schema))],
+                    Arc::clone(&schema),
+                );
+                assert_eq!(pruning.prune(&unknown)?, vec![true]);
+                drop(actual);
+                drop(pruning);
+                assert_eq!(pool.reserved(), 0, "pruner releases producer charge");
+            } else {
+                let bitmap_bytes = membership
+                    .downcast_ref::<HashTableLookupExpr>()
+                    .unwrap()
+                    .pruning_bitmap()
+                    .expect("sparse bitmap")
+                    .size();
+                let dynamic_expr: PhysicalExprRef = dynamic.clone();
+                let pruning = PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&schema))
+                    .try_build(dynamic_expr)?;
+                let mut bitmap_expr = None;
+                pruning.predicate_expr().apply(|node| {
+                    if node.to_string().starts_with("KEY_RANGE_BITMAP(") {
+                        bitmap_expr = Some(Arc::clone(node));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+                let bitmap_expr = bitmap_expr.expect("actual bitmap pruning expression");
+                let remapped = bitmap_expr
+                    .with_new_children(vec![physical_lit(0_i64), physical_lit(0_i64)])?;
+                drop(pruning);
+                drop(membership);
+                drop(current);
+                drop(batches);
+                drop(dynamic);
+                drop(join);
+                assert_eq!(
+                    pool.reserved(),
+                    bitmap_bytes,
+                    "detached pruning expression retains only the bitmap charge"
+                );
+                let actual = remapped.evaluate(&probe)?.into_array(probe.num_rows())?;
+                assert_eq!(actual.as_ref(), &BooleanArray::from(vec![true, true, true]));
+                let absent = remapped.with_new_children(vec![
+                    physical_lit(500_000_i64),
+                    physical_lit(500_000_i64),
+                ])?;
+                let actual = absent.evaluate(&probe)?.into_array(probe.num_rows())?;
+                assert_eq!(
+                    actual.as_ref(),
+                    &BooleanArray::from(vec![false, false, false])
+                );
+                drop(absent);
+                assert_eq!(pool.reserved(), 0, "detached bitmap charge releases last");
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -717,6 +1041,731 @@ mod tests {
 
         assert_eq!(row_groups.access_plan.row_group_indexes(), vec![0, 1, 2]);
         assert_eq!(row_groups.is_fully_matched(), &vec![false, true, false]);
+    }
+
+    #[test]
+    fn null_in_list_under_not_does_not_prove_full_match() {
+        use arrow::array::Int32Array;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_physical_expr::expressions::{
+            col as physical_col, in_list, lit as physical_lit,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![100, 1000]))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .set_bloom_filter_enabled(false)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(properties))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let bytes = Bytes::from(bytes);
+        let metadata = Arc::clone(
+            ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                .unwrap()
+                .metadata(),
+        );
+        let column = physical_col("c1", &schema).unwrap();
+        let mut list = (0..21)
+            .map(|value| physical_lit(ScalarValue::Int32(Some(value))))
+            .collect::<Vec<_>>();
+        list.push(physical_lit(ScalarValue::Int32(None)));
+        let in_list = in_list(Arc::clone(&column), list, &false, &schema).unwrap();
+        let not_in: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(in_list));
+        let at_least_100: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::GtEq,
+            physical_lit(ScalarValue::Int32(Some(100))),
+        ));
+        let thousand: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            column,
+            Operator::Eq,
+            physical_lit(ScalarValue::Int32(Some(1000))),
+        ));
+        // At c1=100, the first arm is UNKNOWN and the second is false.
+        // At c1=1000, the second arm is true, so LIMIT must not discard it.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(not_in, Operator::And, at_least_100)),
+            Operator::Or,
+            thousand,
+        ));
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .with_max_in_list_size(32)
+            .try_build(Arc::clone(&predicate))
+            .unwrap();
+        assert!(pruning_predicate.can_be_inverted_for_full_match());
+        let metrics = parquet_file_metrics();
+        let mut row_groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        row_groups.prune_by_statistics_with_metadata(
+            &schema,
+            &metadata,
+            &pruning_predicate,
+            &metrics,
+        );
+        let full_match_flags = row_groups.is_fully_matched().clone();
+        row_groups.prune_by_limit(1, metadata.row_groups(), &metrics);
+        let selected = row_groups.row_group_indexes().collect::<Vec<_>>();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .with_row_groups(selected.clone())
+            .build()
+            .unwrap();
+        let matching_values = reader
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                let filter = predicate
+                    .evaluate(&batch)
+                    .unwrap()
+                    .into_array(batch.num_rows())
+                    .unwrap();
+                let filter = filter.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let filtered =
+                    arrow::compute::filter_record_batch(&batch, filter).unwrap();
+                filtered
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (full_match_flags, selected, matching_values),
+            (vec![false, false], vec![0, 1], vec![1000]),
+            "UNKNOWN from NOT IN with a NULL member must not prove a full match"
+        );
+    }
+
+    /// A CASE arm can manufacture NULL even when every input column is non-null.
+    /// The first row is UNKNOWN and the second is TRUE; LIMIT must keep the latter.
+    #[tokio::test]
+    async fn computed_null_case_does_not_prove_full_match() -> Result<()> {
+        use crate::row_filter::build_row_filter;
+        use crate::source::ParquetSource;
+        use arrow::array::Int32Array;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_datasource::PartitionedFile;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_expr::expressions::{
+            CaseExpr, TryCastExpr, col as physical_col, lit as physical_lit,
+        };
+        use datafusion_physical_plan::filter::FilterExec;
+        use datafusion_physical_plan::limit::GlobalLimitExec;
+        use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![-200, 0])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ],
+        )?;
+        let column = |name| physical_col(name, &schema).unwrap();
+        let lit_i32 = |v| physical_lit(ScalarValue::Int32(Some(v)));
+        let when = Arc::new(BinaryExpr::new(column("a"), Operator::Eq, lit_i32(1)));
+        let cast = Arc::new(TryCastExpr::new(column("x"), DataType::Int8));
+        let then = Arc::new(BinaryExpr::new(
+            cast,
+            Operator::Gt,
+            physical_lit(ScalarValue::Int8(Some(0))),
+        ));
+        let case = Arc::new(CaseExpr::try_new(
+            None,
+            vec![(when, then)],
+            Some(physical_lit(ScalarValue::Boolean(Some(false)))),
+        )?);
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(NotExpr::new(case)),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column("b"), Operator::Gt, lit_i32(0))),
+        ));
+        let evaluated = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            evaluated.as_ref(),
+            &BooleanArray::from(vec![None, Some(true)])
+        );
+
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .set_bloom_filter_enabled(false)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let bytes = Bytes::from(bytes);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+        let metadata = Arc::clone(builder.metadata());
+        let pruning_predicate =
+            build_test_pruning_predicate(Arc::clone(&predicate), Arc::clone(&schema));
+        let metrics = parquet_file_metrics();
+        let mut groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        groups.prune_by_statistics_with_metadata(
+            &schema,
+            &metadata,
+            &pruning_predicate,
+            &metrics,
+        );
+        let flags = groups.is_fully_matched().clone();
+        groups.prune_by_limit(1, metadata.row_groups(), &metrics);
+        let selected = groups.row_group_indexes().collect::<Vec<_>>();
+        let row_filter =
+            build_row_filter(&predicate, &schema, &metadata, false, &metrics)?
+                .expect("real parquet reader filter");
+        let reader = builder
+            .with_row_groups(selected.clone())
+            .with_row_filter(row_filter)
+            .build()?;
+        let read_x = reader
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        // The same two rows can share a row group; max(x)=0 then masks the
+        // NULL produced by TRY_CAST(-200 AS Int8) in the inverse rewrite.
+        let mut mixed_bytes = Vec::new();
+        let mut mixed_writer =
+            ArrowWriter::try_new(&mut mixed_bytes, Arc::clone(&schema), None)?;
+        mixed_writer.write(&batch)?;
+        mixed_writer.close()?;
+        let mixed_bytes = Bytes::from(mixed_bytes);
+        let mixed_builder =
+            ParquetRecordBatchReaderBuilder::try_new(mixed_bytes.clone())?;
+        let mixed_metadata = Arc::clone(mixed_builder.metadata());
+        assert_eq!(mixed_metadata.num_row_groups(), 1);
+        let mut mixed_groups =
+            RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(1));
+        mixed_groups.prune_by_statistics_with_metadata(
+            &schema,
+            &mixed_metadata,
+            &pruning_predicate,
+            &metrics,
+        );
+        let mixed_flags = mixed_groups.is_fully_matched().clone();
+        mixed_groups.prune_by_limit(1, mixed_metadata.row_groups(), &metrics);
+        let mixed_selected = mixed_groups.row_group_indexes().collect::<Vec<_>>();
+        let mixed_filter =
+            build_row_filter(&predicate, &schema, &mixed_metadata, false, &metrics)?
+                .expect("mixed reader filter");
+        let mixed_reader = mixed_builder
+            .with_row_groups(mixed_selected.clone())
+            .with_row_filter(mixed_filter)
+            .build()?;
+        let mixed_read_x = mixed_reader
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "mixed CASE flags={mixed_flags:?}, selected={mixed_selected:?}, reader={mixed_read_x:?}"
+        );
+        // Additionally place a later matching row in a second row group. A
+        // LIMIT of two cannot be satisfied by the first row group alone.
+        let batch3 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int32Array::from(vec![-200, 0, 0])),
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+            ],
+        )?;
+        let properties3 = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .set_bloom_filter_enabled(false)
+            .build();
+        let mut bytes3 = Vec::new();
+        let mut writer3 =
+            ArrowWriter::try_new(&mut bytes3, Arc::clone(&schema), Some(properties3))?;
+        writer3.write(&batch3)?;
+        writer3.close()?;
+        let bytes3 = Bytes::from(bytes3);
+        let builder3 = ParquetRecordBatchReaderBuilder::try_new(bytes3.clone())?;
+        let metadata3 = Arc::clone(builder3.metadata());
+        assert_eq!(metadata3.num_row_groups(), 2);
+        let mut groups3 = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        groups3.prune_by_statistics_with_metadata(
+            &schema,
+            &metadata3,
+            &pruning_predicate,
+            &metrics,
+        );
+        let flags3 = groups3.is_fully_matched().clone();
+        let before_limit3 = groups3.row_group_indexes().collect::<Vec<_>>();
+        groups3.prune_by_limit(2, metadata3.row_groups(), &metrics);
+        let selected3 = groups3.row_group_indexes().collect::<Vec<_>>();
+        let filter3 = build_row_filter(&predicate, &schema, &metadata3, false, &metrics)?
+            .expect("two-group reader filter");
+        let reader3 = builder3
+            .with_row_groups(selected3.clone())
+            .with_row_filter(filter3)
+            .build()?;
+        let read3 = reader3
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "LIMIT2 before={before_limit3:?}, flags={flags3:?}, selected={selected3:?}, reader={read3:?}"
+        );
+
+        // Exercise the real Parquet DataSourceExec with row-filter pushdown both
+        // enabled and disabled. The external filter gives identical SQL semantics.
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), &bytes)?;
+        let path = object_store::path::Path::from_filesystem_path(file.path()).unwrap();
+        let mut exec_results = Vec::new();
+        for pushdown in [false, true] {
+            let source = Arc::new(
+                ParquetSource::new(Arc::clone(&schema))
+                    .with_predicate(Arc::clone(&predicate))
+                    .with_pushdown_filters(pushdown)
+                    .with_enable_page_index(false)
+                    .with_bloom_filter_on_read(false),
+            );
+            let config =
+                FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                    .with_file(PartitionedFile::new(path.to_string(), bytes.len() as u64))
+                    .build();
+            let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+            let plan: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(Arc::clone(&predicate), scan)?);
+            let batches = collect(plan, Arc::new(TaskContext::default())).await?;
+            let values = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            exec_results.push(values);
+        }
+        let file3 = tempfile::NamedTempFile::new()?;
+        std::fs::write(file3.path(), &bytes3)?;
+        let path3 = object_store::path::Path::from_filesystem_path(file3.path()).unwrap();
+        let mut exec3 = Vec::new();
+        for pushdown in [false, true] {
+            for limit in [None, Some(2)] {
+                let source = Arc::new(
+                    ParquetSource::new(Arc::clone(&schema))
+                        .with_predicate(Arc::clone(&predicate))
+                        .with_pushdown_filters(pushdown)
+                        .with_enable_page_index(false)
+                        .with_bloom_filter_on_read(false),
+                );
+                let config = FileScanConfigBuilder::new(
+                    ObjectStoreUrl::local_filesystem(),
+                    source,
+                )
+                .with_file(PartitionedFile::new(path3.to_string(), bytes3.len() as u64))
+                // A scan fetch is valid only when its row filter enforces the predicate.
+                .with_limit(if pushdown { limit } else { None })
+                .build();
+                let scan: Arc<dyn ExecutionPlan> =
+                    DataSourceExec::from_data_source(config);
+                let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+                    Arc::clone(&predicate),
+                    Arc::clone(&scan),
+                )?);
+                let plan: Arc<dyn ExecutionPlan> = if limit.is_some() {
+                    Arc::new(GlobalLimitExec::new(filtered, 0, limit))
+                } else {
+                    filtered
+                };
+                eprintln!(
+                    "pushdown={pushdown} limit={limit:?} plan:\n{}",
+                    displayable(plan.as_ref()).indent(true)
+                );
+                let batches = collect(plan, Arc::new(TaskContext::default())).await?;
+                if pushdown && limit.is_none() {
+                    let metrics = scan.metrics().expect("scan metrics");
+                    let pruned = metrics
+                        .sum_by_name("pushdown_rows_pruned")
+                        .expect("row filter metric")
+                        .as_usize();
+                    eprintln!("actual reader row-filter pruned={pruned}");
+                    assert!(pruned > 0, "configured row filter must actually run");
+                }
+                let mut values = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                exec3.push(values);
+            }
+        }
+        eprintln!("LIMIT2 exec pushdown-off/on [no-limit, limit]: {exec3:?}");
+        assert_eq!(
+            exec3,
+            vec![vec![0, 0]; 4],
+            "LIMIT must agree with the unbounded results with and without pushdown"
+        );
+        assert_eq!(
+            (mixed_flags, mixed_selected, mixed_read_x),
+            (vec![false], vec![0], vec![0])
+        );
+        assert_eq!(
+            (before_limit3, flags3, selected3, read3),
+            (vec![0, 1], vec![false, false], vec![0, 1], vec![0, 0])
+        );
+        assert_eq!(
+            (flags, selected, read_x, exec_results),
+            (
+                vec![false, false],
+                vec![0, 1],
+                vec![0],
+                vec![vec![0], vec![0]]
+            ),
+            "computed NULL must not prove a full match or discard the later true row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn safe_cast_case_computed_null_does_not_prove_full_match() -> Result<()> {
+        use arrow::array::Int32Array;
+        use arrow::compute::CastOptions;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_physical_expr::expressions::{
+            CaseExpr, CastExpr, col as physical_col, lit as physical_lit,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![-200, 0])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+            ],
+        )?;
+        let column = |name| physical_col(name, &schema).unwrap();
+        let i32_lit = |value| physical_lit(ScalarValue::Int32(Some(value)));
+        let cast = Arc::new(CastExpr::new(
+            column("x"),
+            DataType::Int8,
+            Some(CastOptions {
+                safe: true,
+                ..Default::default()
+            }),
+        ));
+        assert!(
+            !cast.nullable(&schema)?,
+            "safe CAST currently reports non-null for non-null input"
+        );
+        let then: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            cast,
+            Operator::Gt,
+            physical_lit(ScalarValue::Int8(Some(0))),
+        ));
+        assert!(!then.nullable(&schema)?);
+        let case = Arc::new(CaseExpr::try_new(
+            None,
+            vec![(
+                Arc::new(BinaryExpr::new(column("a"), Operator::Eq, i32_lit(1))),
+                then,
+            )],
+            Some(physical_lit(ScalarValue::Boolean(Some(false)))),
+        )?);
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(NotExpr::new(case)),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column("b"), Operator::Gt, i32_lit(0))),
+        ));
+        let evaluated = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            evaluated.as_ref(),
+            &BooleanArray::from(vec![None, Some(true)])
+        );
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?;
+        let metadata = Arc::clone(reader.metadata());
+        let pruning = build_test_pruning_predicate(predicate, Arc::clone(&schema));
+        let mut groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(1));
+        groups.prune_by_statistics_with_metadata(
+            &schema,
+            &metadata,
+            &pruning,
+            &parquet_file_metrics(),
+        );
+        assert_eq!(
+            groups.is_fully_matched(),
+            &vec![false],
+            "safe CAST may create NULL despite nullable=false"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optimized_computed_null_cast_does_not_prove_full_match() -> Result<()> {
+        use arrow::array::Int32Array;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_physical_expr::expressions::{
+            TryCastExpr, col as physical_col, lit as physical_lit,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int32Array::from(vec![-200, 0, 0])),
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+            ],
+        )?;
+        let column = |name| physical_col(name, &schema).unwrap();
+        let int32 = |v| physical_lit(ScalarValue::Int32(Some(v)));
+        // The SQL optimizer eliminates CASE to this non-CASE expression.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(column("a"), Operator::NotEq, int32(1))),
+                Operator::Or,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(TryCastExpr::new(column("x"), DataType::Int8)),
+                    Operator::LtEq,
+                    physical_lit(ScalarValue::Int8(Some(0))),
+                )),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column("b"), Operator::Gt, int32(0))),
+        ));
+        let values = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(
+            values.as_ref(),
+            &BooleanArray::from(vec![None, Some(true), Some(true)])
+        );
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .metadata()
+            .clone();
+        let pruning = build_test_pruning_predicate(predicate, Arc::clone(&schema));
+        assert!(!pruning.can_be_inverted_for_full_match());
+        let metrics = parquet_file_metrics();
+        let mut groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        groups.prune_by_statistics_with_metadata(&schema, &metadata, &pruning, &metrics);
+        assert_eq!(groups.is_fully_matched(), &vec![false, false]);
+        groups.prune_by_limit(2, metadata.row_groups(), &metrics);
+        assert_eq!(groups.row_group_indexes().collect::<Vec<_>>(), vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn total_casts_can_prove_full_match_and_satisfy_limit() -> Result<()> {
+        use arrow::array::Int32Array;
+        use arrow::compute::CastOptions;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_physical_expr::expressions::{
+            CastExpr, TryCastExpr, col as physical_col, lit as physical_lit,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let mut bytes = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .metadata()
+            .clone();
+        for safe_cast in [false, true] {
+            for target in [DataType::Int32, DataType::Int64] {
+                let column = physical_col("x", &schema)?;
+                let cast: Arc<dyn PhysicalExpr> = if safe_cast {
+                    Arc::new(CastExpr::new(
+                        column,
+                        target.clone(),
+                        Some(CastOptions {
+                            safe: true,
+                            ..Default::default()
+                        }),
+                    ))
+                } else {
+                    Arc::new(TryCastExpr::new(column, target.clone()))
+                };
+                let zero = match target {
+                    DataType::Int32 => ScalarValue::Int32(Some(0)),
+                    DataType::Int64 => ScalarValue::Int64(Some(0)),
+                    _ => unreachable!(),
+                };
+                let predicate = build_test_pruning_predicate(
+                    Arc::new(BinaryExpr::new(cast, Operator::Gt, physical_lit(zero))),
+                    Arc::clone(&schema),
+                );
+                assert!(
+                    predicate.can_be_inverted_for_full_match(),
+                    "safe_cast={safe_cast} target={target}"
+                );
+                let metrics = parquet_file_metrics();
+                let mut groups =
+                    RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+                groups.prune_by_statistics_with_metadata(
+                    &schema, &metadata, &predicate, &metrics,
+                );
+                assert_eq!(
+                    groups.is_fully_matched(),
+                    &vec![true, true],
+                    "safe_cast={safe_cast} target={target}"
+                );
+                groups.prune_by_limit(1, metadata.row_groups(), &metrics);
+                assert_eq!(groups.row_group_indexes().collect::<Vec<_>>(), vec![0]);
+                assert_eq!(metrics.limit_pruned_row_groups.pruned(), 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_nullable_case_can_still_prove_full_match_and_satisfy_limit() -> Result<()> {
+        use arrow::array::Int32Array;
+        use arrow::record_batch::RecordBatch;
+        use bytes::Bytes;
+        use datafusion_physical_expr::expressions::{
+            CaseExpr, col as physical_col, lit as physical_lit,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let column = physical_col("b", &schema)?;
+        let zero = physical_lit(ScalarValue::Int32(Some(0)));
+        let when = Arc::new(BinaryExpr::new(
+            Arc::clone(&column),
+            Operator::Gt,
+            Arc::clone(&zero),
+        ));
+        let then = Arc::new(BinaryExpr::new(column, Operator::LtEq, zero));
+        let case = Arc::new(CaseExpr::try_new(
+            None,
+            vec![(when, then)],
+            Some(physical_lit(ScalarValue::Boolean(Some(false)))),
+        )?);
+        let predicate = build_test_pruning_predicate(
+            Arc::new(NotExpr::new(case)),
+            Arc::clone(&schema),
+        );
+        assert!(predicate.can_be_inverted_for_full_match());
+        let mut bytes = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))?
+            .metadata()
+            .clone();
+        let metrics = parquet_file_metrics();
+        let mut groups = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(2));
+        groups
+            .prune_by_statistics_with_metadata(&schema, &metadata, &predicate, &metrics);
+        assert_eq!(groups.is_fully_matched(), &vec![true, true]);
+        groups.prune_by_limit(1, metadata.row_groups(), &metrics);
+        assert_eq!(groups.row_group_indexes().collect::<Vec<_>>(), vec![0]);
+        Ok(())
     }
 
     #[test]

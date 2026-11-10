@@ -556,8 +556,8 @@ impl HashJoinStream {
 
         let pushdown = left_data.membership().clone();
         let bounds = left_data
-            .bounds
-            .clone()
+            .bounds()
+            .cloned()
             .unwrap_or_else(|| PartitionBounds::new(vec![]));
         // Arrow tracks null counts per array, so this costs no data scan.
         let keys_have_null = left_data
@@ -569,11 +569,13 @@ impl HashJoinStream {
             PartitionMode::Partitioned => PartitionBuildData::Partitioned {
                 partition_id: self.partition,
                 pushdown,
+                build_lease: Some(left_data.build_lease()),
                 bounds,
                 keys_have_null,
             },
             PartitionMode::CollectLeft => PartitionBuildData::CollectLeft {
                 pushdown,
+                build_lease: Some(left_data.build_lease()),
                 bounds,
                 keys_have_null,
             },
@@ -1082,6 +1084,7 @@ mod tests {
         PartitionBuildData::Partitioned {
             partition_id,
             pushdown: PushdownStrategy::Empty,
+            build_lease: None,
             bounds: PartitionBounds::new(vec![]),
             keys_have_null: false,
         }
