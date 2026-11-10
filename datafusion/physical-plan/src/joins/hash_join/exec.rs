@@ -70,9 +70,7 @@ use crate::{
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanBufferBuilder, GenericListArray, OffsetSizeTrait,
-};
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -2318,146 +2316,18 @@ fn new_join_hashmap(
     }
 }
 
-/// Estimates the memory newly allocated for `array`'s share of a concatenated
-/// array.
-///
-/// Concatenating view arrays copies only the views and keeps sharing the data
-/// buffers of the inputs, which are already accounted for.
-///
-/// `concat` slices the child values of list and map arrays to the range selected
-/// by their offsets before copying them (see `concat_lists` and `concat_maps` in
-/// `arrow-select`), so only that range is newly allocated. The rest of the child
-/// backing stays shared with the inputs, which already reserve it.
-///
-/// `shares_dictionary_values` tells whether every input of this column holds the
-/// same `Dictionary` values array, which `concat` reuses instead of copying; see
-/// [`shares_dictionary_values`].
-fn estimate_concat_allocation(
-    array: &dyn Array,
-    shares_dictionary_values: bool,
-) -> Result<usize> {
-    match array.data_type() {
-        DataType::Utf8View | DataType::BinaryView => {
-            let nulls = array
-                .nulls()
-                .map(|_| bit_util::ceil(array.len(), 8))
-                .unwrap_or_default();
-            Ok(array.len() * size_of::<u128>() + nulls)
-        }
-        DataType::List(_) => list_concat_allocation(array.as_list::<i32>()),
-        DataType::LargeList(_) => list_concat_allocation(array.as_list::<i64>()),
-        DataType::Map(_, _) => {
-            let map = array.as_map();
-            let (start, len) = selected_child_range(map.offsets(), map.len());
-            let entries = map.entries().slice(start, len);
-            Ok(merged_offsets_size::<i32>(map.len(), map.nulls().is_some())
-                + estimate_concat_allocation(&entries, false)?)
-        }
-        DataType::FixedSizeList(_, _) => {
-            // Slicing a fixed size list slices its values, and `concat` extends
-            // them only over the range the selected elements cover.
-            let values = array.as_fixed_size_list().values();
-            Ok(concat_nulls_size(array.len(), array.nulls().is_some())
-                + estimate_concat_allocation(values.as_ref(), false)?)
-        }
-        DataType::Struct(_) => {
-            // Slicing a struct array slices its children and `concat` recurses
-            // into them, so only the children's own estimates are needed.
-            let struct_array = array.as_struct();
-            let mut size =
-                concat_nulls_size(struct_array.len(), struct_array.nulls().is_some());
-            for column in struct_array.columns() {
-                size += estimate_concat_allocation(column.as_ref(), false)?;
-            }
-            Ok(size)
-        }
-        DataType::Dictionary(_, _) => {
-            // The keys are always rebuilt. A values array shared by every input
-            // is kept as-is (`MutableArrayData` reuses the dictionary), while an
-            // unshared one is copied or merged into a new values array.
-            let dictionary = array.as_any_dictionary();
-            let keys = dictionary.keys().to_data().get_slice_memory_size()?;
-            if shares_dictionary_values {
-                Ok(keys)
-            } else {
-                Ok(keys + dictionary.values().to_data().get_slice_memory_size()?)
-            }
-        }
-        _ => Ok(array.to_data().get_slice_memory_size()?),
-    }
-}
-
-/// Whether every input batch holds the same `Dictionary` values array for
-/// `column`, in which case `concat` reuses those values instead of copying them.
-///
-/// This mirrors what `arrow-data`'s `MutableArrayData` does: it keeps the
-/// dictionary only when the values of every input are pointer equal, otherwise
-/// it concatenates (or merges) the values of the inputs.
-fn shares_dictionary_values(batches: &[RecordBatch], column: usize) -> bool {
-    let Some(first) = batches
-        .first()
-        .and_then(|batch| batch.columns().get(column))
-    else {
-        return false;
-    };
-    if !matches!(first.data_type(), DataType::Dictionary(_, _)) {
-        return false;
-    }
-    let first_values = first.as_any_dictionary().values().to_data();
-    batches.iter().all(|batch| {
-        batch.columns().get(column).is_some_and(|array| {
-            matches!(array.data_type(), DataType::Dictionary(_, _))
-                && array
-                    .as_any_dictionary()
-                    .values()
-                    .to_data()
-                    .ptr_eq(&first_values)
-        })
-    })
-}
-
-/// Estimates the memory newly allocated for a list array's share of a
-/// concatenated list array.
-fn list_concat_allocation<O: OffsetSizeTrait>(
-    array: &GenericListArray<O>,
-) -> Result<usize> {
-    let (start, len) = selected_child_range(array.value_offsets(), array.len());
-    Ok(
-        merged_offsets_size::<O>(array.len(), array.nulls().is_some())
-            + estimate_concat_allocation(
-                array.values().slice(start, len).as_ref(),
-                false,
-            )?,
-    )
-}
-
-/// The `(start, len)` range of the child values a list or map array concatenates.
-///
-/// Note the offsets are absolute within the child buffer, which stays unsliced
-/// when the parent array is sliced.
-fn selected_child_range<O: OffsetSizeTrait>(offsets: &[O], len: usize) -> (usize, usize) {
-    let start = offsets[0].as_usize();
-    (start, offsets[len].as_usize() - start)
-}
-
-/// Memory newly allocated for the merged offsets and validity of a concatenated
-/// list or map array of `len` elements.
-fn merged_offsets_size<O: OffsetSizeTrait>(len: usize, has_nulls: bool) -> usize {
-    // One boundary per element plus the final one.
-    (len + 1) * size_of::<O>() + concat_nulls_size(len, has_nulls)
-}
-
-/// Memory newly allocated for a validity bitmap of `len` elements.
-fn concat_nulls_size(len: usize, has_nulls: bool) -> usize {
-    if has_nulls { bit_util::ceil(len, 8) } else { 0 }
-}
-
 /// Concatenates the build side `batches` into a single batch, in reverse order
-/// if `reverse` is set, keeping `reservation` ahead of the actual memory usage.
+/// if `reverse` is set.
 ///
 /// `inputs_reserved` is the memory `reservation` already holds for `batches`.
-/// The copy is reserved before it is made, and once `batches` are dropped the
-/// reservation is trimmed to the memory retained by the returned batch.
+/// The copy is *not* reserved ahead of time: while `concat_batches` runs, the
+/// inputs and the output can transiently need more memory than the pool holds,
+/// so a physical allocation can still fail. The reservation is reconciled with
+/// the single returned batch only after the inputs are dropped.
+///
+/// Only the difference between `inputs_reserved` and the memory the returned
+/// batch retains is applied; other charges on `reservation` (the hash map, row
+/// indices, ...) stay untouched.
 fn concat_build_batches(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
@@ -2466,34 +2336,6 @@ fn concat_build_batches(
     reservation: &mut MemoryReservation,
     metrics: &BuildProbeJoinMetrics,
 ) -> Result<RecordBatch> {
-    // Concatenating a single batch is zero-copy
-    let copy_size = if batches.len() > 1 {
-        // A `Dictionary` column keeps its values array when every input holds
-        // the same one, which the inputs already reserve.
-        let shared_dictionaries = batches
-            .first()
-            .map(|batch| {
-                (0..batch.num_columns())
-                    .map(|column| shares_dictionary_values(&batches, column))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut copy_size = 0;
-        for batch in &batches {
-            for (column, array) in batch.columns().iter().enumerate() {
-                let shares_dictionary_values =
-                    shared_dictionaries.get(column).copied().unwrap_or_default();
-                copy_size +=
-                    estimate_concat_allocation(array.as_ref(), shares_dictionary_values)?;
-            }
-        }
-        copy_size
-    } else {
-        0
-    };
-    reservation.try_grow(copy_size)?;
-    metrics.build_mem_used.add(copy_size);
-
     let batch = if reverse {
         concat_batches(schema, batches.iter().rev())?
     } else {
@@ -2501,16 +2343,17 @@ fn concat_build_batches(
     };
     drop(batches);
 
-    // The inputs are gone: only hold on to what the concatenated batch retains,
+    // The inputs are gone: hold on to what the concatenated batch retains,
     // which includes any buffers it still shares with the inputs.
-    let held = inputs_reserved + copy_size;
     let retained = get_record_batch_memory_size(&batch);
-    if retained > held {
-        reservation.try_grow(retained - held)?;
-        metrics.build_mem_used.add(retained - held);
+    if retained > inputs_reserved {
+        let delta = retained - inputs_reserved;
+        reservation.try_grow(delta)?;
+        metrics.build_mem_used.add(delta);
     } else {
-        reservation.shrink(held - retained);
-        metrics.build_mem_used.sub(held - retained);
+        let delta = inputs_reserved - retained;
+        reservation.shrink(delta);
+        metrics.build_mem_used.sub(delta);
     }
 
     Ok(batch)
@@ -2536,10 +2379,12 @@ fn concat_build_batches(
 ///
 /// # Memory Accounting
 /// Build batches are added to `reservation` as they arrive. They are then copied
-/// into a single batch, see [`concat_build_batches`]: the copy is reserved
-/// before it is made, and the reservation is trimmed to what the single batch
-/// retains once the input batches are dropped. Join key arrays that do not
-/// share the buffers of that batch are reserved as well.
+/// into a single batch, see [`concat_build_batches`]: that copy is not reserved
+/// in advance, so the inputs and the output can transiently exceed the pool
+/// while the concatenation runs. Once the input batches are dropped, the
+/// reservation is reconciled with what the single batch actually retains.
+/// Join key arrays that do not share the buffers of that batch are reserved as
+/// well.
 ///
 /// # Dynamic Filter Coordination
 /// When `should_compute_dynamic_filters` is true, this function computes the min/max bounds
@@ -2617,7 +2462,9 @@ async fn collect_left_input(
         memory_counter: _,
     } = state;
 
-    // Admit concatenation copies while the original batches are retained.
+    // A prepared build keeps the batches for later joins, so it admits the
+    // concatenation copy while the original batches are retained. The ordinary
+    // path reserves nothing up front, see [`concat_build_batches`].
     // Arrow keeps a single batch as an inexpensive slice.
     let copy_bytes = if prepared && batches.len() > 1 {
         let copy_bytes = prepared::prepared_copy_bytes(&batches)?;
@@ -2896,9 +2743,9 @@ mod tests {
     };
 
     use arrow::array::{
-        BinaryViewArray, Date32Array, DictionaryArray, FixedSizeListArray, Int32Array,
-        Int64Array, ListArray, MapArray, StringArray, StringViewArray, StructArray,
-        UInt32Array, UInt64Array,
+        AsArray, BinaryViewArray, Date32Array, DictionaryArray, FixedSizeListArray,
+        Int32Array, Int64Array, ListArray, MapArray, StringArray, StringViewArray,
+        StructArray, UInt32Array, UInt64Array,
     };
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{DataType, Field, Fields, Int32Type};
@@ -6979,6 +6826,44 @@ mod tests {
         Ok((schema, batches))
     }
 
+    /// Three batches of a `k: Int32, l: List<Dictionary<Int32, Utf8>>` schema that
+    /// are one-row, zero-copy slices of one parent list: every `l` column holds a
+    /// single dictionary key and all of them share the same 8 MiB values array.
+    fn nested_shared_dictionary_batches() -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        const VALUES: usize = 1024;
+        let value = "x".repeat(8 * 1024);
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+            std::iter::repeat_n(value.as_str(), VALUES),
+        ));
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 0, 0]),
+            values,
+        )?;
+        let item = Arc::new(Field::new("item", dictionary.data_type().clone(), true));
+        let parent = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([1, 1, 1]),
+            Arc::new(dictionary),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("l", parent.data_type().clone(), true),
+        ]));
+        let batches = [0, 1, 2]
+            .into_iter()
+            .zip([1, 2, 100_000_i32])
+            .map(|(offset, key)| -> Result<RecordBatch> {
+                let payload: ArrayRef = Arc::new(parent.slice(offset, 1));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(vec![key])), payload],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches))
+    }
+
     /// Two batches of a `k: Int32, f: FixedSizeList<List<Int64>, 1>` schema whose
     /// `f` columns are one-element, zero-copy slices of one `1024 x 1024` Int64
     /// parent list: both share a single 8 MiB inner values buffer.
@@ -7041,45 +6926,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn concat_build_batches_reserves_copy() -> Result<()> {
-        let batches = concat_test_batches(4, 1000);
-        let schema = batches[0].schema();
-        let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
-        let inputs: usize = batches.iter().map(get_record_batch_memory_size).sum();
-
-        // The inputs fit, but not together with their concatenated copy
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(inputs * 5 / 4));
-        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
-        assert_eq!(inputs_reserved, inputs);
-        let err = concat_build_batches(
-            &schema,
-            batches.clone(),
-            false,
-            inputs_reserved,
-            &mut reservation,
-            &metrics,
-        )
-        .unwrap_err();
-        assert_contains!(err.to_string(), "Resources exhausted");
-        drop(reservation);
-
-        // With room for the copy, the reservation ends up at what is retained
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(inputs * 2));
-        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
-        let batch = concat_build_batches(
-            &schema,
-            batches,
-            false,
-            inputs_reserved,
-            &mut reservation,
-            &metrics,
-        )?;
-        assert_eq!(reservation.size(), get_record_batch_memory_size(&batch));
-        assert_eq!(pool.reserved(), reservation.size());
-        Ok(())
-    }
-
     /// Concatenating a single batch is zero-copy, so nothing more is reserved.
     #[test]
     fn concat_build_batches_single_batch_not_reserved_twice() -> Result<()> {
@@ -7103,9 +6949,40 @@ mod tests {
         Ok(())
     }
 
-    /// Only the views of a view array are copied, its data buffers stay shared.
+    /// Reconciling the concatenated batch only adjusts the batch's own charge:
+    /// an extra reservation, such as the hash map, stays in place.
+    #[test]
+    fn concat_build_batches_reconciliation_keeps_extra_reservation() -> Result<()> {
+        let batches = concat_test_batches(4, 1000);
+        let schema = batches[0].schema();
+        let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
+
+        // Stand-in for the hash map that the build reserves next to the batches.
+        let hash_map = inputs_reserved / 2;
+        reservation.try_grow(hash_map)?;
+
+        let batch = concat_build_batches(
+            &schema,
+            batches,
+            true,
+            inputs_reserved,
+            &mut reservation,
+            &metrics,
+        )?;
+
+        let retained = get_record_batch_memory_size(&batch);
+        assert_eq!(reservation.size(), retained + hash_map);
+        assert_eq!(pool.reserved(), retained + hash_map);
+        Ok(())
+    }
+
+    /// After the inputs are dropped the reservation matches what the batch
+    /// retains: `concat` copies the views of a view array and keeps sharing the
+    /// data buffers of the inputs.
     #[rstest]
-    fn concat_build_batches_view_data_not_reserved_twice(
+    fn concat_build_batches_view_retains_shared_data(
         #[values("v", "bv")] column: &str,
     ) -> Result<()> {
         let batches = concat_test_batches(4, 1000);
@@ -7117,11 +6994,8 @@ mod tests {
         let schema = batches[0].schema();
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let inputs: usize = batches.iter().map(get_record_batch_memory_size).sum();
-        let views = 4 * 1000 * size_of::<u128>();
-        assert!(inputs > 2 * views);
 
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(inputs + views * 5 / 4));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         let batch = concat_build_batches(
             &schema,
@@ -7131,15 +7005,21 @@ mod tests {
             &mut reservation,
             &metrics,
         )?;
-        assert_eq!(reservation.size(), get_record_batch_memory_size(&batch));
+
+        assert_eq!(batch.num_rows(), 4000);
+        // Only the views are new; the data buffers are shared, not duplicated.
+        let retained = get_record_batch_memory_size(&batch);
+        assert!(retained < inputs * 2);
+        assert_eq!(reservation.size(), retained);
+        assert_eq!(pool.reserved(), retained);
         Ok(())
     }
 
     /// `concat` slices the values of a `List` input to the range selected by its
-    /// offsets before copying them, so the shared child backing must not be
-    /// reserved a second time on top of the inputs that already hold it.
+    /// offsets before copying them, so the shared child backing is not counted
+    /// again once the reservation is reconciled.
     #[test]
-    fn concat_build_batches_list_child_not_reserved_twice() -> Result<()> {
+    fn concat_build_batches_list_retains_selected_values() -> Result<()> {
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let (schema, batches) = list_slice_batches([1, 2])?;
         let selected = batches
@@ -7147,21 +7027,15 @@ mod tests {
             .map(|batch| batch.column(1).as_list::<i32>().value(0))
             .collect::<Vec<_>>();
 
-        // The inputs share the child values buffer, so it is reserved once.
+        // The inputs share the child values buffer, so it is counted once.
         let mut counter = RecordBatchMemoryCounter::new();
         for batch in &batches {
             counter.count_batch(batch);
         }
         let expected_inputs = counter.memory_usage();
         assert!(expected_inputs >= LIST_SLICE_CHILD_BYTES);
-        assert!(expected_inputs < LIST_SLICE_CHILD_BYTES + 16 * 1024);
 
-        // Concatenating copies two one-element lists, i.e. 2 x 1024 Int64 values
-        // plus the merged offsets. A 1 MiB allowance is very loose for that, but
-        // far below the ~16 MiB of counting the full child once per input.
-        let copy_allowance = 1 << 20;
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         assert_eq!(inputs_reserved, expected_inputs);
 
@@ -7178,7 +7052,7 @@ mod tests {
         // what the concatenated batch actually retains.
         assert_eq!(batch.num_rows(), 2);
         let retained = get_record_batch_memory_size(&batch);
-        assert!(retained < copy_allowance);
+        assert!(retained < LIST_SLICE_CHILD_BYTES);
         assert_eq!(reservation.size(), retained);
         assert_eq!(pool.reserved(), retained);
 
@@ -7189,28 +7063,20 @@ mod tests {
         Ok(())
     }
 
-    /// A `List` nested in a `Struct` is sliced by `StructArray::slice` and the
-    /// list values are then sliced again by `concat`, so their shared backing
-    /// must not be counted once per input either.
+    /// A nested `List` inside a `Struct` keeps its sliced child backing shared
+    /// with the inputs, so only the selected values are retained.
     #[test]
-    fn concat_build_batches_struct_list_child_not_reserved_twice() -> Result<()> {
+    fn concat_build_batches_struct_list_retains_selected_values() -> Result<()> {
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let (schema, batches) = struct_list_slice_batches()?;
-        let child_bytes = 4 * 1024 * size_of::<i64>();
 
         let mut counter = RecordBatchMemoryCounter::new();
         for batch in &batches {
             counter.count_batch(batch);
         }
         let expected_inputs = counter.memory_usage();
-        assert!(expected_inputs >= child_bytes);
-        assert!(expected_inputs < child_bytes + 16 * 1024);
 
-        // Concatenating copies two one-element lists: 2 x 1024 Int64 values plus
-        // the merged offsets and the struct validity.
-        let copy_allowance = 32 * 1024;
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         assert_eq!(inputs_reserved, expected_inputs);
 
@@ -7225,7 +7091,6 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 2);
         let retained = get_record_batch_memory_size(&batch);
-        assert!(retained < copy_allowance);
         assert_eq!(reservation.size(), retained);
 
         let lists = batch.column(1).as_struct().column(0).as_list::<i32>();
@@ -7236,26 +7101,20 @@ mod tests {
     }
 
     /// `concat` slices the entries of a `Map` input to the range selected by its
-    /// offsets, so the shared entries backing must not be counted again.
+    /// offsets before copying them, so the shared entries backing is retained
+    /// once the reservation is reconciled.
     #[test]
-    fn concat_build_batches_map_entries_not_reserved_twice() -> Result<()> {
+    fn concat_build_batches_map_retains_selected_entries() -> Result<()> {
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let (schema, batches) = map_slice_batches()?;
-        let child_bytes = 4 * 1024 * (size_of::<i32>() + size_of::<i64>());
 
         let mut counter = RecordBatchMemoryCounter::new();
         for batch in &batches {
             counter.count_batch(batch);
         }
         let expected_inputs = counter.memory_usage();
-        assert!(expected_inputs >= child_bytes);
-        assert!(expected_inputs < child_bytes + 16 * 1024);
 
-        // Concatenating copies two one-element maps: 2 x 1024 (Int32, Int64)
-        // entries plus the merged offsets.
-        let copy_allowance = 32 * 1024;
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         assert_eq!(inputs_reserved, expected_inputs);
 
@@ -7270,7 +7129,6 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 2);
         let retained = get_record_batch_memory_size(&batch);
-        assert!(retained < copy_allowance);
         assert_eq!(reservation.size(), retained);
 
         let maps = batch.column(1).as_map();
@@ -7280,10 +7138,10 @@ mod tests {
         Ok(())
     }
 
-    /// `concat` reuses a `Dictionary` values array that every input shares
-    /// instead of copying it, so those values are not newly allocated.
+    /// `concat` reuses a `Dictionary` values array that every input shares, and
+    /// the reconciled reservation holds those values exactly once.
     #[test]
-    fn concat_build_batches_shared_dictionary_not_reserved_twice() -> Result<()> {
+    fn concat_build_batches_shared_dictionary_retains_values() -> Result<()> {
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let (schema, batches) = shared_dictionary_batches()?;
         let shared_values = Arc::clone(batches[0].column(1).as_any_dictionary().values());
@@ -7294,14 +7152,8 @@ mod tests {
         }
         let expected_inputs = counter.memory_usage();
         assert!(expected_inputs >= DICTIONARY_SHARED_VALUES_BYTES);
-        assert!(expected_inputs < DICTIONARY_SHARED_VALUES_BYTES + 16 * 1024);
 
-        // Concatenating three rows only allocates their keys: 1 MiB is a very
-        // loose allowance, far below the ~24 MiB of counting the values once per
-        // input would ask for.
-        let copy_allowance = 1 << 20;
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         assert_eq!(inputs_reserved, expected_inputs);
 
@@ -7315,8 +7167,8 @@ mod tests {
         )?;
 
         assert_eq!(batch.num_rows(), 3);
-        // The output still holds the shared values, but nothing was copied for
-        // them: the reservation matches what the batch actually retains.
+        // The output still holds the shared values, once: the reservation
+        // matches what the batch actually retains.
         let retained = get_record_batch_memory_size(&batch);
         assert!(retained >= DICTIONARY_SHARED_VALUES_BYTES);
         assert!(retained < DICTIONARY_SHARED_VALUES_BYTES + 16 * 1024);
@@ -7336,10 +7188,9 @@ mod tests {
     }
 
     /// A `FixedSizeList` slice carries a sliced child, and `concat` copies only
-    /// the child range it selects, so an inner `List` backing must not be counted
-    /// in full once per input.
+    /// the child range it selects, so the inner `List` backing is retained once.
     #[test]
-    fn concat_build_batches_fixed_size_list_child_not_reserved_twice() -> Result<()> {
+    fn concat_build_batches_fixed_size_list_retains_selected_values() -> Result<()> {
         let metrics = BuildProbeJoinMetrics::new(0, &ExecutionPlanMetricsSet::new());
         let (schema, batches) = fixed_size_list_slice_batches([1, 2])?;
         let selected = batches
@@ -7353,13 +7204,8 @@ mod tests {
         }
         let expected_inputs = counter.memory_usage();
         assert!(expected_inputs >= LIST_SLICE_CHILD_BYTES);
-        assert!(expected_inputs < LIST_SLICE_CHILD_BYTES + 16 * 1024);
 
-        // Concatenating copies two one-element lists: 2 x 1024 Int64 values plus
-        // the merged offsets.
-        let copy_allowance = 1 << 20;
-        let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(expected_inputs + copy_allowance));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (mut reservation, inputs_reserved) = reserve_inputs(&batches, &pool)?;
         assert_eq!(inputs_reserved, expected_inputs);
 
@@ -7374,7 +7220,7 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 2);
         let retained = get_record_batch_memory_size(&batch);
-        assert!(retained < copy_allowance);
+        assert!(retained < LIST_SLICE_CHILD_BYTES);
         assert_eq!(reservation.size(), retained);
 
         let payload = batch.column(1).as_fixed_size_list();
@@ -7385,10 +7231,10 @@ mod tests {
         Ok(())
     }
 
-    /// The ordinary hash join build path must fit in a pool that only has room
-    /// for the build inputs and the `Dictionary` keys `concat` copies.
+    /// An ordinary build over a shared `Dictionary` column fits in a pool sized
+    /// for the final held data: the values buffer is charged once, not per input.
     #[tokio::test]
-    async fn join_build_shared_dictionary_concat_not_reserved_twice() -> Result<()> {
+    async fn join_build_shared_dictionary_fits_final_reservation() -> Result<()> {
         // Sparse keys keep the build on the hash table path instead of the
         // perfect hash map.
         let (left_schema, batches) = shared_dictionary_batches()?;
@@ -7399,9 +7245,11 @@ mod tests {
         let inputs = counter.memory_usage();
         assert!(inputs >= DICTIONARY_SHARED_VALUES_BYTES);
 
-        let copy_allowance = 1 << 20;
+        // Headroom for the hash map and keys: the pool holds the final build,
+        // not a pre-concat copy of the shared values (3 x 8 MiB here).
+        let headroom = 1 << 20;
         let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(inputs + copy_allowance));
+            Arc::new(GreedyMemoryPool::new(inputs + headroom));
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::clone(&pool))
             .build_arc()?;
@@ -7452,10 +7300,11 @@ mod tests {
         Ok(())
     }
 
-    /// The ordinary hash join build path must fit in a pool that only has room
-    /// for the build inputs and the `List` values `concat` actually copies.
+    /// An ordinary build over `List` slices fits in a pool sized for the final
+    /// held data: only the selected values are retained, not the shared backing
+    /// once per input.
     #[tokio::test]
-    async fn join_build_list_slice_concat_not_reserved_twice() -> Result<()> {
+    async fn join_build_list_slice_fits_final_reservation() -> Result<()> {
         // Sparse keys keep the build on the hash table path instead of the
         // perfect hash map.
         let (left_schema, batches) = list_slice_batches([1, 100_000])?;
@@ -7466,9 +7315,11 @@ mod tests {
         let inputs = counter.memory_usage();
         assert!(inputs >= LIST_SLICE_CHILD_BYTES);
 
-        let copy_allowance = 1 << 20;
+        // Headroom for the hash map and keys: the pool holds the final build,
+        // not a pre-concat copy of the shared values (3 x 8 MiB here).
+        let headroom = 1 << 20;
         let pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(inputs + copy_allowance));
+            Arc::new(GreedyMemoryPool::new(inputs + headroom));
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::clone(&pool))
             .build_arc()?;
@@ -7523,77 +7374,172 @@ mod tests {
         Ok(())
     }
 
-    /// The build side is concatenated into a single batch, and that copy must
-    /// be visible to the memory pool while the input batches are still alive.
+    /// An ordinary build whose payload nests a `Dictionary` inside a `List`
+    /// shares the values across every input. The build must fit in a pool sized
+    /// for the final held data: the values are charged once.
+    #[tokio::test]
+    async fn join_build_nested_shared_dictionary_fits_final_reservation() -> Result<()> {
+        // Sparse keys keep the build on the hash table path instead of the
+        // perfect hash map.
+        let (left_schema, batches) = nested_shared_dictionary_batches()?;
+        let mut counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            counter.count_batch(batch);
+        }
+        let inputs = counter.memory_usage();
+        assert!(inputs >= DICTIONARY_SHARED_VALUES_BYTES);
+
+        // Room for the inputs, the hash map and the keys, far less than the
+        // 3 x 8 MiB a copy of the shared nested values would ask for.
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(GreedyMemoryPool::new(inputs + (1 << 20)));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let left = TestMemoryExec::try_new_exec(
+            std::slice::from_ref(&batches),
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        let right_schema =
+            Arc::new(Schema::new(vec![Field::new("k2", DataType::Int32, false)]));
+        let probe = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 100_000]))],
+        )?;
+        let right = TestMemoryExec::try_new_exec(
+            &[vec![probe]],
+            Arc::clone(&right_schema),
+            None,
+        )?;
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left_schema)?) as _,
+            Arc::new(Column::new_with_schema("k2", &right_schema)?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+
+        let stream = join.execute(0, Arc::clone(&task_ctx))?;
+        let output = common::collect(stream).await?;
+        let rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 2);
+
+        // The nested payload survives the concat: one dictionary key per row,
+        // still backed by the shared values array.
+        let mut lengths = Vec::new();
+        for batch in &output {
+            let payload = batch.column(1).as_list::<i32>();
+            for row in 0..payload.len() {
+                let value = payload.value(row);
+                assert!(matches!(value.data_type(), DataType::Dictionary(_, _)));
+                assert_eq!(value.len(), 1);
+                lengths.push(payload.value_length(row));
+            }
+        }
+        assert_eq!(lengths, vec![1, 1]);
+        Ok(())
+    }
+
+    /// Only the final held build data has to fit: a pool with room for exactly
+    /// that succeeds, one byte less fails and releases everything it reserved.
     #[rstest]
     #[tokio::test]
-    async fn join_build_concat_is_reserved(
-        #[values(PartitionMode::CollectLeft, PartitionMode::Partitioned)]
-        mode: PartitionMode,
-        #[values(false, true)] use_perfect_hash_join_as_possible: bool,
+    async fn join_build_tight_pool_bound_by_final_reservation(
+        #[values(false, true)] computed_key: bool,
     ) -> Result<()> {
+        use crate::memory::MemoryStream;
+
         let num_rows = 4000;
         let values = (0..num_rows).collect::<Vec<i32>>();
         let batches = (0..4)
             .map(|_| build_table_i32(("a1", &values), ("b1", &values), ("c1", &values)))
             .collect::<Vec<_>>();
-        let inputs: usize = batches.iter().map(get_record_batch_memory_size).sum();
-        let left_schema = batches[0].schema();
-        let right = build_table(
-            ("a2", &vec![10, 11]),
-            ("b2", &vec![12, 13]),
-            ("c2", &vec![14, 15]),
-        );
-        let on = vec![(
-            Arc::new(Column::new_with_schema("a1", &left_schema)?) as _,
-            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
-        )];
-
-        // Reserved on top of the inputs and their copy
-        let build_rows = batches.len() * num_rows as usize;
-        let map = if use_perfect_hash_join_as_possible {
-            ArrayMap::estimate_memory_size(0, num_rows as u64 - 1, build_rows)
+        let schema = batches[0].schema();
+        let column = Arc::new(Column::new_with_schema("a1", &schema)?) as PhysicalExprRef;
+        let on_left: Vec<PhysicalExprRef> = vec![if computed_key {
+            Arc::new(BinaryExpr::new(
+                column,
+                Operator::Plus,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            ))
         } else {
-            estimate_memory_size::<(u32, u64)>(build_rows, size_of::<JoinHashMapU32>())?
-                + build_rows * size_of::<u32>()
-        };
+            column
+        }];
+        let config = Arc::clone(prepare_task_ctx(8192, false).session_config().options());
 
-        for (limit, fits) in [(map + inputs * 3 / 2, false), (map + inputs * 3, true)] {
-            let left = TestMemoryExec::try_new_exec(
-                std::slice::from_ref(&batches),
-                Arc::clone(&left_schema),
+        // Measure what the build holds once it is done.
+        let unbounded: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let data = collect_left_input(
+            HASH_JOIN_SEED.random_state().clone(),
+            Box::pin(MemoryStream::try_new(
+                batches.clone(),
+                Arc::clone(&schema),
                 None,
-            )?;
-            let join = HashJoinExec::try_new(
-                left,
-                Arc::clone(&right),
-                on.clone(),
-                None,
-                &JoinType::Inner,
-                None,
-                mode,
-                NullEquality::NullEqualsNothing,
+            )?),
+            on_left.clone(),
+            BuildProbeJoinMetrics::new(0, &metrics_set),
+            MemoryConsumer::new("build quota").register(&unbounded),
+            false,
+            1,
+            false,
+            Arc::clone(&config),
+            NullEquality::NullEqualsNothing,
+            MetricBuilder::new(&metrics_set)
+                .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0),
+            BuildMode::Ordinary,
+        )
+        .await?;
+        let held = unbounded.reserved();
+        assert!(held > 0);
+        drop(data);
+        // A dropped build releases its reservation.
+        assert_eq!(unbounded.reserved(), 0);
+
+        for (limit, fits) in [(held, true), (held - 1, false)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let metrics_set = ExecutionPlanMetricsSet::new();
+            let result = collect_left_input(
+                HASH_JOIN_SEED.random_state().clone(),
+                Box::pin(MemoryStream::try_new(
+                    batches.clone(),
+                    Arc::clone(&schema),
+                    None,
+                )?),
+                on_left.clone(),
+                BuildProbeJoinMetrics::new(0, &metrics_set),
+                MemoryConsumer::new("build quota").register(&pool),
                 false,
-            )?;
+                1,
+                false,
+                Arc::clone(&config),
+                NullEquality::NullEqualsNothing,
+                MetricBuilder::new(&metrics_set)
+                    .counter(ARRAY_MAP_CREATED_COUNT_METRIC_NAME, 0),
+                BuildMode::Ordinary,
+            )
+            .await;
 
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_limit(limit, 1.0)
-                .build_arc()?;
-            let task_ctx = prepare_task_ctx(8192, use_perfect_hash_join_as_possible);
-            let task_ctx = Arc::new(
-                TaskContext::default()
-                    .with_session_config(task_ctx.session_config().clone())
-                    .with_runtime(runtime),
-            );
-
-            let result = common::collect(join.execute(0, task_ctx)?).await;
             if fits {
                 result?;
             } else {
-                assert_contains!(
-                    result.unwrap_err().to_string(),
-                    "Resources exhausted: Additional allocation failed for HashJoinInput"
-                );
+                let Err(err) = result else {
+                    panic!("the build must not fit in {limit} bytes");
+                };
+                assert_contains!(err.to_string(), "Resources exhausted");
+                // The failed build releases everything it reserved.
+                assert_eq!(pool.reserved(), 0);
             }
         }
         Ok(())
