@@ -20,7 +20,7 @@
 use std::{fmt::Display, hash::Hash, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, UInt64Array},
+    array::{Array, ArrayRef, UInt64Array},
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
@@ -312,6 +312,89 @@ impl HashTableLookupExpr {
     pub fn pruning_bitmap(&self) -> Option<&Arc<KeyRangeBitmap>> {
         self.pruning_bitmap.as_ref()
     }
+
+    /// Read-only view of the build-side membership this lookup checks rows against.
+    ///
+    /// Returns `None` unless the membership can be exposed exactly as a bounded,
+    /// single-column UTF-8 value list:
+    ///
+    /// * the lookup must carry a real build lease. Lookups built with
+    ///   [`HashTableLookupExpr::new`] (tests, deserialized plans) have no build
+    ///   data, so their membership is deliberately unavailable;
+    /// * the join key must be exactly one column, and the lease must hold exactly
+    ///   one evaluated key array for it;
+    /// * that array must be non-dictionary `Utf8`. `Utf8View`, `LargeUtf8`,
+    ///   dictionary encodings, numeric, decimal, float and every other type are
+    ///   rejected: the membership is meant for predicates that must agree with
+    ///   join equality, and e.g. signed zero or dictionary key domains would
+    ///   need a different representation;
+    /// * the array must be non-empty, NULL-free (an `IN` list cannot express
+    ///   `NULL` equality, so a NULL key would turn into a narrower predicate),
+    ///   and within the caller's `max_values` / `max_bytes` bounds.
+    ///
+    /// This is a read-only accessor for consumers that re-encode the membership
+    /// predicate elsewhere; it does not change how the lookup evaluates rows.
+    ///
+    /// # Ownership and lifetime
+    ///
+    /// The returned references borrow from the immutable
+    /// [`JoinBuildData`](super::exec::JoinBuildData) that the expression's lease
+    /// keeps alive. Published build data is never mutated, the lease holds the
+    /// build-side memory reservation (and therefore the underlying buffers) for
+    /// as long as the published map is reachable, and `with_new_children`
+    /// propagates the same lease to derived expressions. Every borrow is
+    /// therefore valid for the lifetime of `&self` and observes one fixed build
+    /// side: the same arrays the lookup's map was built from.
+    pub fn build_key_membership(
+        &self,
+        max_values: usize,
+        max_bytes: usize,
+    ) -> Option<LookupBuildKey<'_>> {
+        let lease = self.build_lease.as_ref()?;
+        // Only a single-column key can be written as `column IN (...)`.
+        let [key] = self.on_columns.as_slice() else {
+            return None;
+        };
+        let [values] = lease.values.as_slice() else {
+            return None;
+        };
+        if values.data_type() != &DataType::Utf8 {
+            return None;
+        }
+        // An empty build has no membership, and NULL build keys match nothing
+        // via `IN` yet may match via `NULL`-equal joins: fail open instead.
+        if values.is_empty() || values.null_count() != 0 {
+            return None;
+        }
+        if values.len() > max_values || values.get_array_memory_size() > max_bytes {
+            return None;
+        }
+        Some(LookupBuildKey { key, values })
+    }
+}
+
+/// Bounded, read-only build-side membership of a [`HashTableLookupExpr`].
+///
+/// Both references borrow from the build data the lookup's lease keeps alive;
+/// see [`HashTableLookupExpr::build_key_membership`] for the exact contract.
+#[derive(Debug)]
+pub struct LookupBuildKey<'a> {
+    /// Probe-side key expression the membership applies to.
+    key: &'a PhysicalExprRef,
+    /// Build-side key values, one entry per build row.
+    values: &'a ArrayRef,
+}
+
+impl<'a> LookupBuildKey<'a> {
+    /// The single probe-side key expression of the lookup.
+    pub fn key(&self) -> &'a PhysicalExprRef {
+        self.key
+    }
+
+    /// The build-side key values, in build order and without duplicates removed.
+    pub fn values(&self) -> &'a ArrayRef {
+        self.values
+    }
 }
 impl std::fmt::Debug for HashTableLookupExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -450,6 +533,7 @@ fn evaluate_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joins::hash_join::exec::JoinBuildData;
     use crate::joins::join_hash_map::JoinHashMapU32;
     use datafusion_common::ScalarValue;
     use datafusion_physical_expr::expressions::Column;
@@ -890,5 +974,180 @@ mod tests {
         // Equal expressions should have equal hashes
         assert_eq!(expr1, expr2);
         assert_eq!(compute_hash(&expr1), compute_hash(&expr2));
+    }
+
+    /// Builds the smallest real build lease: an immutable `JoinBuildData` holding
+    /// the evaluated build key values, exactly like `collect_build_side` publishes.
+    fn test_build_lease(
+        values: Vec<ArrayRef>,
+        columns: Vec<ArrayRef>,
+    ) -> Arc<JoinBuildData> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let reservation =
+            MemoryConsumer::new("build key membership test").register(&pool);
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    arrow::datatypes::Field::new(
+                        format!("k{index}"),
+                        column.data_type().clone(),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        Arc::new(JoinBuildData {
+            map: Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(
+                values[0].len(),
+            )))),
+            batch,
+            values,
+            bounds: None,
+            reservation,
+        })
+    }
+
+    fn utf8_values(values: &[&str]) -> ArrayRef {
+        Arc::new(arrow::array::StringArray::from(values.to_vec()))
+    }
+
+    fn lookup_with_lease(
+        on_columns: Vec<PhysicalExprRef>,
+        lease: Arc<JoinBuildData>,
+    ) -> HashTableLookupExpr {
+        HashTableLookupExpr::new(
+            on_columns,
+            SeededRandomState::with_seed(1),
+            Arc::clone(&lease.map),
+            "lookup".to_string(),
+            None,
+        )
+        .with_build_lease(Some(lease))
+    }
+
+    #[test]
+    fn build_key_membership_exposes_utf8_build_values_of_a_real_lease() {
+        let values = utf8_values(&["trace-a", "trace-b"]);
+        let lease =
+            test_build_lease(vec![Arc::clone(&values)], vec![Arc::clone(&values)]);
+        let key: PhysicalExprRef = Arc::new(Column::new("trace_id", 0));
+        let lookup = lookup_with_lease(vec![Arc::clone(&key)], lease);
+
+        let membership = lookup.build_key_membership(16, 4096).unwrap();
+        assert_eq!(membership.key().to_string(), key.to_string());
+        assert_eq!(
+            membership
+                .values()
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>(),
+            values.as_any().downcast_ref::<arrow::array::StringArray>()
+        );
+
+        // The borrow is tied to the expression, so it stays valid while the
+        // expression (and therefore the lease) is alive.
+        let kept = Arc::new(lookup);
+        assert_eq!(
+            kept.build_key_membership(16, 4096).unwrap().values().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn build_key_membership_is_none_without_a_build_lease() {
+        let values = utf8_values(&["trace-a"]);
+        let lease =
+            test_build_lease(vec![Arc::clone(&values)], vec![Arc::clone(&values)]);
+        let lookup = HashTableLookupExpr::new(
+            vec![Arc::new(Column::new("trace_id", 0))],
+            SeededRandomState::with_seed(1),
+            Arc::clone(&lease.map),
+            "lookup".to_string(),
+            None,
+        );
+
+        assert!(lookup.build_key_membership(16, 4096).is_none());
+    }
+
+    #[test]
+    fn build_key_membership_is_none_for_composite_keys() {
+        let values = utf8_values(&["trace-a"]);
+        let lease =
+            test_build_lease(vec![Arc::clone(&values)], vec![Arc::clone(&values)]);
+        let lookup = lookup_with_lease(
+            vec![
+                Arc::new(Column::new("trace_id", 0)),
+                Arc::new(Column::new("host", 1)),
+            ],
+            lease,
+        );
+
+        assert!(lookup.build_key_membership(16, 4096).is_none());
+    }
+
+    #[test]
+    fn build_key_membership_is_none_for_unsupported_key_types() {
+        // Numeric keys, `Utf8View` and dictionary keys are all out of scope: an
+        // exact `IN` list would need a different value domain.
+        let int_values: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2]));
+        let dictionary_values: ArrayRef = Arc::new(arrow::array::DictionaryArray::<
+            arrow::datatypes::Int32Type,
+        >::from_iter([
+            "trace-a", "trace-b",
+        ]));
+        let view_values: ArrayRef = Arc::new(arrow::array::StringViewArray::from(vec![
+            "trace-a", "trace-b",
+        ]));
+
+        for values in [int_values, dictionary_values, view_values] {
+            let lease =
+                test_build_lease(vec![Arc::clone(&values)], vec![Arc::clone(&values)]);
+            let lookup =
+                lookup_with_lease(vec![Arc::new(Column::new("trace_id", 0))], lease);
+            assert!(
+                lookup.build_key_membership(16, 4096).is_none(),
+                "unexpected membership for {:?}",
+                lookup.children()[0].data_type(&Schema::empty()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn build_key_membership_is_none_for_empty_null_or_oversized_values() {
+        // Empty build side.
+        let empty = utf8_values(&[]);
+        let empty_lease =
+            test_build_lease(vec![Arc::clone(&empty)], vec![Arc::clone(&empty)]);
+        assert!(
+            lookup_with_lease(vec![Arc::new(Column::new("trace_id", 0))], empty_lease)
+                .build_key_membership(16, 4096)
+                .is_none()
+        );
+
+        // NULL build keys cannot be expressed as `IN` membership.
+        let with_null: ArrayRef =
+            Arc::new(arrow::array::StringArray::from(vec![Some("trace-a"), None]));
+        let null_lease =
+            test_build_lease(vec![Arc::clone(&with_null)], vec![Arc::clone(&with_null)]);
+        assert!(
+            lookup_with_lease(vec![Arc::new(Column::new("trace_id", 0))], null_lease)
+                .build_key_membership(16, 4096)
+                .is_none()
+        );
+
+        // Value count and byte bounds are enforced by the caller.
+        let values = utf8_values(&["trace-a", "trace-b"]);
+        let lease =
+            test_build_lease(vec![Arc::clone(&values)], vec![Arc::clone(&values)]);
+        let lookup = lookup_with_lease(vec![Arc::new(Column::new("trace_id", 0))], lease);
+        assert!(lookup.build_key_membership(1, 4096).is_none());
+        assert!(lookup.build_key_membership(16, 8).is_none());
+        assert!(lookup.build_key_membership(16, 4096).is_some());
     }
 }
